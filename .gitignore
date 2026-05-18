@@ -1,0 +1,4 @@
+outputs/
+.agents/
+.codex/
+__pycache__/
