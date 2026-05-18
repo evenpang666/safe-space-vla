@@ -23,6 +23,94 @@ loss, metrics = point_world_model_loss(
 
 `point_world_model_loss` 会提高 moving points、near-robot points 和 near-contact points 的权重，避免训练被大量静态场景点支配。
 
+## 0. 环境安装
+
+建议把环境拆成三类，不要把 OpenPI、LIBERO 和本仓库的轻量 PyTorch 训练脚本硬塞进同一个 Python 环境。OpenPI 当前要求 Python 3.11 和 `torch==2.7.1`，而 LIBERO/robosuite 依赖更偏 Python 3.8、旧版 Torch/MuJoCo。
+
+### 0.1 基础 safety module 环境
+
+这个环境用于训练 `PointWorldModel`、`PointCloudSafetyCritic`、构建 SDF、跑单元 smoke test 和导出 TorchScript：
+
+```bash
+conda create -n safety-module python=3.10 -y
+conda activate safety-module
+
+# CPU 版本足够跑数据处理和小规模 smoke test；有 CUDA 时可按本机驱动换成对应 PyTorch wheel。
+pip install numpy scipy torch torchvision tqdm matplotlib
+
+# 让 scripts/ 可以直接 import safety_module。
+export PYTHONPATH=$PWD:$PYTHONPATH
+```
+
+安装后做一次快速检查：
+
+```bash
+python -m compileall safety_module scripts
+python - <<'PY'
+import torch
+from safety_module import PointCloudSafetyCritic, geometric_safety_cost
+
+scene = torch.randn(2, 128, 3)
+robot = torch.randn(2, 10, 64, 3)
+critic = PointCloudSafetyCritic()
+out = critic(scene, robot)
+geom = geometric_safety_cost(scene, robot)
+print(out["cost"].shape, geom["min_distance"].shape)
+PY
+```
+
+### 0.2 LIBERO / MuJoCo 数据采集环境
+
+LIBERO 相关脚本用于重建场景点云、采样 robot point flow、生成 action chunk 数据集。建议单独建 Python 3.8 环境：
+
+```bash
+conda create -n libero python=3.8 -y
+conda activate libero
+
+pip install -r thiry_party/LIBERO/requirements.txt
+pip install -e thiry_party/LIBERO
+
+# 如果 pip resolver 对少数旧依赖失败，可以单独补装：
+pip install bddl==1.0.1 easydict==1.9 future==0.18.2
+
+export PYTHONPATH=$PWD:$PWD/thiry_party/LIBERO:$PYTHONPATH
+```
+
+无显示器服务器上运行 MuJoCo/LIBERO 时通常需要 EGL：
+
+```bash
+export MUJOCO_GL=egl
+```
+
+若本机没有 EGL/GPU 渲染，先用 `MUJOCO_GL=osmesa` 或在有显示环境的机器上采集点云；这部分取决于机器的 MuJoCo/OpenGL 驱动配置。
+
+### 0.3 OpenPI 训练环境
+
+OpenPI 使用 `uv` 管理依赖。推荐在 `thiry_party/openpi` 内按它自己的 workspace 安装：
+
+```bash
+cd thiry_party/openpi
+uv sync
+uv pip install -r examples/libero/requirements.txt
+cd ../..
+```
+
+运行 OpenPI 训练命令时，保持项目根目录可被 import：
+
+```bash
+export PYTHONPATH=$PWD:$PYTHONPATH
+cd thiry_party/openpi
+uv run scripts/train_pytorch.py pi05_libero --help
+```
+
+如果只是在 OpenPI 里复用本仓库导出的 TorchScript safety loss / collision critic，关键产物是：
+
+```text
+outputs/fk_robot_point_flow.pt              FK/仿真器导出的 robot point-flow TorchScript
+outputs/collision_critic/collision_critic.pt 训练后的 collision critic TorchScript
+outputs/safe_space/*.npz                    SDF safe-space 文件
+```
+
 ## 1. 重建当前场景点云
 
 从 RGB-D / 多视角深度融合出当前场景点云，默认去掉机器人自身点：
