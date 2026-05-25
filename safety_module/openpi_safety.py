@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from .safety_loss import SafetyLoss
+from .joint_swept_box_loss import JointSweptBoxSafetyLoss, parse_box_indices
 
 
 def _stats_dim(stats: Any) -> int:
@@ -141,24 +142,52 @@ class TorchscriptSafetyCritic(nn.Module):
 
 
 class OpenPISafetyLoss(nn.Module):
-    """Combine OpenPI unnormalization, deterministic robot point flow, and SDF loss."""
+    """Combine OpenPI unnormalization and an action-chunk safety regularizer."""
 
     def __init__(
         self,
-        sdf_path: Union[str, Path],
+        sdf_path: Optional[Union[str, Path]],
         data_config: Any,
         margin: float = 0.03,
+        obstacle_box_path: Optional[Union[str, Path]] = None,
+        obstacle_box_indices: Optional[str] = None,
         robot_pointcloud_model_path: Optional[Union[str, Path]] = None,
         robot_pointcloud_mode: str = "torchscript",
         eef_sphere_radius: float = 0.05,
         eef_sphere_points: int = 64,
         eef_action_scale: float = 1.0,
+        joint_action_scale: float = 1.0,
+        joint_swept_surface_samples: int = 5,
+        joint_swept_topk: int = 128,
+        joint_swept_gripper_width: float = 0.085,
+        joint_swept_base_position: tuple[float, float, float] = (-0.61, 0.0, 0.912),
         state_dim: Optional[int] = None,
         action_dim: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:
         super().__init__()
-        self.sdf_loss = SafetyLoss.from_npz(sdf_path, margin=margin, device=device)
+        self.robot_pointcloud_mode = robot_pointcloud_mode
+        self.sdf_loss = None
+        self.joint_swept_box_loss = None
+        if robot_pointcloud_mode == "joint_swept_boxes":
+            if obstacle_box_path is None:
+                raise ValueError("obstacle_box_path is required when robot_pointcloud_mode='joint_swept_boxes'")
+            self.joint_swept_box_loss = JointSweptBoxSafetyLoss(
+                obstacle_box_path=obstacle_box_path,
+                obstacle_box_indices=parse_box_indices(obstacle_box_indices),
+                margin=margin,
+                action_scale=joint_action_scale,
+                surface_samples=joint_swept_surface_samples,
+                topk=joint_swept_topk,
+                gripper_width=joint_swept_gripper_width,
+                base_position=joint_swept_base_position,
+            )
+            if device is not None:
+                self.joint_swept_box_loss = self.joint_swept_box_loss.to(device=device)
+        else:
+            if sdf_path is None:
+                raise ValueError("sdf_path is required for torchscript/eef_sphere safety modes")
+            self.sdf_loss = SafetyLoss.from_npz(sdf_path, margin=margin, device=device)
         self.use_quantiles = bool(getattr(data_config, "use_quantile_norm", False))
         norm_stats = getattr(data_config, "norm_stats", None) or {}
         self.state_stats = norm_stats.get("state") if isinstance(norm_stats, dict) else None
@@ -166,7 +195,9 @@ class OpenPISafetyLoss(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        if robot_pointcloud_mode == "torchscript":
+        if robot_pointcloud_mode == "joint_swept_boxes":
+            self.robot_pointcloud = None
+        elif robot_pointcloud_mode == "torchscript":
             if robot_pointcloud_model_path is None:
                 raise ValueError("robot_pointcloud_model_path is required when robot_pointcloud_mode='torchscript'")
             self.robot_pointcloud = TorchscriptRobotPointCloud(robot_pointcloud_model_path)
@@ -192,6 +223,11 @@ class OpenPISafetyLoss(nn.Module):
             self.use_quantiles,
             real_dim=self.action_dim,
         )
+        if self.robot_pointcloud_mode == "joint_swept_boxes":
+            assert self.joint_swept_box_loss is not None
+            return self.joint_swept_box_loss(state, actions, return_info=True)
+
+        assert self.sdf_loss is not None
         robot_points = self.robot_pointcloud(state, actions)
         loss, info = self.sdf_loss(robot_points, return_info=True)
         info["robot_points"] = robot_points.shape[-2] if robot_points.ndim >= 3 else robot_points.numel() // 3

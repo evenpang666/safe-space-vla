@@ -1,6 +1,7 @@
 """Safety utilities for deterministic robot geometry, point worlds, and critics."""
 
 from .openpi_safety import OpenPICollisionCritic, OpenPISafetyLoss
+from .joint_swept_box_loss import JointSweptBoxSafetyLoss, UR5eSweptSegments, load_obstacle_boxes
 from .point_world_model import (
     PointWorldModel,
     chamfer_hausdorff_loss,
@@ -22,6 +23,7 @@ from .safety_loss import SafetyLoss, load_safe_space_sdf
 
 __all__ = [
     "LagrangeMultiplier",
+    "JointSweptBoxSafetyLoss",
     "OpenPICollisionCritic",
     "OpenPISafetyLoss",
     "PointCloudSafetyCritic",
@@ -30,6 +32,7 @@ __all__ = [
     "ResidualActionCorrection",
     "RobotSweptPointCloudModel",
     "SafetyLoss",
+    "UR5eSweptSegments",
     "action_smoothness_cost",
     "chamfer_distance",
     "chamfer_hausdorff_loss",
@@ -37,6 +40,7 @@ __all__ = [
     "geometric_safety_cost",
     "joint_limit_cost",
     "load_safe_space_sdf",
+    "load_obstacle_boxes",
     "point_world_model_loss",
     "ppo_lagrangian_loss",
     "rerank_action_chunks",

@@ -31,6 +31,13 @@ for libero_root in LIBERO_ROOT_CANDIDATES:
         sys.path.insert(0, str(libero_root))
         break
 
+LOCAL_LIBERO_BENCHMARK_ROOT = None
+for libero_root in LIBERO_ROOT_CANDIDATES:
+    candidate = libero_root / "libero" / "libero"
+    if candidate.exists():
+        LOCAL_LIBERO_BENCHMARK_ROOT = candidate
+        break
+
 
 def install_robosuite_compat() -> None:
     """Install small shims for LIBERO versions written for robosuite <= 1.4.
@@ -97,8 +104,11 @@ def load_runtime_dependencies() -> None:
     try:
         patch_torch_load_for_libero()
         install_robosuite_compat()
+        import libero.libero as libero_core
+
+        patch_libero_resource_paths(libero_core)
         from libero.libero import benchmark as libero_benchmark
-        from libero.libero import get_libero_path as libero_get_libero_path
+        patch_benchmark_resource_paths(libero_benchmark)
         from libero.libero.envs import OffScreenRenderEnv as LiberoOffScreenRenderEnv
         from robosuite.utils import camera_utils as robosuite_camera_utils
     except ModuleNotFoundError as exc:
@@ -110,10 +120,41 @@ def load_runtime_dependencies() -> None:
         ) from exc
 
     benchmark = libero_benchmark
-    get_libero_path = libero_get_libero_path
+    get_libero_path = local_libero_path
     OffScreenRenderEnv = LiberoOffScreenRenderEnv
     camera_utils = robosuite_camera_utils
     patch_libero_robot_models()
+
+
+def local_libero_path(query_key: str) -> str:
+    if LOCAL_LIBERO_BENCHMARK_ROOT is None:
+        raise RuntimeError("local LIBERO benchmark root was not found")
+    paths = {
+        "benchmark_root": LOCAL_LIBERO_BENCHMARK_ROOT,
+        "bddl_files": LOCAL_LIBERO_BENCHMARK_ROOT / "bddl_files",
+        "init_states": LOCAL_LIBERO_BENCHMARK_ROOT / "init_files",
+        "assets": LOCAL_LIBERO_BENCHMARK_ROOT / "assets",
+        "datasets": LOCAL_LIBERO_BENCHMARK_ROOT.parent / "datasets",
+    }
+    if query_key not in paths:
+        raise KeyError(f"unknown LIBERO path key: {query_key}")
+    return str(paths[query_key])
+
+
+def patch_libero_resource_paths(libero_core) -> None:
+    """Route installed LIBERO code to the workspace's editable assets."""
+
+    if LOCAL_LIBERO_BENCHMARK_ROOT is None:
+        return
+    libero_core.get_libero_path = local_libero_path
+    if hasattr(libero_core, "_assets_path_cache"):
+        libero_core._assets_path_cache = str(LOCAL_LIBERO_BENCHMARK_ROOT / "assets")
+    libero_core.get_assets_path = lambda: str(LOCAL_LIBERO_BENCHMARK_ROOT / "assets")
+
+
+def patch_benchmark_resource_paths(libero_benchmark) -> None:
+    if LOCAL_LIBERO_BENCHMARK_ROOT is not None:
+        libero_benchmark.get_libero_path = local_libero_path
 
 
 def patch_torch_load_for_libero() -> None:
@@ -169,7 +210,10 @@ def patch_libero_robot_models() -> None:
         cls.default_controller_config = property(lambda self, name=controller: {"right": name})
 
 
-DEFAULT_CAMERAS = ("agentview", "frontview", "birdview")
+# Use the front-facing agent camera plus the two lateral depth cameras. In the
+# LIBERO tabletop frame, sideview is the observed right side and leftsideview is
+# its opposite camera added in the scene XML assets.
+DEFAULT_CAMERAS = ("agentview", "sideview", "leftsideview")
 
 
 def parse_args() -> argparse.Namespace:

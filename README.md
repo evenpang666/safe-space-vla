@@ -119,7 +119,7 @@ outputs/safe_space/*.npz                    SDF safe-space 文件
 python scripts/libero_reconstruct_pointcloud.py \
   --task-suite libero_spatial \
   --task-id 0 \
-  --camera-names agentview frontview birdview \
+  --camera-names agentview sideview leftsideview \
   --width 256 \
   --height 256 \
   --stride 2 \
@@ -204,7 +204,32 @@ python scripts/train_point_world_model.py \
 
 ## 4. OpenPI Safety Loss
 
-`OpenPISafetyLoss` 仍用于约束机器人点流不要进入 unsafe SDF。推荐传入 FK/URDF 导出的 TorchScript：
+`OpenPISafetyLoss` 可用于把几何正则接到 pi0.5 的 PyTorch 训练入口。当前有两条路线：
+
+- `joint_swept_boxes`：把 `state[..., :6]` 和预测 `action_chunk[..., :6]` 当作 UR5e 关节角 / 关节增量，生成 7 条线段扫略面，并对桌面障碍物 OBB 做 clearance 正则。
+- `torchscript` / `eef_sphere`：旧的机器人点流到 SDF 约束。
+
+当前 UR5e 竖立障碍场景可以先用 `joint_swept_boxes` 试跑；`--safety.obstacle_box_indices 0,1` 表示只约束两个黄色薄块，不把红色目标块当 forbidden obstacle：
+
+```bash
+cd thiry_party/openpi
+uv run scripts/train_pytorch.py pi05_libero \
+  --exp_name pi05_ur5e_joint_swept_boxes \
+  --overwrite \
+  --safety.robot_pointcloud_mode joint_swept_boxes \
+  --safety.obstacle_box_path ../../outputs/robosuite_collision_scene/ur5e_upright_blocks_safe_space_demo_safe_space.npz \
+  --safety.obstacle_box_indices 0,1 \
+  --safety.weight 0.05 \
+  --safety.margin 0.04 \
+  --safety.warmup_steps 2000 \
+  --safety.state_dim 6 \
+  --safety.action_dim 6 \
+  --safety.joint_swept_surface_samples 5 \
+  --safety.joint_swept_topk 128 \
+  --safety.joint_swept_gripper_width 0.085
+```
+
+SDF 约束仍可传入 FK/URDF 导出的 TorchScript：
 
 ```bash
 cd thiry_party/openpi
@@ -335,3 +360,36 @@ Safe RL 后训练建议只更新 LoRA、action head 或 residual head。`safe_rl
 ## 6. Legacy Learned Robot Pointcloud
 
 `scripts/train_robot_pointcloud_model.py` 和 `RobotSweptPointCloudModel` 仍保留，但不再是推荐主路线。它们只适合作 baseline，或在没有 FK/URDF 几何源时临时使用。若 FK 存在但有系统误差，应改用 `ResidualRobotPointFlowModel` 学 bounded residual，而不是从零学习机械臂几何。
+
+## 7. Upright Blocks LeRobot Demo Collection
+
+当前 UR5e upright-blocks 场景的数据采集脚本：
+
+```bash
+NUMBA_DISABLE_JIT=1 /home/evan/anaconda3/envs/libero/bin/python \
+  scripts/collect_upright_blocks_lerobot_demos.py \
+  --repo-id local/ur5e_upright_blocks \
+  --num-demos 50 \
+  --overwrite
+```
+
+默认采集逻辑：
+
+- 图像：保存 `frontview/sideview/leftsideview`，并额外提供 OpenPI LIBERO 兼容的 `image=frontview`、`wrist_image=leftsideview`。
+- 任务描述：每帧和每个 episode 固定保存 `pick up the red cube and place it on the plate without touching the yellow blocks`。
+- 状态：`state` / `observation.state` 为 6 个 UR5e arm joints + 1 个 gripper scalar。
+- 动作：`actions` / `action` 为实际观测到的 joint delta，即 `next_state - state`，不是 OSC 控制器命令。
+- 成功：红色物块在盘子上、夹爪已释放且不再接触红块，连续保持 `--success-hold` 步后才保存。
+- 失败：黄色立方体倾倒，或黄色立方体和任意非桌面几何发生接触，当前 attempt 直接丢弃并重来。
+- 时间：`--max-steps 0` 表示不限时，这是默认值。
+
+如果采集环境里没有 `lerobot` 包，脚本会先保存 raw `.npz` 备份；之后可在 OpenPI 环境转换：
+
+```bash
+cd thiry_party/openpi
+UV_CACHE_DIR=/tmp/uv-cache uv run python \
+  ../../scripts/collect_upright_blocks_lerobot_demos.py \
+  --convert-only ../../outputs/robosuite_collision_scene/lerobot_demos/<run>/raw \
+  --repo-id local/ur5e_upright_blocks \
+  --overwrite
+```
