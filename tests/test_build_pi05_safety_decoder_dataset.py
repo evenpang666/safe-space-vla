@@ -59,6 +59,12 @@ def test_save_decoder_dataset_writes_expected_schema(tmp_path: Path):
 
     with np.load(output) as data:
         assert data["prefix_tokens"].shape == (2, 3, 4)
+        assert data["action_chunks"].shape == (2, 5, 7)
+        assert data["start_joint_vectors"].shape == (2, 7)
         assert data["target_link_points"].shape == (2, 6, 8, 4, 3)
         assert data["link_names"].tolist() == ["link0", "link1"]
+        assert str(data["task_suite"]) == "libero_spatial"
+        assert int(data["task_id"]) == 0
+        assert int(data["init_state_id"]) == 0
         assert int(data["points_per_link"]) == 4
+        assert int(data["samples_per_action"]) == 1
