@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -87,23 +88,35 @@ def train_one_epoch(
 
 
 def save_checkpoint(
-    output: Path,
-    *,
+    path: Path,
     model: SafetyPointDecoder,
-    optimizer: torch.optim.Optimizer,
+    config: SafetyPointDecoderConfig,
     epoch: int,
     loss: float,
 ) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config_payload = config.to_dict()
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": model.config.to_dict(),
+            "config": config_payload,
             "epoch": int(epoch),
             "loss": float(loss),
         },
-        output,
+        path,
+    )
+    path.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "config": config_payload,
+                "epoch": int(epoch),
+                "loss": float(loss),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -139,7 +152,7 @@ def main() -> None:
         )
         print(f"epoch={epoch} loss={loss:.6f}")
 
-    save_checkpoint(args.output, model=model, optimizer=optimizer, epoch=args.epochs, loss=loss)
+    save_checkpoint(args.output, model, config, epoch=args.epochs, loss=loss)
     print(f"saved checkpoint to {args.output}")
 
 
