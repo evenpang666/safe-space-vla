@@ -45,6 +45,18 @@ def load_dataset_tensors(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
             "target_link_points must have shape (S, T, L, P, 3), "
             f"got {tuple(target_link_points.shape)}"
         )
+    if prefix_tokens.shape[0] <= 0:
+        raise ValueError("dataset must contain at least one sample")
+    if prefix_tokens.shape[1] <= 0:
+        raise ValueError("prefix_tokens token count must be positive")
+    if prefix_tokens.shape[2] <= 0:
+        raise ValueError("prefix_tokens token dimension must be positive")
+    if target_link_points.shape[1] <= 0:
+        raise ValueError("target_link_points horizon must be positive")
+    if target_link_points.shape[2] <= 0:
+        raise ValueError("target_link_points link count must be positive")
+    if target_link_points.shape[3] <= 0:
+        raise ValueError("target_link_points points per link must be positive")
     if target_link_points.shape[-1] != 3:
         raise ValueError(f"target_link_points last dimension must be 3, got {target_link_points.shape[-1]}")
     if prefix_tokens.shape[0] != target_link_points.shape[0]:
@@ -62,9 +74,11 @@ def train_one_epoch(
     device: torch.device,
 ) -> float:
     if batch_size <= 0:
-        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
     if prefix_tokens.shape[0] != targets.shape[0]:
         raise ValueError("prefix_tokens and targets must have the same first dimension")
+    if prefix_tokens.shape[0] <= 0:
+        raise ValueError("training dataset must contain at least one sample")
 
     model.train()
     num_samples = prefix_tokens.shape[0]
