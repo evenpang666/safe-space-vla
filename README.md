@@ -1,62 +1,14 @@
 # Safety Module Architecture
 
-这个模块现在按三层组织：
-
-1. **确定性机器人几何层**：从当前关节/状态和 action chunk 得到未来机器人点流 `robot_point_flow: (B, H, R, 3)`。优先使用 URDF/FK、控制器积分或仿真器几何，不再把“机器人 swept pointcloud”作为主要学习目标。只有在延迟、柔顺、控制误差或标定误差明显时，才用 `ResidualRobotPointFlowModel` 学小 residual。
-2. **接触/影响区域预测**：`PointWorldModel(scene_points, robot_point_flow)` 输出 `mask_logits: (B, H, N)`，回答当前场景点 `X_t` 中哪些点会在未来被机器人影响。
-3. **场景点流预测**：同一个 `PointWorldModel` 可输出 `flow: (B, H, N, 3)` 和 `future_points = X_t + flow`。有点级对应时用 weighted Huber/L1；没有对应时应在外层使用 Chamfer/Hausdorff/occupancy/SDF 目标。
-
-核心接口：
-
-```python
-from safety_module import PointWorldModel, point_world_model_loss
-
-outputs = model(scene_points, robot_point_flow, scene_features=None)
-loss, metrics = point_world_model_loss(
-    outputs,
-    scene_points=scene_points,
-    target_future_points=future_scene_points,
-    target_mask=affected_mask,
-    robot_point_flow=robot_point_flow,
-)
-```
-
-`point_world_model_loss` 会提高 moving points、near-robot points 和 near-contact points 的权重，避免训练被大量静态场景点支配。
 
 ## 0. 环境安装
 
-建议把环境拆成三类，不要把 OpenPI、LIBERO 和本仓库的轻量 PyTorch 训练脚本硬塞进同一个 Python 环境。OpenPI 当前要求 Python 3.11 和 `torch==2.7.1`，而 LIBERO/robosuite 依赖更偏 Python 3.8、旧版 Torch/MuJoCo。
-
-### 0.1 基础 safety module 环境
-
-这个环境用于训练 `PointWorldModel`、`PointCloudSafetyCritic`、构建 SDF、跑单元 smoke test 和导出 TorchScript：
+### 0.1 基础 safety module 和 openpi 环境
 
 ```bash
-conda create -n safety-module python=3.10 -y
-conda activate safety-module
+conda create -n safety python=3.11
+conda activate safety
 
-# CPU 版本足够跑数据处理和小规模 smoke test；有 CUDA 时可按本机驱动换成对应 PyTorch wheel。
-pip install numpy scipy torch torchvision tqdm matplotlib
-
-# 让 scripts/ 可以直接 import safety_module。
-export PYTHONPATH=$PWD:$PYTHONPATH
-```
-
-安装后做一次快速检查：
-
-```bash
-python -m compileall safety_module scripts
-python - <<'PY'
-import torch
-from safety_module import PointCloudSafetyCritic, geometric_safety_cost
-
-scene = torch.randn(2, 128, 3)
-robot = torch.randn(2, 10, 64, 3)
-critic = PointCloudSafetyCritic()
-out = critic(scene, robot)
-geom = geometric_safety_cost(scene, robot)
-print(out["cost"].shape, geom["min_distance"].shape)
-PY
 ```
 
 ### 0.2 LIBERO / MuJoCo 数据采集环境
@@ -84,32 +36,7 @@ export MUJOCO_GL=egl
 
 若本机没有 EGL/GPU 渲染，先用 `MUJOCO_GL=osmesa` 或在有显示环境的机器上采集点云；这部分取决于机器的 MuJoCo/OpenGL 驱动配置。
 
-### 0.3 OpenPI 训练环境
 
-OpenPI 使用 `uv` 管理依赖。推荐在 `thiry_party/openpi` 内按它自己的 workspace 安装：
-
-```bash
-cd thiry_party/openpi
-uv sync
-uv pip install -r examples/libero/requirements.txt
-cd ../..
-```
-
-运行 OpenPI 训练命令时，保持项目根目录可被 import：
-
-```bash
-export PYTHONPATH=$PWD:$PYTHONPATH
-cd thiry_party/openpi
-uv run scripts/train_pytorch.py pi05_libero --help
-```
-
-如果只是在 OpenPI 里复用本仓库导出的 TorchScript safety loss / collision critic，关键产物是：
-
-```text
-outputs/fk_robot_point_flow.pt              FK/仿真器导出的 robot point-flow TorchScript
-outputs/collision_critic/collision_critic.pt 训练后的 collision critic TorchScript
-outputs/safe_space/*.npz                    SDF safe-space 文件
-```
 
 ## 1. 重建当前场景点云
 
@@ -126,37 +53,7 @@ python scripts/libero_reconstruct_pointcloud.py \
   --output-dir outputs/libero_pointcloud
 ```
 
-## 2. 生成确定性机器人点流
-
-LIBERO 中先用仿真器几何生成每个未来步的 robot point flow。输出里 `robot_point_flow` 是主字段，`points` 只是 legacy union swept cloud：
-
-```bash
-/home/evan/anaconda3/envs/libero/bin/python scripts/collect_libero_robot_swept_dataset.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --num-samples 20000 \
-  --horizon 10 \
-  --action-scale 0.35 \
-  --random-prefix-steps 5 \
-  --reset-every 5 \
-  --points-per-geom 80 \
-  --target-points 1024 \
-  --disable-nonrobot-collisions \
-  --mujoco-gl egl \
-  --output outputs/robot_point_flow/libero_spatial_task0_robot_flow.npz
-```
-
-可视化单个 action chunk 的机器人 swept volume：
-
-```bash
-/home/evan/anaconda3/envs/libero/bin/python scripts/libero_robot_swept_pointcloud.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --horizon 50 \
-  --points-per-geom 800 \
-  --include-initial \
-  --mujoco-gl egl
-```
+## 2. 生成机器人点流和障碍物obb
 
 ### 2.1 LIBERO 点云和 safespace 图片生成
 
@@ -273,51 +170,6 @@ outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_p
 outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept.npz
 ```
 
-生成随机 `action_chunk` 长度为 10 的机械臂点云扫略过程图。这里使用固定 robot geom 表面模板并随仿真 rollout 变换，因此相邻 step 的同索引点有稳定对应关系，图中黄色线连接每两步间的对应点。
-
-```bash
-$LIBERO_PY scripts/libero_robot_pointcloud_sweep_process.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --horizon 10 \
-  --points-per-geom 300 \
-  --action-scale 0.18 \
-  --seed 0 \
-  --plot-elev 18 \
-  --plot-azim 0 \
-  --max-line-points 3000 \
-  --output-dir outputs/libero_robot_pointcloud_sweep_process \
-  --mujoco-gl egl
-```
-
-主要输出：
-
-```text
-outputs/libero_robot_pointcloud_sweep_process/${TASK}_random10_robot_pointcloud_process_frontview_yellow_lines.png
-outputs/libero_robot_pointcloud_sweep_process/${TASK}_random10_robot_pointcloud_process.npz
-outputs/libero_robot_pointcloud_sweep_process/${TASK}_random10_robot_pointcloud_process.ply
-outputs/libero_robot_pointcloud_sweep_process/${TASK}_random10_robot_pointcloud_process_actions.npy
-```
-
-把机械臂扫略点云和障碍物 OBB 渲染成正面检查图：
-
-如果 `outputs/libero_robot_swept_pointcloud/${TASK}_robot_swept.npz` 还不存在，先运行本节前面的 `scripts/libero_robot_swept_pointcloud.py` swept volume 命令。
-
-```bash
-$LIBERO_PY scripts/render_libero_frontview_figures.py \
-  --swept-pointcloud outputs/libero_robot_swept_pointcloud/${TASK}_robot_swept.npz \
-  --scene-pointcloud outputs/libero_pointcloud/${TASK}_pointcloud.npz \
-  --obb-safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz \
-  --output-dir outputs/libero_frontview_figures \
-  --name ${TASK}
-```
-
-主要输出：
-
-```text
-outputs/libero_frontview_figures/${TASK}_frontview_swept_pointcloud.png
-outputs/libero_frontview_figures/${TASK}_frontview_obstacle_pointcloud_obb.png
-```
 
 
 ## 3. Upright Blocks LeRobot Demo Collection
