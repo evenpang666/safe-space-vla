@@ -33,6 +33,7 @@ from create_robosuite_upright_blocks_scene import (  # noqa: E402
     UprightBlocksLift,
 )
 from robosuite.controllers import load_controller_config  # noqa: E402
+from robosuite.utils import camera_utils  # noqa: E402
 
 
 LINK_ANCHOR_BODIES = (
@@ -108,6 +109,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=170, help="Output figure DPI.")
     parser.add_argument("--elev", type=float, default=24.0, help="Matplotlib 3D elevation.")
     parser.add_argument("--azim", type=float, default=-58.0, help="Matplotlib 3D azimuth.")
+    parser.add_argument("--frontview-width", type=int, default=384, help="Front camera sweep image width in pixels.")
+    parser.add_argument("--frontview-height", type=int, default=384, help="Front camera sweep image height in pixels.")
+    parser.add_argument(
+        "--frontview-overlay-alpha",
+        type=float,
+        default=0.45,
+        help="Opacity of the projected sweep mask in the front camera overlay.",
+    )
+    parser.add_argument(
+        "--swept-point-link-samples",
+        type=int,
+        default=8,
+        help="Number of sparse points sampled along each joint-link segment on every swept panel.",
+    )
+    parser.add_argument(
+        "--swept-point-time-samples",
+        type=int,
+        default=2,
+        help="Number of sparse points sampled along each swept panel's time direction.",
+    )
+    parser.add_argument(
+        "--frontview-point-size",
+        type=float,
+        default=5.0,
+        help="Scatter marker size for front-view swept point previews.",
+    )
+    parser.add_argument(
+        "--frontview-point-elev",
+        type=float,
+        default=18.0,
+        help="Matplotlib elevation for the front-view 3D swept point preview.",
+    )
+    parser.add_argument(
+        "--frontview-point-azim",
+        type=float,
+        default=0.0,
+        help="Matplotlib azimuth for the front-view 3D swept point preview.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--name", default="ur5e_upright_blocks_joint_swept_surfaces")
     return parser.parse_args()
@@ -300,6 +339,47 @@ def build_swept_panels(segment_path: np.ndarray) -> tuple[np.ndarray, np.ndarray
     )
 
 
+def sample_swept_surface_points(
+    segment_path: np.ndarray,
+    link_samples: int,
+    time_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if link_samples < 2:
+        raise ValueError("--swept-point-link-samples must be >= 2")
+    if time_samples < 2:
+        raise ValueError("--swept-point-time-samples must be >= 2")
+
+    segment_path = np.asarray(segment_path, dtype=np.float64)
+    if segment_path.ndim != 4 or segment_path.shape[-2:] != (2, 3):
+        raise ValueError(f"segment_path must have shape (T, L, 2, 3), got {segment_path.shape}")
+
+    u_values = np.linspace(0.0, 1.0, link_samples, dtype=np.float64)
+    v_values = np.linspace(0.0, 1.0, time_samples, dtype=np.float64)
+    points = []
+    link_ids = []
+    step_ids = []
+    for step_idx in range(segment_path.shape[0] - 1):
+        s0 = segment_path[step_idx]
+        s1 = segment_path[step_idx + 1]
+        for link_idx in range(segment_path.shape[1]):
+            p00 = s0[link_idx, 0]
+            p01 = s0[link_idx, 1]
+            p10 = s1[link_idx, 0]
+            p11 = s1[link_idx, 1]
+            for v in v_values:
+                start = (1.0 - v) * p00 + v * p10
+                end = (1.0 - v) * p01 + v * p11
+                for u in u_values:
+                    points.append((1.0 - u) * start + u * end)
+                    link_ids.append(link_idx)
+                    step_ids.append(step_idx)
+    return (
+        np.asarray(points, dtype=np.float64),
+        np.asarray(link_ids, dtype=np.int64),
+        np.asarray(step_ids, dtype=np.int64),
+    )
+
+
 def cuboid_faces(center: np.ndarray, half_size: np.ndarray, rotation: np.ndarray | None = None) -> list[np.ndarray]:
     signs = np.array(
         [
@@ -469,6 +549,198 @@ def save_visualization(
     plt.close(fig)
 
 
+def render_camera_rgb(sim, camera_name: str, width: int, height: int) -> np.ndarray:
+    rgb = sim.render(camera_name=camera_name, width=width, height=height, depth=False)
+    if isinstance(rgb, (tuple, list)):
+        rgb = rgb[0]
+    return np.asarray(rgb, dtype=np.uint8)[::-1]
+
+
+def project_world_points_to_camera_pixels(
+    sim,
+    camera_name: str,
+    width: int,
+    height: int,
+    points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    intrinsic = camera_utils.get_camera_intrinsic_matrix(
+        sim=sim,
+        camera_name=camera_name,
+        camera_height=height,
+        camera_width=width,
+    )
+    camera_to_world = camera_utils.get_camera_extrinsic_matrix(sim=sim, camera_name=camera_name)
+    world_to_camera = np.linalg.inv(camera_to_world)
+
+    hom = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float64)], axis=1)
+    camera_points = (world_to_camera @ hom.T).T[:, :3]
+    z = camera_points[:, 2]
+    valid = np.isfinite(camera_points).all(axis=1) & (z > 1e-6)
+
+    uv = np.full((points.shape[0], 2), np.nan, dtype=np.float64)
+    uv[valid, 0] = intrinsic[0, 0] * camera_points[valid, 0] / z[valid] + intrinsic[0, 2]
+    uv[valid, 1] = intrinsic[1, 1] * camera_points[valid, 1] / z[valid] + intrinsic[1, 2]
+    return uv, valid
+
+
+def rasterize_polygons(polygons: np.ndarray, height: int, width: int) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    mask_image = Image.new("L", (int(width), int(height)), 0)
+    draw = ImageDraw.Draw(mask_image)
+    for polygon in np.asarray(polygons, dtype=np.float64):
+        finite = np.isfinite(polygon).all(axis=1)
+        if np.count_nonzero(finite) < 3:
+            continue
+        coords = [tuple(point) for point in polygon[finite]]
+        draw.polygon(coords, fill=255)
+    return np.asarray(mask_image, dtype=np.uint8)
+
+
+def projected_swept_mask(
+    sim,
+    camera_name: str,
+    width: int,
+    height: int,
+    panels: np.ndarray,
+) -> np.ndarray:
+    panel_points = np.asarray(panels, dtype=np.float64).reshape(-1, 3)
+    uv, valid = project_world_points_to_camera_pixels(sim, camera_name, width, height, panel_points)
+    uv_panels = uv.reshape(-1, 4, 2)
+    valid_panels = valid.reshape(-1, 4)
+    return rasterize_polygons(uv_panels[valid_panels.all(axis=1)], height=height, width=width)
+
+
+def overlay_mask(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int] = (255, 80, 20),
+    alpha: float = 0.45,
+) -> np.ndarray:
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    mask_bool = np.asarray(mask) > 0
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    overlay = rgb.astype(np.float32, copy=True)
+    color_arr = np.asarray(color, dtype=np.float32)
+    overlay[mask_bool] = (1.0 - alpha) * overlay[mask_bool] + alpha * color_arr
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+def point_colors(link_ids: np.ndarray) -> np.ndarray:
+    link_ids = np.asarray(link_ids, dtype=np.int64)
+    return (LINK_COLORS[link_ids % len(LINK_COLORS), :3] * 255.0).astype(np.uint8)
+
+
+def projected_point_image(
+    sim,
+    camera_name: str,
+    width: int,
+    height: int,
+    points: np.ndarray,
+    colors: np.ndarray,
+    point_radius: int = 2,
+    background: np.ndarray | None = None,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    if background is None:
+        canvas = Image.new("RGB", (int(width), int(height)), (255, 255, 255))
+    else:
+        canvas = Image.fromarray(np.asarray(background, dtype=np.uint8), mode="RGB")
+    draw = ImageDraw.Draw(canvas)
+
+    uv, valid = project_world_points_to_camera_pixels(sim, camera_name, width, height, points)
+    order = np.argsort(points[:, 0])[::-1]
+    radius = int(max(point_radius, 1))
+    for idx in order:
+        if not valid[idx]:
+            continue
+        x, y = uv[idx]
+        if x < -radius or x >= width + radius or y < -radius or y >= height + radius:
+            continue
+        color = tuple(int(c) for c in colors[idx])
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def save_frontview_swept_point_outputs(
+    env,
+    output_prefix: Path,
+    points: np.ndarray,
+    link_ids: np.ndarray,
+    width: int,
+    height: int,
+    point_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    from PIL import Image
+
+    colors = point_colors(link_ids)
+    rgb = render_camera_rgb(env.sim, "frontview", width, height)
+    radius = max(1, int(round(point_size / 2.0)))
+    point_image = projected_point_image(env.sim, "frontview", width, height, points, colors, radius)
+    point_overlay = projected_point_image(env.sim, "frontview", width, height, points, colors, radius, background=rgb)
+    Image.fromarray(point_image).save(output_prefix.with_name(f"{output_prefix.name}_frontview_swept_points.png"))
+    Image.fromarray(point_overlay).save(output_prefix.with_name(f"{output_prefix.name}_frontview_swept_points_overlay.png"))
+    np.save(output_prefix.with_name(f"{output_prefix.name}_swept_surface_points.npy"), points.astype(np.float32))
+    return point_image, point_overlay
+
+
+def save_frontview_3d_point_plot(
+    path: Path,
+    env,
+    points: np.ndarray,
+    link_ids: np.ndarray,
+    args: argparse.Namespace,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(args.width, args.height), dpi=args.dpi)
+    ax = fig.add_subplot(111, projection="3d")
+    draw_scene(ax, env)
+    colors = LINK_COLORS[np.asarray(link_ids, dtype=np.int64) % len(LINK_COLORS), :3]
+    ax.scatter(
+        points[:, 0],
+        points[:, 1],
+        points[:, 2],
+        c=colors,
+        s=float(args.frontview_point_size),
+        alpha=0.85,
+        depthshade=False,
+    )
+    set_axes_equal(ax, points, margin=0.10)
+    ax.view_init(elev=args.frontview_point_elev, azim=args.frontview_point_azim)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_zlabel("z (m)")
+    ax.set_title("Sparse swept-surface points, front view")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def save_frontview_swept_outputs(
+    env,
+    panels: np.ndarray,
+    output_prefix: Path,
+    width: int,
+    height: int,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    from PIL import Image
+
+    rgb = render_camera_rgb(env.sim, "frontview", width, height)
+    mask = projected_swept_mask(env.sim, "frontview", width, height, panels)
+    overlay = overlay_mask(rgb, mask, alpha=alpha)
+
+    Image.fromarray(rgb).save(output_prefix.with_name(f"{output_prefix.name}_frontview_rgb.png"))
+    Image.fromarray(mask).save(output_prefix.with_name(f"{output_prefix.name}_frontview_swept_mask.png"))
+    Image.fromarray(overlay).save(output_prefix.with_name(f"{output_prefix.name}_frontview_swept_overlay.png"))
+    np.save(output_prefix.with_name(f"{output_prefix.name}_frontview_swept_mask.npy"), mask)
+    return rgb, mask, overlay
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -523,14 +795,45 @@ def main() -> None:
         )
         segment_path = build_link_segments(anchor_path, gripper_rotation_path, args.gripper_width)
         panels, panel_link_ids, panel_step_ids = build_swept_panels(segment_path)
+        swept_points, swept_point_link_ids, swept_point_step_ids = sample_swept_surface_points(
+            segment_path,
+            link_samples=args.swept_point_link_samples,
+            time_samples=args.swept_point_time_samples,
+        )
 
         prefix = args.name
         png_path = args.output_dir / f"{prefix}.png"
         npz_path = args.output_dir / f"{prefix}.npz"
         action_path = args.output_dir / f"{prefix}_actions.npy"
         joint_path_path = args.output_dir / f"{prefix}_joint_path.npy"
+        output_prefix = args.output_dir / prefix
+        frontview_point_plot_path = args.output_dir / f"{prefix}_frontview_swept_points_3d.png"
 
         save_visualization(png_path, env, anchor_path, segment_path, panels, panel_link_ids, args)
+        save_frontview_3d_point_plot(
+            frontview_point_plot_path,
+            env,
+            swept_points,
+            swept_point_link_ids,
+            args,
+        )
+        frontview_swept_points, frontview_swept_points_overlay = save_frontview_swept_point_outputs(
+            env=env,
+            output_prefix=output_prefix,
+            points=swept_points,
+            link_ids=swept_point_link_ids,
+            width=args.frontview_width,
+            height=args.frontview_height,
+            point_size=args.frontview_point_size,
+        )
+        frontview_rgb, frontview_swept_mask, frontview_swept_overlay = save_frontview_swept_outputs(
+            env=env,
+            panels=panels,
+            output_prefix=output_prefix,
+            width=args.frontview_width,
+            height=args.frontview_height,
+            alpha=args.frontview_overlay_alpha,
+        )
         np.save(action_path, action_chunk.astype(np.float32))
         np.save(joint_path_path, joint_path.astype(np.float32))
         np.savez_compressed(
@@ -544,9 +847,21 @@ def main() -> None:
             panels=panels.astype(np.float32),
             panel_link_ids=panel_link_ids.astype(np.int16),
             panel_step_ids=panel_step_ids.astype(np.int16),
+            swept_surface_points=swept_points.astype(np.float32),
+            swept_surface_point_link_ids=swept_point_link_ids.astype(np.int16),
+            swept_surface_point_step_ids=swept_point_step_ids.astype(np.int16),
+            frontview_rgb=frontview_rgb.astype(np.uint8),
+            frontview_swept_mask=frontview_swept_mask.astype(np.uint8),
+            frontview_swept_overlay=frontview_swept_overlay.astype(np.uint8),
+            frontview_swept_points=frontview_swept_points.astype(np.uint8),
+            frontview_swept_points_overlay=frontview_swept_points_overlay.astype(np.uint8),
             link_names=np.asarray(LINK_NAMES),
             link_anchor_bodies=np.asarray(LINK_ANCHOR_BODIES),
             gripper_width=np.array(args.gripper_width, dtype=np.float32),
+            frontview_width=np.array(args.frontview_width, dtype=np.int32),
+            frontview_height=np.array(args.frontview_height, dtype=np.int32),
+            swept_point_link_samples=np.array(args.swept_point_link_samples, dtype=np.int32),
+            swept_point_time_samples=np.array(args.swept_point_time_samples, dtype=np.int32),
         )
 
         print(f"[info] start_joint_vector: {np.array2string(start_joint_vector, precision=4)}")
@@ -554,7 +869,13 @@ def main() -> None:
         print(f"[info] joint FK samples: {joint_path.shape[0]}")
         print(f"[info] gripper virtual segment width: {args.gripper_width:.4f} m")
         print(f"[info] swept panels: {panels.shape[0]} ({len(LINK_NAMES)} links x {joint_path.shape[0] - 1} intervals)")
+        print(f"[info] sparse swept surface points: {swept_points.shape[0]}")
         print(f"[done] saved visualization: {png_path}")
+        print(f"[done] saved frontview 3D point plot: {frontview_point_plot_path}")
+        print(f"[done] saved frontview projected points: {output_prefix}_frontview_swept_points.png")
+        print(f"[done] saved frontview projected point overlay: {output_prefix}_frontview_swept_points_overlay.png")
+        print(f"[done] saved frontview sweep mask: {output_prefix}_frontview_swept_mask.png")
+        print(f"[done] saved frontview sweep overlay: {output_prefix}_frontview_swept_overlay.png")
         print(f"[done] saved swept surface data: {npz_path}")
         print(f"[done] saved actions: {action_path}")
         print(f"[done] saved joint path: {joint_path_path}")

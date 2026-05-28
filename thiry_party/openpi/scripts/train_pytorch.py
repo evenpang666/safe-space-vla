@@ -29,9 +29,7 @@ import logging
 import os
 import platform
 import shutil
-import sys
 import time
-from pathlib import Path
 
 import jax
 import numpy as np
@@ -47,12 +45,6 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from safety_module import OpenPISafetyLoss  # noqa: E402
 
 
 def init_logging():
@@ -314,15 +306,6 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
-def safety_weight_at_step(safety_config: _config.SafetyLossConfig, step: int) -> float:
-    if not safety_config.enabled or step < safety_config.start_step:
-        return 0.0
-    if safety_config.warmup_steps <= 0:
-        return float(safety_config.weight)
-    progress = min(1.0, (step - safety_config.start_step + 1) / safety_config.warmup_steps)
-    return float(safety_config.weight) * progress
-
-
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -374,38 +357,6 @@ def train_loop(config: _config.TrainConfig):
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
-
-    safety_loss_fn = None
-    if config.safety.enabled:
-        safety_loss_fn = OpenPISafetyLoss(
-            sdf_path=config.safety.sdf_path,
-            data_config=data_config,
-            margin=config.safety.margin,
-            obstacle_box_path=config.safety.obstacle_box_path,
-            obstacle_box_indices=config.safety.obstacle_box_indices,
-            robot_pointcloud_model_path=config.safety.robot_pointcloud_model_path,
-            robot_pointcloud_mode=config.safety.robot_pointcloud_mode,
-            eef_sphere_radius=config.safety.eef_sphere_radius,
-            eef_sphere_points=config.safety.eef_sphere_points,
-            eef_action_scale=config.safety.eef_action_scale,
-            joint_action_scale=config.safety.joint_action_scale,
-            joint_swept_surface_samples=config.safety.joint_swept_surface_samples,
-            joint_swept_topk=config.safety.joint_swept_topk,
-            joint_swept_gripper_width=config.safety.joint_swept_gripper_width,
-            joint_swept_base_position=config.safety.joint_swept_base_position,
-            state_dim=config.safety.state_dim,
-            action_dim=config.safety.action_dim,
-            device=device,
-        ).to(device)
-        safety_loss_fn.eval()
-        logging.info(
-            "Enabled safety loss: sdf=%s boxes=%s weight=%s margin=%s mode=%s",
-            config.safety.sdf_path,
-            config.safety.obstacle_box_path,
-            config.safety.weight,
-            config.safety.margin,
-            config.safety.robot_pointcloud_mode,
-        )
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
@@ -575,25 +526,14 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            model_outputs = model(observation, actions, return_outputs=safety_loss_fn is not None)
-            losses = model_outputs["losses"] if isinstance(model_outputs, dict) else model_outputs
+            losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            bc_loss = losses.mean()
-            loss = bc_loss
-            safety_raw_loss = None
-            safety_active_weight = 0.0
-            safety_info = {}
-            if safety_loss_fn is not None:
-                safety_active_weight = safety_weight_at_step(config.safety, global_step)
-                if safety_active_weight > 0.0:
-                    pred_actions = model_outputs["pred_actions"]
-                    safety_raw_loss, safety_info = safety_loss_fn(observation.state, pred_actions)
-                    loss = loss + safety_active_weight * safety_raw_loss
+            loss = losses.mean()
 
             # Backward pass
             loss.backward()
@@ -620,33 +560,17 @@ def train_loop(config: _config.TrainConfig):
                 infos.append(
                     {
                         "loss": loss.item(),
-                        "bc_loss": bc_loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
                 )
-                if safety_raw_loss is not None:
-                    infos[-1].update(
-                        {
-                            "safety_loss": safety_raw_loss.item(),
-                            "safety_weight": safety_active_weight,
-                            "safety_min_sdf": float(safety_info["min_sdf"]),
-                            "safety_unsafe_ratio": float(safety_info["unsafe_ratio"]),
-                            "safety_margin_violation_ratio": float(safety_info["margin_violation_ratio"]),
-                        }
-                    )
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_bc_loss = sum(info["bc_loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
-                avg_safety_loss = None
-                if any("safety_loss" in info for info in infos):
-                    safety_vals = [info["safety_loss"] for info in infos if "safety_loss" in info]
-                    avg_safety_loss = sum(safety_vals) / len(safety_vals)
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -656,39 +580,19 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} bc={avg_bc_loss:.4f} safety={avg_safety_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None and avg_safety_loss is not None
-                    else f"step={global_step} loss={avg_loss:.4f} bc={avg_bc_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} bc={avg_bc_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
-                        "bc_loss": avg_bc_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
-                    if avg_safety_loss is not None:
-                        safety_infos = [info for info in infos if "safety_loss" in info]
-                        log_payload.update(
-                            {
-                                "safety_loss": avg_safety_loss,
-                                "safety_weight": sum(info["safety_weight"] for info in safety_infos)
-                                / len(safety_infos),
-                                "safety_min_sdf": sum(info["safety_min_sdf"] for info in safety_infos)
-                                / len(safety_infos),
-                                "safety_unsafe_ratio": sum(info["safety_unsafe_ratio"] for info in safety_infos)
-                                / len(safety_infos),
-                                "safety_margin_violation_ratio": sum(
-                                    info["safety_margin_violation_ratio"] for info in safety_infos
-                                )
-                                / len(safety_infos),
-                            }
-                        )
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)

@@ -314,6 +314,25 @@ def estimate_table_workspace_bounds(
     return bounds, slab_count
 
 
+def table_aligned_display_bounds(
+    workspace_bounds: np.ndarray,
+    table_z: float,
+    table_xy_bounds: np.ndarray | None = None,
+) -> np.ndarray:
+    """Bounds used only for dashed visualization, with its bottom on the table."""
+
+    bounds = np.asarray(workspace_bounds, dtype=np.float32).copy()
+    if table_xy_bounds is not None:
+        xy = np.asarray(table_xy_bounds, dtype=np.float32)
+        if xy.shape != (4,):
+            raise ValueError(f"table_xy_bounds must have shape (4,), got {xy.shape}")
+        bounds[:4] = xy
+    bounds[4] = np.float32(table_z)
+    if bounds[5] <= bounds[4]:
+        bounds[5] = bounds[4] + np.float32(1e-3)
+    return bounds
+
+
 def bounds_to_origin_shape(bounds: np.ndarray, voxel_size: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mins = np.array([bounds[0], bounds[2], bounds[4]], dtype=np.float32)
     maxs = np.array([bounds[1], bounds[3], bounds[5]], dtype=np.float32)
@@ -823,6 +842,7 @@ def save_visualization(
     points: np.ndarray,
     colors: np.ndarray | None,
     bounds: np.ndarray,
+    display_bounds: np.ndarray,
     obstacle_centers: np.ndarray,
     voxel_size: float,
     max_obstacle_cubes: int,
@@ -890,12 +910,12 @@ def save_visualization(
         )
         ax.add_collection3d(cubes)
 
-    draw_workspace_edges(ax, bounds)
+    draw_workspace_edges(ax, display_bounds)
     ax.set_xlabel("world x")
     ax.set_ylabel("world y")
     ax.set_zlabel("world z")
     ax.view_init(elev=25, azim=-55)
-    set_equal_axes(ax, bounds)
+    set_equal_axes(ax, display_bounds)
     title = f"workspace + obstacle cubes ({len(obstacle_centers)} total"
     if len(draw_centers) != len(obstacle_centers):
         title += f", {len(draw_centers)} drawn"
@@ -912,6 +932,7 @@ def save_box_visualization(
     points: np.ndarray,
     colors: np.ndarray | None,
     bounds: np.ndarray,
+    display_bounds: np.ndarray,
     box_mins: np.ndarray,
     box_maxs: np.ndarray,
     box_corners: np.ndarray,
@@ -982,12 +1003,12 @@ def save_box_visualization(
             label = f"{i + 1}: {int(component_point_counts[i])}"
         ax.text(center[0], center[1], box_max[2] + 0.015, label, color=color[:3], fontsize=8)
 
-    draw_workspace_edges(ax, bounds)
+    draw_workspace_edges(ax, display_bounds)
     ax.set_xlabel("world x")
     ax.set_ylabel("world y")
     ax.set_zlabel("world z")
     ax.view_init(elev=28, azim=-58)
-    set_equal_axes(ax, bounds)
+    set_equal_axes(ax, display_bounds)
     ax.set_title(f"tabletop obstacle {box_orientation} bounding boxes ({len(box_mins)} boxes)")
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1036,6 +1057,8 @@ def main() -> None:
                 "workspace z max must be above table_z for tabletop_boxes mode. "
                 "Increase --workspace-bounds ZMAX or pass a lower --table-z."
             )
+
+    display_bounds = table_aligned_display_bounds(bounds, table_z, bounds[:4])
 
     box_mins = np.zeros((0, 3), dtype=np.float32)
     box_maxs = np.zeros((0, 3), dtype=np.float32)
@@ -1098,6 +1121,7 @@ def main() -> None:
     np.savez_compressed(
         npz_path,
         workspace_bounds=bounds.astype(np.float32),
+        display_workspace_bounds=display_bounds.astype(np.float32),
         workspace_mode=np.array(args.workspace_mode),
         obstacle_mode=np.array(args.obstacle_mode),
         table_z=np.array(table_z, dtype=np.float32),
@@ -1132,6 +1156,7 @@ def main() -> None:
             points=points,
             colors=colors,
             bounds=bounds,
+            display_bounds=display_bounds,
             obstacle_centers=obstacle_centers,
             voxel_size=args.voxel_size,
             max_obstacle_cubes=args.max_obstacle_cubes,
@@ -1144,6 +1169,7 @@ def main() -> None:
             points=points,
             colors=colors,
             bounds=bounds,
+            display_bounds=display_bounds,
             box_mins=box_mins,
             box_maxs=box_maxs,
             box_corners=box_corners,
@@ -1154,6 +1180,7 @@ def main() -> None:
         )
 
     print(f"[done] workspace bounds xyz: {bounds}")
+    print(f"[done] display workspace bounds xyz: {display_bounds}")
     print(f"[done] workspace mode: {args.workspace_mode}")
     print(f"[done] obstacle mode: {args.obstacle_mode}")
     print(f"[done] table z: {table_z}")

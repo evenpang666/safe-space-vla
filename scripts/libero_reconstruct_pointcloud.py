@@ -279,6 +279,11 @@ def parse_args() -> argparse.Namespace:
         help="Keep robot points in the reconstructed cloud. By default robot pixels are removed.",
     )
     parser.add_argument(
+        "--only-robot",
+        action="store_true",
+        help="Keep only visible robot surface points from the depth cameras.",
+    )
+    parser.add_argument(
         "--robot-mask-dilation",
         type=int,
         default=1,
@@ -312,7 +317,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="MuJoCo OpenGL backend. Must be set before robosuite is imported.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.include_robot and args.only_robot:
+        parser.error("--include-robot and --only-robot are mutually exclusive")
+    return args
 
 
 def resolve_task(args: argparse.Namespace) -> tuple[Path, str, np.ndarray | None]:
@@ -649,7 +657,9 @@ def main() -> None:
     try:
         settle_scene(env, init_state, args.num_steps_wait)
         robot_geom_ids = set() if args.include_robot else find_robot_geoms(env)
-        if args.include_robot:
+        if args.only_robot:
+            print(f"[info] robot geoms kept in point cloud: {len(robot_geom_ids)}")
+        elif args.include_robot:
             print("[info] robot filtering disabled; robot points will be kept")
         else:
             print(f"[info] robot geoms excluded from point cloud: {len(robot_geom_ids)}")
@@ -661,15 +671,16 @@ def main() -> None:
                 rgb, depth_m = render_rgbd(env.sim, camera_name, args.width, args.height)
                 keep_mask = None
                 if not args.include_robot:
+                    mask_dilation = 0 if args.only_robot else args.robot_mask_dilation
                     robot_mask = robot_pixel_mask(
                         sim=env.sim,
                         camera_name=camera_name,
                         width=args.width,
                         height=args.height,
                         robot_geom_ids=robot_geom_ids,
-                        dilation=args.robot_mask_dilation,
+                        dilation=mask_dilation,
                     )
-                    keep_mask = ~robot_mask
+                    keep_mask = robot_mask if args.only_robot else ~robot_mask
                     if args.save_robot_masks:
                         np.save(args.output_dir / f"{task_name}_{camera_name}_robot_mask.npy", robot_mask)
             except Exception as exc:
@@ -688,7 +699,10 @@ def main() -> None:
             np.save(args.output_dir / f"{task_name}_{camera_name}_depth.npy", depth_m)
             all_points.append(points)
             all_colors.append(colors)
-            if args.include_robot:
+            if args.only_robot:
+                kept = int(np.count_nonzero(robot_mask))
+                print(f"[info] {camera_name}: {len(points)} visible robot points from {kept} robot pixels")
+            elif args.include_robot:
                 print(f"[info] {camera_name}: {len(points)} points")
             else:
                 removed = int(np.count_nonzero(robot_mask))
@@ -700,13 +714,26 @@ def main() -> None:
         points = np.concatenate(all_points, axis=0)
         colors = np.concatenate(all_colors, axis=0)
         points, colors = crop_workspace(points, colors, args.workspace_bounds)
+        if len(points) == 0:
+            raise RuntimeError("The reconstructed point cloud is empty after filtering.")
 
         safe_task_name = task_name.replace("/", "_")
-        npz_path = args.output_dir / f"{safe_task_name}_pointcloud.npz"
-        ply_path = args.output_dir / f"{safe_task_name}_pointcloud.ply"
-        preview_path = args.output_dir / f"{safe_task_name}_pointcloud_preview.png"
+        output_stem = (
+            f"{safe_task_name}_visible_robot_pointcloud"
+            if args.only_robot
+            else f"{safe_task_name}_pointcloud"
+        )
+        npz_path = args.output_dir / f"{output_stem}.npz"
+        ply_path = args.output_dir / f"{output_stem}.ply"
+        preview_path = args.output_dir / f"{output_stem}_preview.png"
 
-        np.savez_compressed(npz_path, points=points.astype(np.float32), colors=colors.astype(np.uint8))
+        np.savez_compressed(
+            npz_path,
+            points=points.astype(np.float32),
+            colors=colors.astype(np.uint8),
+            camera_names=np.asarray(list(args.camera_names)),
+            point_mode=np.asarray("visible_robot" if args.only_robot else "scene"),
+        )
         write_ascii_ply(ply_path, points, colors)
         save_preview_png(preview_path, points, colors, args.preview_points)
 
