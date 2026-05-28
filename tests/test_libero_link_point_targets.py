@@ -44,6 +44,9 @@ def test_sample_link_points_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="points_per_link must be >= 2"):
         sample_link_points_from_segments(np.zeros((2, 1, 2, 3)), points_per_link=1)
 
+    with pytest.raises(ValueError, match="points_per_link must be an integer"):
+        sample_link_points_from_segments(np.zeros((2, 1, 2, 3)), points_per_link=2.9)
+
     with pytest.raises(ValueError, match="segment_path must have shape"):
         sample_link_points_from_segments(np.zeros((2, 1, 3)), points_per_link=2)
 

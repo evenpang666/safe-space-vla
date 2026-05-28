@@ -16,13 +16,19 @@ def sample_link_points_from_segments(segment_path: np.ndarray, points_per_link: 
     Returns:
         Array with shape ``(T, L, points_per_link, 3)``.
     """
+    try:
+        point_count = int(points_per_link)
+    except (TypeError, ValueError):
+        raise ValueError("points_per_link must be an integer") from None
+    if point_count != points_per_link:
+        raise ValueError("points_per_link must be an integer")
     if points_per_link < 2:
         raise ValueError("points_per_link must be >= 2")
     segment_path = np.asarray(segment_path, dtype=np.float64)
     if segment_path.ndim != 4 or segment_path.shape[-2:] != (2, 3):
         raise ValueError(f"segment_path must have shape (T, L, 2, 3), got {segment_path.shape}")
 
-    u = np.linspace(0.0, 1.0, int(points_per_link), dtype=np.float64)
+    u = np.linspace(0.0, 1.0, point_count, dtype=np.float64)
     start = segment_path[:, :, 0, :]
     end = segment_path[:, :, 1, :]
     points = (1.0 - u[None, None, :, None]) * start[:, :, None, :]
