@@ -144,16 +144,22 @@ outputs/libero_visible_robot_pointcloud_frontview_render/${TASK}_three_view_visi
 outputs/libero_visible_robot_pointcloud_frontview_render/${TASK}_three_view_visible_robot_pointcloud_frontview_projected_overlay.png
 ```
 
-生成 LIBERO / Franka 机械臂关节连线扫略点云。这个脚本不是采样机器人 mesh 几何，而是用 FK 得到 `robot0_link0..robot0_link7` 的关节锚点连线，并额外加入沿夹爪 x 轴方向的末端夹爪宽度线段。
+生成 LIBERO / Franka 机械臂 skeleton 扫略点云。默认 `--skeleton-source geom` 会在每个 FK 采样时刻读取机器人 MuJoCo geoms 的包络中心轴：capsule / cylinder 用几何体中心轴，box / ellipsoid 用最长中心轴，mesh 用编译后顶点包围盒最长中心轴；这比原来的 `robot0_link0..robot0_link7` 关节锚点连线更接近机械臂包裹面的中心。可视化时同一连杆 body 下的多个 geom 使用同一种颜色，不同连杆使用不同颜色。需要对比旧逻辑时可加 `--skeleton-source anchors`。
 
 ```bash
 $LIBERO_PY scripts/libero_joint_swept_pointcloud.py \
   --task-suite libero_spatial \
   --task-id 0 \
-  --horizon 50 \
+  --horizon 200 \
+  --action-scale 0.12 \
+  --skeleton-source geom \
   --samples-per-action 8 \
   --swept-point-link-samples 8 \
   --swept-point-time-samples 2 \
+  --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz \
+  --collision-margin 0.0 \
+  --save-video \
+  --video-fps 12 \
   --frontview-width 768 \
   --frontview-height 768 \
   --frontview-point-size 3 \
@@ -167,12 +173,63 @@ $LIBERO_PY scripts/libero_joint_swept_pointcloud.py \
 outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points.png
 outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points_overlay.png
 outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points_3d.png
+outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points.mp4
 outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept.npz
 ```
 
+其中 `*_frontview_swept_points.mp4` 会在 `frontview` 相机图像上按时间累计显示连杆点，点数随帧递增；`*_frontview_swept_points_3d.png` 标题会写明 `collision: YES/NO`；`*.npz` 内保存 `collision`、`collision_method`、`collision_point_count` 和 `collision_swept_point_indices`。
 
 
-## 3. Upright Blocks LeRobot Demo Collection
+
+## 3. PI05 latent safety decoder
+
+第一版 safety decoder 使用 PI05 VLM `prefix_tokens` 预测未来连杆点，不直接预测碰撞分类。安全信号由预测点和障碍物 OBB / occupied grid 的几何重叠计算得到。
+
+准备训练 seed 数据，要求 `.npz` 至少包含：
+
+```text
+prefix_tokens: shape [S, N, D]
+action_chunks: shape [S, T, A]
+start_joint_vectors: shape [S, J]
+```
+
+用真实 action chunk 经 FK 生成训练目标：
+
+```bash
+$LIBERO_PY scripts/build_pi05_safety_decoder_dataset.py \
+  --seed-samples outputs/pi05_prefix_seed_samples.npz \
+  --task-suite libero_spatial \
+  --task-id 0 \
+  --points-per-link 8 \
+  --samples-per-action 1 \
+  --output outputs/pi05_safety_decoder/libero_spatial_task0_decoder_dataset.npz \
+  --mujoco-gl egl
+```
+
+训练 decoder：
+
+```bash
+python scripts/train_pi05_safety_decoder.py \
+  --dataset outputs/pi05_safety_decoder/libero_spatial_task0_decoder_dataset.npz \
+  --output outputs/pi05_safety_decoder/decoder.pt \
+  --hidden-dim 512 \
+  --num-layers 4 \
+  --epochs 50 \
+  --batch-size 64
+```
+
+推理并用几何计算输出 `collision` 或 `safe`：
+
+```bash
+python scripts/run_pi05_safety_decoder.py \
+  --checkpoint outputs/pi05_safety_decoder/decoder.pt \
+  --prefix-tokens outputs/pi05_prefix_tokens/current_prefix_tokens.npz \
+  --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz \
+  --collision-margin 0.01 \
+  --output outputs/pi05_safety_decoder/current_safety_result.npz
+```
+
+## 4. Upright Blocks LeRobot Demo Collection
 
 当前 UR5e upright-blocks 场景的数据采集脚本：
 
