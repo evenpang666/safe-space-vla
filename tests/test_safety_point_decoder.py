@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig, masked_mean_pool
@@ -56,3 +57,61 @@ def test_safety_point_decoder_can_fit_one_tiny_batch():
         losses.append(float(loss.detach()))
 
     assert losses[-1] < losses[0]
+
+
+def test_safety_point_decoder_config_rejects_invalid_horizon():
+    with pytest.raises(ValueError, match="horizon"):
+        SafetyPointDecoderConfig(
+            token_dim=4,
+            hidden_dim=32,
+            num_layers=3,
+            horizon=0,
+            num_links=2,
+            points_per_link=3,
+        )
+
+
+def test_safety_point_decoder_config_rejects_invalid_dropout():
+    with pytest.raises(ValueError, match="dropout"):
+        SafetyPointDecoderConfig(
+            token_dim=4,
+            hidden_dim=32,
+            num_layers=3,
+            horizon=2,
+            num_links=2,
+            points_per_link=3,
+            dropout=1.0,
+        )
+
+
+def test_safety_point_decoder_rejects_wrong_prefix_token_dim():
+    config = SafetyPointDecoderConfig(
+        token_dim=4,
+        hidden_dim=32,
+        num_layers=3,
+        horizon=2,
+        num_links=2,
+        points_per_link=3,
+    )
+    model = SafetyPointDecoder(config)
+    prefix_tokens = torch.randn(4, 5, 5)
+
+    with pytest.raises(ValueError, match="token_dim"):
+        model(prefix_tokens)
+
+
+def test_safety_point_decoder_double_returns_float64_output():
+    config = SafetyPointDecoderConfig(
+        token_dim=4,
+        hidden_dim=32,
+        num_layers=3,
+        horizon=2,
+        num_links=2,
+        points_per_link=3,
+    )
+    model = SafetyPointDecoder(config).double()
+    prefix_tokens = torch.randn(4, 5, 4, dtype=torch.float64)
+
+    points = model(prefix_tokens)
+
+    assert points.dtype == torch.float64

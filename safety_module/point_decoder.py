@@ -16,6 +16,22 @@ class SafetyPointDecoderConfig:
     points_per_link: int
     dropout: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.token_dim <= 0:
+            raise ValueError(f"token_dim must be > 0, got {self.token_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {self.hidden_dim}")
+        if self.num_layers < 0:
+            raise ValueError(f"num_layers must be >= 0, got {self.num_layers}")
+        if self.horizon <= 0:
+            raise ValueError(f"horizon must be > 0, got {self.horizon}")
+        if self.num_links <= 0:
+            raise ValueError(f"num_links must be > 0, got {self.num_links}")
+        if self.points_per_link <= 0:
+            raise ValueError(f"points_per_link must be > 0, got {self.points_per_link}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must satisfy 0 <= dropout < 1, got {self.dropout}")
+
     def to_dict(self) -> dict[str, int | float]:
         return asdict(self)
 
@@ -62,7 +78,14 @@ class SafetyPointDecoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, prefix_tokens: torch.Tensor, prefix_mask: torch.Tensor | None = None) -> torch.Tensor:
-        pooled = masked_mean_pool(prefix_tokens.to(dtype=torch.float32), prefix_mask)
+        if prefix_tokens.shape[-1] != int(self.config.token_dim):
+            raise ValueError(
+                f"prefix_tokens last dimension must match token_dim={self.config.token_dim}, "
+                f"got {prefix_tokens.shape[-1]}"
+            )
+        param = next(self.parameters())
+        prefix_tokens = prefix_tokens.to(device=param.device, dtype=param.dtype)
+        pooled = masked_mean_pool(prefix_tokens, prefix_mask)
         raw = self.net(pooled)
         return raw.reshape(
             prefix_tokens.shape[0],
