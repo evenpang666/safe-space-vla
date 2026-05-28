@@ -46,3 +46,8 @@ def test_sample_link_points_rejects_invalid_inputs():
 
     with pytest.raises(ValueError, match="segment_path must have shape"):
         sample_link_points_from_segments(np.zeros((2, 1, 3)), points_per_link=2)
+
+
+def test_flatten_link_points_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="link_points must have shape"):
+        flatten_link_points(np.zeros((2, 3, 4)))
