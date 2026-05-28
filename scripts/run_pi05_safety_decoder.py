@@ -33,7 +33,7 @@ def load_npz_dict(path: Path) -> dict[str, np.ndarray]:
 
 
 def load_checkpoint_model(path: Path, device: torch.device) -> SafetyPointDecoder:
-    payload = torch.load(path, map_location=device, weights_only=False)
+    payload = torch.load(path, map_location=device, weights_only=True)
     config = SafetyPointDecoderConfig.from_dict(payload["config"])
     model = SafetyPointDecoder(config).to(device)
     model.load_state_dict(payload["model_state_dict"])
@@ -68,6 +68,8 @@ def run_prediction(
     device: torch.device,
 ) -> tuple[np.ndarray, object]:
     prefix = torch.as_tensor(np.asarray(prefix_tokens, dtype=np.float32), device=device)
+    if prefix.shape[0] != 1:
+        raise ValueError(f"run_prediction expects a single prefix sample, got batch size {prefix.shape[0]}")
     pred = model(prefix).detach().cpu().numpy().astype(np.float32, copy=False)
     result = predicted_link_points_collision(pred[0], safe_space, collision_margin=collision_margin)
     return pred, result
