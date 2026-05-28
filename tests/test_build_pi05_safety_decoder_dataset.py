@@ -1,4 +1,7 @@
+import importlib
+import os
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -9,6 +12,17 @@ from scripts.build_pi05_safety_decoder_dataset import (
     save_decoder_dataset,
     validate_seed_arrays,
 )
+
+
+def test_import_does_not_set_mujoco_gl(monkeypatch):
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    sys.modules.pop("scripts.build_pi05_safety_decoder_dataset", None)
+    sys.modules.pop("libero_joint_swept_pointcloud", None)
+    sys.modules.pop("scripts.libero_joint_swept_pointcloud", None)
+
+    importlib.import_module("scripts.build_pi05_safety_decoder_dataset")
+
+    assert "MUJOCO_GL" not in os.environ
 
 
 def test_validate_seed_arrays_accepts_matching_prefix_actions_and_joints():
@@ -42,6 +56,21 @@ def test_load_seed_samples_reads_required_arrays(tmp_path: Path):
     assert prefix.shape == (2, 3, 4)
     assert actions.shape == (2, 5, 7)
     assert start_joints.shape == (2, 7)
+
+
+def test_normalize_fk_inputs_truncates_extra_start_and_action_dims():
+    module = importlib.import_module("scripts.build_pi05_safety_decoder_dataset")
+
+    start, actions = module.normalize_fk_inputs(
+        start_joint_vector=np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+        action_chunk=np.asarray([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32),
+        action_dim=3,
+    )
+
+    assert start.dtype == np.float64
+    assert actions.dtype == np.float64
+    np.testing.assert_allclose(start, [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(actions, [[0.1, 0.2, 0.3]])
 
 
 def test_save_decoder_dataset_writes_expected_schema(tmp_path: Path):
