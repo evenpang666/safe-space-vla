@@ -6,13 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET = REPO_ROOT / "outputs" / "libero_joint_swept_pointcloud" / "pi05_safety_decoder_dataset.npz"
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "libero_joint_swept_pointcloud" / "pi05_safety_decoder.pt"
 
@@ -23,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--ffn-dim", type=int, default=0, help="Transformer feed-forward dim. 0 means 4 * hidden_dim.")
+    parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -146,6 +153,9 @@ def main() -> None:
         token_dim=int(prefix_tokens.shape[-1]),
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        ffn_dim=args.ffn_dim,
+        max_tokens=args.max_tokens,
         horizon=int(targets.shape[1]),
         num_links=int(targets.shape[2]),
         points_per_link=int(targets.shape[3]),

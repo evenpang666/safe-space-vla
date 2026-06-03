@@ -32,6 +32,45 @@ def test_safety_point_decoder_outputs_fixed_topology_points():
     assert points.dtype == torch.float32
 
 
+def test_safety_point_decoder_uses_transformer_encoder_before_linear_head():
+    config = SafetyPointDecoderConfig(
+        token_dim=6,
+        hidden_dim=16,
+        num_layers=2,
+        num_heads=4,
+        ffn_dim=32,
+        max_tokens=8,
+        horizon=4,
+        num_links=3,
+        points_per_link=5,
+    )
+
+    model = SafetyPointDecoder(config)
+
+    assert isinstance(model.transformer, torch.nn.TransformerEncoder)
+    assert isinstance(model.output_head, torch.nn.Linear)
+    assert model.output_head.out_features == 4 * 3 * 5 * 3
+
+
+def test_safety_point_decoder_config_round_trips_transformer_fields():
+    config = SafetyPointDecoderConfig(
+        token_dim=6,
+        hidden_dim=16,
+        num_layers=2,
+        num_heads=4,
+        ffn_dim=64,
+        max_tokens=128,
+        horizon=4,
+        num_links=3,
+        points_per_link=5,
+        dropout=0.1,
+    )
+
+    restored = SafetyPointDecoderConfig.from_dict(config.to_dict())
+
+    assert restored == config
+
+
 def test_safety_point_decoder_can_fit_one_tiny_batch():
     torch.manual_seed(0)
     config = SafetyPointDecoderConfig(
@@ -84,6 +123,19 @@ def test_safety_point_decoder_config_rejects_invalid_dropout():
         )
 
 
+def test_safety_point_decoder_config_rejects_hidden_dim_not_divisible_by_heads():
+    with pytest.raises(ValueError, match="hidden_dim.*num_heads"):
+        SafetyPointDecoderConfig(
+            token_dim=4,
+            hidden_dim=30,
+            num_layers=3,
+            num_heads=8,
+            horizon=2,
+            num_links=2,
+            points_per_link=3,
+        )
+
+
 def test_safety_point_decoder_rejects_wrong_prefix_token_dim():
     config = SafetyPointDecoderConfig(
         token_dim=4,
@@ -98,6 +150,22 @@ def test_safety_point_decoder_rejects_wrong_prefix_token_dim():
 
     with pytest.raises(ValueError, match="token_dim"):
         model(prefix_tokens)
+
+
+def test_safety_point_decoder_rejects_more_prefix_tokens_than_position_table():
+    config = SafetyPointDecoderConfig(
+        token_dim=4,
+        hidden_dim=32,
+        num_layers=3,
+        max_tokens=4,
+        horizon=2,
+        num_links=2,
+        points_per_link=3,
+    )
+    model = SafetyPointDecoder(config)
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        model(torch.randn(1, 5, 4))
 
 
 def test_safety_point_decoder_double_returns_float64_output():

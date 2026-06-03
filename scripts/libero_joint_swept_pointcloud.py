@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Generate LIBERO joint-link swept point clouds from FK anchor segments.
+"""Generate LIBERO robot skeleton swept point clouds from FK samples.
 
 This is the LIBERO counterpart of visualize_robosuite_joint_swept_surfaces.py:
-it does not sample robot mesh geometry. Instead, it integrates a joint-delta
-chunk, builds line segments between consecutive robot link anchors, and samples
-the swept ruled surfaces made by those segments over time.
+it integrates a joint-delta chunk, builds sparse skeleton segments at every FK
+sample, and samples the swept ruled surfaces made by those segments over time.
+By default, skeleton segments come from each robot geom's envelope center axis.
+The legacy joint-anchor line mode is still available with --skeleton-source
+anchors.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
 import numpy as np
 
@@ -54,6 +59,15 @@ LINK_COLORS = np.array(
 )
 
 
+@dataclass(frozen=True)
+class CollisionResult:
+    collides: bool
+    method: str
+    collision_point_count: int
+    colliding_point_indices: np.ndarray
+    collision_margin: float
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -71,12 +85,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional .npy/.npz/.json/.csv joint-delta chunk. Uses the first arm-joint dims.",
     )
-    parser.add_argument("--horizon", type=int, default=50, help="Random joint-delta chunk length.")
+    parser.add_argument("--horizon", type=int, default=100, help="Random joint-delta chunk length.")
     parser.add_argument("--action-scale", type=float, default=0.06, help="Random joint delta range in radians.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for generated joint deltas.")
     parser.add_argument("--samples-per-action", type=int, default=8, help="Interpolated FK intervals per action.")
     parser.add_argument("--joint-vector-file", type=Path, default=None, help="Optional start joint vector file.")
     parser.add_argument("--gripper-width", type=float, default=0.08, help="Virtual gripper segment length in meters.")
+    parser.add_argument(
+        "--skeleton-source",
+        choices=["geom", "anchors"],
+        default="geom",
+        help=(
+            "Source for swept skeleton segments. 'geom' uses robot geom envelope center axes; "
+            "'anchors' keeps the legacy robot0_link0..link7 joint-anchor lines."
+        ),
+    )
     parser.add_argument(
         "--swept-point-link-samples",
         type=int,
@@ -94,6 +117,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frontview-point-size", type=float, default=3.0, help="Projected point marker size.")
     parser.add_argument("--plot-elev", type=float, default=18.0, help="3D front-view plot elevation.")
     parser.add_argument("--plot-azim", type=float, default=0.0, help="3D front-view plot azimuth.")
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Save an MP4 where swept skeleton points accumulate over time.",
+    )
+    parser.add_argument("--video-fps", type=int, default=12, help="Frames per second for --save-video.")
+    parser.add_argument("--video-dpi", type=int, default=160, help="Matplotlib DPI for --save-video frames.")
+    parser.add_argument(
+        "--safe-space",
+        type=Path,
+        default=None,
+        help="Optional *_safe_space.npz used to check swept-point collision against obstacles.",
+    )
+    parser.add_argument(
+        "--collision-margin",
+        type=float,
+        default=0.0,
+        help="Meters by which obstacle occupancy / OBBs are inflated for swept-point collision checks.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--name", default=None, help="Output basename. Defaults to LIBERO task name.")
     parser.add_argument("--mujoco-gl", choices=["egl", "osmesa", "glfw"], default=None)
@@ -119,6 +161,11 @@ def load_array(path: Path, key: str | None = None) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported array file suffix: {suffix}")
     return np.asarray(arr, dtype=np.float64)
+
+
+def load_npz_dict(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as data:
+        return {key: data[key] for key in data.files}
 
 
 def make_random_action_chunk(horizon: int, action_dim: int, action_scale: float, seed: int) -> np.ndarray:
@@ -252,6 +299,378 @@ def build_link_segments(
     return segments
 
 
+def mujoco_geom_type_names() -> dict[int, str]:
+    try:
+        import mujoco
+    except ImportError:
+        return {
+            0: "plane",
+            1: "hfield",
+            2: "sphere",
+            3: "capsule",
+            4: "ellipsoid",
+            5: "cylinder",
+            6: "box",
+            7: "mesh",
+        }
+    return {
+        int(mujoco.mjtGeom.mjGEOM_PLANE): "plane",
+        int(mujoco.mjtGeom.mjGEOM_HFIELD): "hfield",
+        int(mujoco.mjtGeom.mjGEOM_SPHERE): "sphere",
+        int(mujoco.mjtGeom.mjGEOM_CAPSULE): "capsule",
+        int(mujoco.mjtGeom.mjGEOM_ELLIPSOID): "ellipsoid",
+        int(mujoco.mjtGeom.mjGEOM_CYLINDER): "cylinder",
+        int(mujoco.mjtGeom.mjGEOM_BOX): "box",
+        int(mujoco.mjtGeom.mjGEOM_MESH): "mesh",
+    }
+
+
+def model_name(model, kind: str, idx: int) -> str:
+    try:
+        return getattr(model, f"{kind}_id2name")(idx) or ""
+    except Exception:
+        names = getattr(model, f"{kind}_names", None)
+        if names is not None and idx < len(names):
+            return names[idx] or ""
+    return ""
+
+
+def geom_kind(model, geom_id: int) -> str:
+    geom_types = np.asarray(model.geom_type)
+    type_id = int(geom_types[int(geom_id)])
+    return mujoco_geom_type_names().get(type_id, f"geom_type_{type_id}")
+
+
+def central_axis_segment_for_geom(
+    position: np.ndarray,
+    rotation: np.ndarray,
+    size: np.ndarray,
+    geom_kind: str,
+    local_segment: np.ndarray | None = None,
+) -> np.ndarray:
+    position = np.asarray(position, dtype=np.float64).reshape(3)
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    if local_segment is not None:
+        local_segment = np.asarray(local_segment, dtype=np.float64).reshape(2, 3)
+        return local_segment @ rotation.T + position
+
+    size = np.asarray(size, dtype=np.float64).reshape(-1)
+    padded_size = np.zeros(3, dtype=np.float64)
+    padded_size[: min(3, size.size)] = np.abs(size[: min(3, size.size)])
+    kind = str(geom_kind).lower()
+
+    if kind in {"capsule", "cylinder"}:
+        axis_idx = 2
+        half_length = float(padded_size[1])
+    elif kind in {"box", "ellipsoid"}:
+        axis_idx = int(np.argmax(padded_size))
+        half_length = float(padded_size[axis_idx])
+    else:
+        axis_idx = int(np.argmax(padded_size))
+        half_length = 0.0
+
+    if half_length <= 0.0:
+        return np.stack([position, position], axis=0)
+    direction = rotation[:, axis_idx]
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-9:
+        return np.stack([position, position], axis=0)
+    direction = direction / norm
+    return np.stack([position - half_length * direction, position + half_length * direction], axis=0)
+
+
+def local_axis_segment_from_vertices(vertices: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    if len(vertices) == 0:
+        return np.zeros((2, 3), dtype=np.float64)
+    mins = vertices.min(axis=0)
+    maxs = vertices.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    half_sizes = 0.5 * (maxs - mins)
+    axis_idx = int(np.argmax(half_sizes))
+    half_length = float(half_sizes[axis_idx])
+    if half_length <= 0.0:
+        return np.stack([center, center], axis=0)
+    segment = np.stack([center, center], axis=0)
+    segment[0, axis_idx] -= half_length
+    segment[1, axis_idx] += half_length
+    return segment
+
+
+def local_axis_segment_for_model_geom(model, geom_id: int, geom_kind_name: str) -> np.ndarray | None:
+    if str(geom_kind_name).lower() != "mesh":
+        return None
+    try:
+        mesh_id = int(model.geom_dataid[int(geom_id)])
+        if mesh_id < 0:
+            return None
+        start = int(model.mesh_vertadr[mesh_id])
+        count = int(model.mesh_vertnum[mesh_id])
+        vertices = np.asarray(model.mesh_vert[start : start + count], dtype=np.float64)
+    except Exception:
+        return None
+    return local_axis_segment_from_vertices(vertices)
+
+
+def link_color_ids_from_body_names(body_names: list[str] | tuple[str, ...] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    link_to_color: dict[str, int] = {}
+    color_ids = []
+    ordered_names = []
+    for raw_name in body_names:
+        name = str(raw_name) if str(raw_name) else "unknown_link"
+        if name not in link_to_color:
+            link_to_color[name] = len(link_to_color)
+            ordered_names.append(name)
+        color_ids.append(link_to_color[name])
+    return np.asarray(color_ids, dtype=np.int64), np.asarray(ordered_names)
+
+
+def build_geom_skeleton_segments(
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    sizes: np.ndarray,
+    geom_kinds: list[str] | tuple[str, ...] | np.ndarray,
+    local_segments: np.ndarray | None = None,
+) -> np.ndarray:
+    positions = np.asarray(positions, dtype=np.float64)
+    rotations = np.asarray(rotations, dtype=np.float64)
+    sizes = np.asarray(sizes, dtype=np.float64)
+    if positions.ndim != 3 or positions.shape[-1] != 3:
+        raise ValueError(f"positions must have shape (T, G, 3), got {positions.shape}")
+    if rotations.shape != positions.shape[:2] + (3, 3):
+        raise ValueError(f"rotations must have shape (T, G, 3, 3), got {rotations.shape}")
+    if sizes.shape[0] != positions.shape[1]:
+        raise ValueError(f"sizes must describe {positions.shape[1]} geoms, got {sizes.shape}")
+    if len(geom_kinds) != positions.shape[1]:
+        raise ValueError(f"geom_kinds must describe {positions.shape[1]} geoms, got {len(geom_kinds)}")
+    if local_segments is not None:
+        local_segments = np.asarray(local_segments, dtype=np.float64)
+        if local_segments.shape != positions.shape[1:2] + (2, 3):
+            raise ValueError(f"local_segments must have shape (G, 2, 3), got {local_segments.shape}")
+
+    segments = np.empty(positions.shape[:2] + (2, 3), dtype=np.float64)
+    for step_idx in range(positions.shape[0]):
+        for geom_idx in range(positions.shape[1]):
+            local_segment = None if local_segments is None else local_segments[geom_idx]
+            segments[step_idx, geom_idx] = central_axis_segment_for_geom(
+                positions[step_idx, geom_idx],
+                rotations[step_idx, geom_idx],
+                sizes[geom_idx],
+                str(geom_kinds[geom_idx]),
+                local_segment=local_segment,
+            )
+    return segments
+
+
+def geom_skeleton_path(
+    env,
+    qpos_indices: np.ndarray,
+    geom_ids: np.ndarray,
+    joint_path: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    geom_ids = np.asarray(geom_ids, dtype=np.int64)
+    if geom_ids.size == 0:
+        raise RuntimeError("No robot geoms were found for geom skeleton generation.")
+
+    positions = []
+    rotations = []
+    for q in joint_path:
+        set_arm_joint_vector(env.sim, qpos_indices, q)
+        positions.append(np.asarray(env.sim.data.geom_xpos[geom_ids], dtype=np.float64).copy())
+        rotations.append(np.asarray(env.sim.data.geom_xmat[geom_ids], dtype=np.float64).reshape(-1, 3, 3).copy())
+
+    sizes = np.asarray(env.sim.model.geom_size[geom_ids], dtype=np.float64)
+    kinds = np.asarray([geom_kind(env.sim.model, int(geom_id)) for geom_id in geom_ids])
+    names = np.asarray(
+        [
+            model_name(env.sim.model, "geom", int(geom_id)) or f"robot_geom_{int(geom_id)}"
+            for geom_id in geom_ids
+        ]
+    )
+    body_names = np.asarray(
+        [
+            model_name(env.sim.model, "body", int(env.sim.model.geom_bodyid[int(geom_id)]))
+            or f"robot_body_{int(env.sim.model.geom_bodyid[int(geom_id)])}"
+            for geom_id in geom_ids
+        ]
+    )
+    segment_color_ids, link_names = link_color_ids_from_body_names(body_names)
+    local_segments = np.asarray(
+        [
+            (
+                local_axis_segment_for_model_geom(env.sim.model, int(geom_id), str(kind))
+                if str(kind).lower() == "mesh"
+                else np.full((2, 3), np.nan, dtype=np.float64)
+            )
+            for geom_id, kind in zip(geom_ids, kinds)
+        ],
+        dtype=np.float64,
+    )
+    local_segments_arg = None
+    if np.isfinite(local_segments).any():
+        for idx, segment in enumerate(local_segments):
+            if not np.isfinite(segment).all():
+                local_segments[idx] = central_axis_segment_for_geom(
+                    np.zeros(3, dtype=np.float64),
+                    np.eye(3, dtype=np.float64),
+                    sizes[idx],
+                    str(kinds[idx]),
+                )
+        local_segments_arg = local_segments
+    return (
+        build_geom_skeleton_segments(
+            np.asarray(positions),
+            np.asarray(rotations),
+            sizes,
+            kinds,
+            local_segments=local_segments_arg,
+        ),
+        kinds,
+        names,
+        segment_color_ids,
+        link_names,
+    )
+
+
+def points_inside_oriented_boxes(
+    points: np.ndarray,
+    centers: np.ndarray,
+    axes: np.ndarray,
+    half_sizes: np.ndarray,
+    margin: float = 0.0,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    axes = np.asarray(axes, dtype=np.float64).reshape(-1, 3, 3)
+    half_sizes = np.asarray(half_sizes, dtype=np.float64).reshape(-1, 3)
+    if len(centers) == 0:
+        return np.zeros(len(points), dtype=bool)
+    if not (len(centers) == len(axes) == len(half_sizes)):
+        raise ValueError("box centers, axes, and half_sizes must describe the same number of boxes")
+
+    inflated_half_sizes = half_sizes + max(float(margin), 0.0)
+    inside_any = np.zeros(len(points), dtype=bool)
+    for center, box_axes, box_half_sizes in zip(centers, axes, inflated_half_sizes):
+        local = (points - center) @ box_axes
+        inside_any |= np.all(np.abs(local) <= (box_half_sizes + 1e-9), axis=1)
+    return inside_any
+
+
+def occupied_grid_collision_mask(
+    points: np.ndarray,
+    workspace_bounds: np.ndarray,
+    voxel_size: float,
+    occupied_grid: np.ndarray,
+    margin: float = 0.0,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    bounds = np.asarray(workspace_bounds, dtype=np.float64).reshape(6)
+    occupied = np.asarray(occupied_grid, dtype=bool)
+    voxel = float(voxel_size)
+    if voxel <= 0.0:
+        raise ValueError("voxel_size must be positive")
+
+    origin = np.asarray([bounds[0], bounds[2], bounds[4]], dtype=np.float64)
+    dims = np.asarray(occupied.shape, dtype=np.int64)
+    base_indices = np.floor((points - origin) / voxel).astype(np.int64)
+    colliding = np.zeros(len(points), dtype=bool)
+
+    radius = int(np.ceil(max(float(margin), 0.0) / voxel))
+    offsets = [
+        np.asarray([dx, dy, dz], dtype=np.int64)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        for dz in range(-radius, radius + 1)
+    ]
+    for offset in offsets:
+        candidate = base_indices + offset
+        valid = np.all((candidate >= 0) & (candidate < dims), axis=1)
+        if not np.any(valid):
+            continue
+        valid_indices = candidate[valid]
+        occupied_hit = occupied[tuple(valid_indices.T)]
+        if not np.any(occupied_hit):
+            continue
+        valid_point_indices = np.flatnonzero(valid)[occupied_hit]
+        if margin <= 0.0:
+            colliding[valid_point_indices] = True
+            continue
+
+        hit_cells = candidate[valid_point_indices]
+        cell_min = origin + hit_cells.astype(np.float64) * voxel
+        cell_max = cell_min + voxel
+        hit_points = points[valid_point_indices]
+        delta = np.maximum(np.maximum(cell_min - hit_points, hit_points - cell_max), 0.0)
+        colliding[valid_point_indices] |= np.linalg.norm(delta, axis=1) <= margin
+    return colliding
+
+
+def nearest_obstacle_point_collision_mask(
+    points: np.ndarray,
+    obstacle_points: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    obstacle_points = np.asarray(obstacle_points, dtype=np.float64).reshape(-1, 3)
+    if len(obstacle_points) == 0:
+        return np.zeros(len(points), dtype=bool)
+    threshold_sq = float(threshold) ** 2
+    colliding = np.zeros(len(points), dtype=bool)
+    chunk = 4096
+    for start in range(0, len(points), chunk):
+        stop = min(start + chunk, len(points))
+        diff = points[start:stop, None, :] - obstacle_points[None, :, :]
+        min_dist_sq = np.min(np.sum(diff * diff, axis=2), axis=1)
+        colliding[start:stop] = min_dist_sq <= threshold_sq
+    return colliding
+
+
+def detect_swept_obstacle_collision(
+    swept_points: np.ndarray,
+    safe_space: dict[str, np.ndarray],
+    collision_margin: float = 0.0,
+) -> CollisionResult:
+    margin = max(float(collision_margin), 0.0)
+    if {"workspace_bounds", "voxel_size", "occupied_grid"}.issubset(safe_space):
+        collision_mask = occupied_grid_collision_mask(
+            swept_points,
+            workspace_bounds=safe_space["workspace_bounds"],
+            voxel_size=float(np.asarray(safe_space["voxel_size"])),
+            occupied_grid=safe_space["occupied_grid"],
+            margin=margin,
+        )
+        method = "occupied_grid"
+    elif {"obstacle_box_centers", "obstacle_box_axes", "obstacle_box_half_sizes"}.issubset(safe_space):
+        collision_mask = points_inside_oriented_boxes(
+            swept_points,
+            centers=safe_space["obstacle_box_centers"],
+            axes=safe_space["obstacle_box_axes"],
+            half_sizes=safe_space["obstacle_box_half_sizes"],
+            margin=margin,
+        )
+        method = "oriented_boxes"
+    elif "obstacle_centers" in safe_space:
+        voxel_size = float(np.asarray(safe_space.get("voxel_size", np.asarray(0.0))))
+        threshold = margin if margin > 0.0 else 0.5 * np.sqrt(3.0) * max(voxel_size, 0.0)
+        collision_mask = nearest_obstacle_point_collision_mask(
+            swept_points,
+            obstacle_points=safe_space["obstacle_centers"],
+            threshold=threshold,
+        )
+        method = "obstacle_centers"
+    else:
+        raise ValueError("safe-space data must contain occupied_grid, obstacle boxes, or obstacle_centers")
+
+    indices = np.flatnonzero(collision_mask).astype(np.int64)
+    return CollisionResult(
+        collides=bool(len(indices) > 0),
+        method=method,
+        collision_point_count=int(len(indices)),
+        colliding_point_indices=indices,
+        collision_margin=margin,
+    )
+
+
 def build_swept_panels(segment_path: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     panels = []
     panel_link_ids = []
@@ -308,6 +727,55 @@ def sample_swept_surface_points(
         np.asarray(link_ids, dtype=np.int64),
         np.asarray(step_ids, dtype=np.int64),
     )
+
+
+def cumulative_swept_point_frame_indices(step_ids: np.ndarray) -> list[np.ndarray]:
+    step_ids = np.asarray(step_ids, dtype=np.int64).reshape(-1)
+    if len(step_ids) == 0:
+        return []
+    if np.any(step_ids < 0):
+        raise ValueError("step_ids must be non-negative")
+    return [np.flatnonzero(step_ids <= step_idx).astype(np.int64) for step_idx in range(int(step_ids.max()) + 1)]
+
+
+def cumulative_projected_point_frames(
+    uv: np.ndarray,
+    valid: np.ndarray,
+    colors: np.ndarray,
+    step_ids: np.ndarray,
+    width: int,
+    height: int,
+    point_radius: int,
+    background: np.ndarray | None = None,
+):
+    from PIL import Image, ImageDraw
+
+    uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+    valid = np.asarray(valid, dtype=bool).reshape(-1)
+    colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    step_ids = np.asarray(step_ids, dtype=np.int64).reshape(-1)
+    if not (len(uv) == len(valid) == len(colors) == len(step_ids)):
+        raise ValueError("uv, valid, colors, and step_ids must have matching lengths")
+    if len(step_ids) == 0:
+        return
+    if background is None:
+        canvas = Image.new("RGB", (int(width), int(height)), (255, 255, 255))
+    else:
+        canvas = Image.fromarray(np.asarray(background, dtype=np.uint8), mode="RGB")
+    draw = ImageDraw.Draw(canvas)
+    radius = int(max(point_radius, 0))
+    for step_idx in range(int(step_ids.max()) + 1):
+        point_indices = np.flatnonzero((step_ids == step_idx) & valid)
+        for point_idx in point_indices:
+            x, y = uv[point_idx]
+            if x < -radius or x >= width + radius or y < -radius or y >= height + radius:
+                continue
+            color = tuple(int(c) for c in colors[point_idx])
+            if radius <= 0:
+                draw.point((float(x), float(y)), fill=color)
+            else:
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        yield np.asarray(canvas, dtype=np.uint8).copy()
 
 
 def resolve_body_ids(sim, body_names: tuple[str, ...]) -> np.ndarray:
@@ -417,6 +885,96 @@ def save_frontview_projected_points(
     return point_image, point_overlay
 
 
+def write_rgb_frames_mp4(path: Path, frames, fps: int) -> None:
+    iterator = iter(frames)
+    try:
+        first_frame = np.asarray(next(iterator), dtype=np.uint8)
+    except StopIteration as exc:
+        raise ValueError("cannot save MP4 with no frames") from exc
+
+    height, width = first_frame.shape[:2]
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(max(int(fps), 1)),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "mpeg4",
+        "-q:v",
+        "4",
+        "-pix_fmt",
+        "yuv420p",
+        str(path),
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError("Saving MP4 video requires the ffmpeg executable to be installed.") from exc
+
+    assert process.stdin is not None
+    try:
+        process.stdin.write(np.ascontiguousarray(first_frame[..., :3]).tobytes())
+        for frame in iterator:
+            frame = np.asarray(frame, dtype=np.uint8)
+            process.stdin.write(np.ascontiguousarray(frame[..., :3]).tobytes())
+    except Exception as exc:
+        process.kill()
+        raise RuntimeError("Failed while writing MP4 video frames.") from exc
+    finally:
+        try:
+            process.stdin.close()
+        except Exception:
+            pass
+
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    if process.stdout is not None:
+        process.stdout.read()
+    returncode = process.wait()
+    if returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace")[-1200:]
+        raise RuntimeError(f"ffmpeg failed while encoding swept point video: {detail}")
+
+
+def save_cumulative_frontview_projected_points_video(
+    path: Path,
+    env,
+    points: np.ndarray,
+    link_ids: np.ndarray,
+    step_ids: np.ndarray,
+    width: int,
+    height: int,
+    point_size: float,
+    fps: int,
+) -> None:
+    colors = point_colors(link_ids)
+    rgb = render_camera_rgb(env.sim, "frontview", width, height)
+    uv, valid = project_world_points_to_camera_pixels(env.sim, "frontview", width, height, points)
+    radius = max(1, int(round(point_size / 2.0)))
+    frames = cumulative_projected_point_frames(
+        uv=uv,
+        valid=valid,
+        colors=colors,
+        step_ids=step_ids,
+        width=width,
+        height=height,
+        point_radius=radius,
+        background=rgb,
+    )
+    write_rgb_frames_mp4(path, frames, fps=fps)
+
+
 def set_equal_axes(ax, points: np.ndarray, margin: float = 0.06) -> None:
     mins = points.min(axis=0) - margin
     maxs = points.max(axis=0) + margin
@@ -437,6 +995,7 @@ def save_frontview_3d_plot(
     link_ids: np.ndarray,
     elev: float,
     azim: float,
+    title: str = "LIBERO front-view robot skeleton swept points",
 ) -> None:
     import matplotlib
 
@@ -452,11 +1011,93 @@ def save_frontview_3d_plot(
     ax.set_xlabel("world x")
     ax.set_ylabel("world y")
     ax.set_zlabel("world z")
-    ax.set_title("LIBERO front-view joint-link swept points")
+    ax.set_title(title)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=220)
     plt.close(fig)
+
+
+def matplotlib_figure_to_rgb(fig) -> np.ndarray:
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3].copy()
+
+
+def save_cumulative_swept_points_video(
+    path: Path,
+    points: np.ndarray,
+    link_ids: np.ndarray,
+    step_ids: np.ndarray,
+    fps: int,
+    elev: float,
+    azim: float,
+    dpi: int,
+    title: str,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fps = max(int(fps), 1)
+    frame_indices = cumulative_swept_point_frame_indices(step_ids)
+    if not frame_indices:
+        raise ValueError("cannot save video for an empty swept point cloud")
+
+    all_points = np.asarray(points, dtype=np.float64)
+    all_link_ids = np.asarray(link_ids, dtype=np.int64)
+    mins = all_points.min(axis=0) - 0.06
+    maxs = all_points.max(axis=0) + 0.06
+    centers = 0.5 * (mins + maxs)
+    radius = max(float(np.max(maxs - mins)) / 2.0, 1e-3)
+    axis_limits = (
+        (centers[0] - radius, centers[0] + radius),
+        (centers[1] - radius, centers[1] + radius),
+        (centers[2] - radius, centers[2] + radius),
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def render_frame(frame_idx: int, indices: np.ndarray, total_frames: int) -> np.ndarray:
+        fig = None
+        try:
+            frame_points = all_points[indices]
+            frame_colors = LINK_COLORS[all_link_ids[indices] % len(LINK_COLORS), :3]
+            fig = plt.figure(figsize=(8, 7), dpi=dpi)
+            ax = fig.add_subplot(111, projection="3d")
+            ax.scatter(
+                frame_points[:, 0],
+                frame_points[:, 1],
+                frame_points[:, 2],
+                c=frame_colors,
+                s=1.0,
+                alpha=0.82,
+                linewidths=0,
+            )
+            ax.set_xlim(*axis_limits[0])
+            ax.set_ylim(*axis_limits[1])
+            ax.set_zlim(*axis_limits[2])
+            try:
+                ax.set_box_aspect((1, 1, 1))
+            except AttributeError:
+                pass
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_xlabel("world x")
+            ax.set_ylabel("world y")
+            ax.set_zlabel("world z")
+            ax.set_title(f"{title} | frame {frame_idx + 1}/{total_frames}")
+            fig.tight_layout()
+            return matplotlib_figure_to_rgb(fig)
+        finally:
+            if fig is not None:
+                plt.close(fig)
+
+    total_frames = len(frame_indices)
+    frames = (
+        render_frame(frame_idx, indices, total_frames)
+        for frame_idx, indices in enumerate(frame_indices)
+    )
+    write_rgb_frames_mp4(path, frames, fps=fps)
 
 
 def main() -> None:
@@ -501,19 +1142,56 @@ def main() -> None:
             gripper_body_id,
             joint_path,
         )
-        segment_path = build_link_segments(anchor_path, gripper_rotation_path, args.gripper_width)
+        skeleton_geom_ids = np.zeros((0,), dtype=np.int64)
+        skeleton_geom_kinds = np.asarray([], dtype="<U1")
+        skeleton_geom_names = np.asarray([], dtype="<U1")
+        skeleton_segment_color_ids = np.arange(len(DEFAULT_LINK_NAMES), dtype=np.int64)
+        if args.skeleton_source == "geom":
+            skeleton_geom_ids = np.asarray(sorted(libero_pc.find_robot_geoms(env)), dtype=np.int64)
+            (
+                segment_path,
+                skeleton_geom_kinds,
+                skeleton_geom_names,
+                skeleton_segment_color_ids,
+                link_names,
+            ) = geom_skeleton_path(
+                env,
+                qpos_indices,
+                skeleton_geom_ids,
+                joint_path,
+            )
+        else:
+            segment_path = build_link_segments(anchor_path, gripper_rotation_path, args.gripper_width)
+            link_names = np.asarray(DEFAULT_LINK_NAMES)
+            skeleton_segment_color_ids = np.arange(len(link_names), dtype=np.int64)
         panels, panel_link_ids, panel_step_ids = build_swept_panels(segment_path)
-        swept_points, swept_link_ids, swept_step_ids = sample_swept_surface_points(
+        swept_points, swept_segment_ids, swept_step_ids = sample_swept_surface_points(
             segment_path,
             link_samples=args.swept_point_link_samples,
             time_samples=args.swept_point_time_samples,
         )
+        swept_link_ids = skeleton_segment_color_ids[swept_segment_ids]
+        panel_color_ids = skeleton_segment_color_ids[panel_link_ids]
+        collision_result = None
+        collision_title = "collision: not checked"
+        if args.safe_space is not None:
+            safe_space = load_npz_dict(args.safe_space)
+            collision_result = detect_swept_obstacle_collision(
+                swept_points,
+                safe_space,
+                collision_margin=args.collision_margin,
+            )
+            collision_title = (
+                f"collision: {'YES' if collision_result.collides else 'NO'} "
+                f"({collision_result.collision_point_count} swept points, {collision_result.method})"
+            )
 
         safe_task_name = (args.name or task_name).replace("/", "_")
         prefix = args.output_dir / f"{safe_task_name}_joint_link_swept"
         point_png = prefix.with_name(f"{prefix.name}_frontview_swept_points.png")
         overlay_png = prefix.with_name(f"{prefix.name}_frontview_swept_points_overlay.png")
         plot_png = prefix.with_name(f"{prefix.name}_frontview_swept_points_3d.png")
+        video_path = prefix.with_name(f"{prefix.name}_frontview_swept_points.mp4")
         npz_path = prefix.with_suffix(".npz")
         action_path = prefix.with_name(f"{prefix.name}_actions.npy")
         joint_path_path = prefix.with_name(f"{prefix.name}_joint_path.npy")
@@ -528,7 +1206,26 @@ def main() -> None:
             args.frontview_height,
             args.frontview_point_size,
         )
-        save_frontview_3d_plot(plot_png, swept_points, swept_link_ids, args.plot_elev, args.plot_azim)
+        save_frontview_3d_plot(
+            plot_png,
+            swept_points,
+            swept_link_ids,
+            args.plot_elev,
+            args.plot_azim,
+            title=f"LIBERO robot skeleton swept points - {collision_title}",
+        )
+        if args.save_video:
+            save_cumulative_frontview_projected_points_video(
+                video_path,
+                env,
+                swept_points,
+                swept_link_ids,
+                swept_step_ids,
+                width=args.frontview_width,
+                height=args.frontview_height,
+                point_size=args.frontview_point_size,
+                fps=args.video_fps,
+            )
         np.save(action_path, action_chunk.astype(np.float32))
         np.save(joint_path_path, joint_path.astype(np.float32))
         np.savez_compressed(
@@ -541,13 +1238,35 @@ def main() -> None:
             segment_path=segment_path.astype(np.float32),
             panels=panels.astype(np.float32),
             panel_link_ids=panel_link_ids.astype(np.int16),
+            panel_color_ids=panel_color_ids.astype(np.int16),
             panel_step_ids=panel_step_ids.astype(np.int16),
             swept_surface_points=swept_points.astype(np.float32),
             swept_surface_point_link_ids=swept_link_ids.astype(np.int16),
+            swept_surface_point_segment_ids=swept_segment_ids.astype(np.int16),
             swept_surface_point_step_ids=swept_step_ids.astype(np.int16),
             frontview_swept_points=point_image.astype(np.uint8),
             frontview_swept_points_overlay=point_overlay.astype(np.uint8),
-            link_names=np.asarray(DEFAULT_LINK_NAMES),
+            frontview_swept_points_video_path=np.asarray(str(video_path) if args.save_video else ""),
+            video_fps=np.array(args.video_fps, dtype=np.int32),
+            collision_checked=np.array(collision_result is not None),
+            collision=np.array(False if collision_result is None else collision_result.collides),
+            collision_method=np.asarray("" if collision_result is None else collision_result.method),
+            collision_margin=np.array(args.collision_margin, dtype=np.float32),
+            collision_point_count=np.array(
+                0 if collision_result is None else collision_result.collision_point_count,
+                dtype=np.int64,
+            ),
+            collision_swept_point_indices=(
+                np.zeros((0,), dtype=np.int64)
+                if collision_result is None
+                else collision_result.colliding_point_indices.astype(np.int64)
+            ),
+            skeleton_source=np.asarray(args.skeleton_source),
+            skeleton_geom_ids=skeleton_geom_ids.astype(np.int64),
+            skeleton_geom_kinds=skeleton_geom_kinds,
+            skeleton_geom_names=skeleton_geom_names,
+            skeleton_segment_color_ids=skeleton_segment_color_ids.astype(np.int16),
+            link_names=link_names,
             link_anchor_bodies=np.asarray(DEFAULT_PANDA_ANCHOR_BODIES),
             gripper_width=np.array(args.gripper_width, dtype=np.float32),
         )
@@ -557,11 +1276,22 @@ def main() -> None:
         print(f"[info] start_joint_vector: {np.array2string(start_joint_vector, precision=4)}")
         print(f"[info] action_chunk shape: {action_chunk.shape}")
         print(f"[info] joint FK samples: {joint_path.shape[0]}")
+        print(f"[info] skeleton source: {args.skeleton_source}")
+        if args.skeleton_source == "geom":
+            print(f"[info] robot geom skeleton segments per FK sample: {len(skeleton_geom_ids)}")
         print(f"[info] swept panels: {panels.shape[0]}")
-        print(f"[info] joint-link swept surface points: {swept_points.shape[0]}")
+        print(f"[info] skeleton swept surface points: {swept_points.shape[0]}")
+        if collision_result is not None:
+            print(
+                "[info] collision: "
+                f"{'YES' if collision_result.collides else 'NO'} "
+                f"({collision_result.collision_point_count} swept points, method={collision_result.method})"
+            )
         print(f"[done] saved frontview projected points: {point_png}")
         print(f"[done] saved frontview projected overlay: {overlay_png}")
         print(f"[done] saved frontview 3D point plot: {plot_png}")
+        if args.save_video:
+            print(f"[done] saved cumulative swept point video: {video_path}")
         print(f"[done] saved swept surface data: {npz_path}")
         print(f"[done] saved actions: {action_path}")
         print(f"[done] saved joint path: {joint_path_path}")

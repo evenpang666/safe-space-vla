@@ -11,6 +11,8 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
 
+COORDINATE_FRAME = "mujoco_world"
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1120,6 +1122,7 @@ def main() -> None:
 
     np.savez_compressed(
         npz_path,
+        coordinate_frame=np.asarray(COORDINATE_FRAME),
         workspace_bounds=bounds.astype(np.float32),
         display_workspace_bounds=display_bounds.astype(np.float32),
         workspace_mode=np.array(args.workspace_mode),

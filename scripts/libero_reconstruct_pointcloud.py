@@ -9,6 +9,7 @@ saves a fused colored point cloud.
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -23,13 +24,46 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIBERO_ROOT_CANDIDATES = (
+    REPO_ROOT / "openpi" / "third_party" / "libero",
     REPO_ROOT / "third_party" / "LIBERO",
     REPO_ROOT / "thiry_party" / "LIBERO",
 )
-for libero_root in LIBERO_ROOT_CANDIDATES:
-    if libero_root.exists():
-        sys.path.insert(0, str(libero_root))
+
+
+def _same_path(left: str, right: Path) -> bool:
+    try:
+        return Path(left).resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def normalize_libero_import_paths() -> None:
+    """Prefer the LIBERO repo root layout required by ``import libero.libero``.
+
+    Adding ``.../LIBERO/libero`` to ``PYTHONPATH`` makes Python import the inner
+    package as top-level ``libero``. That layout breaks existing LIBERO/OpenPI
+    imports that expect the namespace-style ``libero.libero`` package.
+    """
+    for libero_root in LIBERO_ROOT_CANDIDATES:
+        if not libero_root.exists():
+            continue
+
+        inner_package_parent = libero_root / "libero"
+        sys.path[:] = [path for path in sys.path if not _same_path(path, inner_package_parent)]
+        root_str = str(libero_root)
+        sys.path[:] = [path for path in sys.path if not _same_path(path, libero_root)]
+        sys.path.insert(0, root_str)
+
+        loaded_libero = sys.modules.get("libero")
+        loaded_file = getattr(loaded_libero, "__file__", None)
+        if loaded_file is not None and _same_path(loaded_file, inner_package_parent / "libero" / "__init__.py"):
+            for module_name in list(sys.modules):
+                if module_name == "libero" or module_name.startswith("libero."):
+                    sys.modules.pop(module_name, None)
         break
+
+
+normalize_libero_import_paths()
 
 LOCAL_LIBERO_BENCHMARK_ROOT = None
 for libero_root in LIBERO_ROOT_CANDIDATES:
@@ -102,6 +136,7 @@ def load_runtime_dependencies() -> None:
         return
 
     try:
+        normalize_libero_import_paths()
         patch_torch_load_for_libero()
         install_robosuite_compat()
         import libero.libero as libero_core
@@ -116,7 +151,7 @@ def load_runtime_dependencies() -> None:
         raise RuntimeError(
             "Missing runtime dependency "
             f"{missing!r}. Install LIBERO requirements first, for example: "
-            "pip install -r thiry_party/LIBERO/requirements.txt"
+            "pip install -r openpi/third_party/libero/requirements.txt"
         ) from exc
 
     benchmark = libero_benchmark
@@ -169,9 +204,15 @@ def patch_torch_load_for_libero() -> None:
         return
 
     original_load = torch.load
+    try:
+        load_params = inspect.signature(original_load).parameters
+        supports_weights_only = "weights_only" in load_params
+    except (TypeError, ValueError):
+        supports_weights_only = False
 
     def compat_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        if supports_weights_only:
+            kwargs.setdefault("weights_only", False)
         return original_load(*args, **kwargs)
 
     compat_load._libero_compat_patched = True
@@ -203,17 +244,29 @@ def patch_libero_robot_models() -> None:
         (MountedUR5e, "Robotiq85Gripper", "default_ur5e"),
         (OnTheGroundUR5e, "Robotiq85Gripper", "default_ur5e"),
     )
+    try:
+        from robosuite.robots.single_arm import SingleArm
+
+        use_arm_dict_metadata = SingleArm.__name__ != "SingleArm"
+    except (ImportError, AttributeError):
+        use_arm_dict_metadata = True
+
     for cls, gripper, controller in robot_specs:
         cls.arms = ["right"]
         cls.default_base = property(lambda self: self.default_mount)
-        cls.default_gripper = property(lambda self, name=gripper: {"right": name})
-        cls.default_controller_config = property(lambda self, name=controller: {"right": name})
+        if use_arm_dict_metadata:
+            cls.default_gripper = property(lambda self, name=gripper: {"right": name})
+            cls.default_controller_config = property(lambda self, name=controller: {"right": name})
+        else:
+            cls.default_gripper = property(lambda self, name=gripper: name)
+            cls.default_controller_config = property(lambda self, name=controller: name)
 
 
 # Use the front-facing agent camera plus the two lateral depth cameras. In the
 # LIBERO tabletop frame, sideview is the observed right side and leftsideview is
 # its opposite camera added in the scene XML assets.
 DEFAULT_CAMERAS = ("agentview", "sideview", "leftsideview")
+COORDINATE_FRAME = "mujoco_world"
 
 
 def parse_args() -> argparse.Namespace:
@@ -732,6 +785,7 @@ def main() -> None:
             points=points.astype(np.float32),
             colors=colors.astype(np.uint8),
             camera_names=np.asarray(list(args.camera_names)),
+            coordinate_frame=np.asarray(COORDINATE_FRAME),
             point_mode=np.asarray("visible_robot" if args.only_robot else "scene"),
         )
         write_ascii_ply(ply_path, points, colors)

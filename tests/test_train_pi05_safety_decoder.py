@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -7,6 +9,24 @@ import torch
 
 from scripts.train_pi05_safety_decoder import load_dataset_tensors, save_checkpoint, train_one_epoch
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig
+
+
+def test_train_script_help_runs_when_invoked_by_path():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [sys.executable, "scripts/train_pi05_safety_decoder.py", "--help"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--dataset" in result.stdout
+    assert "--num-heads" in result.stdout
+    assert "--ffn-dim" in result.stdout
+    assert "--max-tokens" in result.stdout
 
 
 def test_load_dataset_tensors_reads_prefix_and_targets(tmp_path: Path):

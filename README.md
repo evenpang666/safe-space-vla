@@ -9,6 +9,11 @@
 conda create -n safety python=3.11
 conda activate safety
 
+cd openpi
+uv sync
+uv pip install -e .
+pip install chex pytest
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 ```
 
 ### 0.2 LIBERO / MuJoCo 数据采集环境
@@ -16,16 +21,14 @@ conda activate safety
 LIBERO 相关脚本用于重建场景点云、采样 robot point flow、生成 action chunk 数据集。建议单独建 Python 3.8 环境：
 
 ```bash
-conda create -n libero python=3.8 -y
-conda activate libero
+uv venv --python 3.8 openpi/examples/libero/.venv
+source openpi/examples/libero/.venv/bin/activate
+uv pip sync openpi/examples/libero/requirements.txt openpi/third_party/libero/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu113 --index-strategy=unsafe-best-match
+uv pip install -e openpi/packages/openpi-client
+uv pip install -e openpi/third_party/libero
+uv pip install h5py
 
-pip install -r thiry_party/LIBERO/requirements.txt
-pip install -e thiry_party/LIBERO
-
-# 如果 pip resolver 对少数旧依赖失败，可以单独补装：
-pip install bddl==1.0.1 easydict==1.9 future==0.18.2
-
-export PYTHONPATH=$PWD:$PWD/thiry_party/LIBERO:$PYTHONPATH
+export PYTHONPATH=$PYTHONPATH:$PWD/openpi/third_party/libero
 ```
 
 无显示器服务器上运行 MuJoCo/LIBERO 时通常需要 EGL：
@@ -61,7 +64,7 @@ python scripts/libero_reconstruct_pointcloud.py \
 
 ```bash
 export MUJOCO_GL=egl
-export PYTHONPATH=$PWD:$PWD/thiry_party/LIBERO:$PYTHONPATH
+export PYTHONPATH=$PWD:$PWD/openpi/third_party/libero:$PYTHONPATH
 LIBERO_PY=/home/evan/anaconda3/envs/libero/bin/python
 TASK=pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate
 ```
@@ -180,43 +183,154 @@ outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept.npz
 其中 `*_frontview_swept_points.mp4` 会在 `frontview` 相机图像上按时间累计显示连杆点，点数随帧递增；`*_frontview_swept_points_3d.png` 标题会写明 `collision: YES/NO`；`*.npz` 内保存 `collision`、`collision_method`、`collision_point_count` 和 `collision_swept_point_indices`。
 
 
+## 3. 可视化
 
-## 3. PI05 latent safety decoder
+```bash
+python scripts/visualize_pi05_safety_decoder_dataset_sample.py \
+  --dataset outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
+  --sample-index 0 \
+  --time-index 10
+```
+
+
+## 4. PI05 latent safety decoder
 
 第一版 safety decoder 使用 PI05 VLM `prefix_tokens` 预测未来连杆点，不直接预测碰撞分类。安全信号由预测点和障碍物 OBB / occupied grid 的几何重叠计算得到。
 
-准备训练 seed 数据，要求 `.npz` 至少包含：
+直接在 LIBERO 中运行 `pi05_libero` 推理，并同步保存每个真实控制时间步的 prefix token、PI05 action chunk、当前关节 qpos、当前机械臂表面点，以及真实执行轨迹中的未来表面点偏移量。采集脚本固定使用 rollout surface 点云流：先按 `--replan-steps` 执行任务 rollout，并在每个真实仿真时间步记录一次机械臂表面点云；rollout 结束后，再为每个时间步样本从这条表面点云轨迹中切出当前帧和未来 `len(action_chunk)` 帧。
+
+OpenPI / safety 环境窗口，启动会额外返回 `prefix_tokens` 的 websocket policy server：
+
+```bash
+conda activate safety
+export PYTHONPATH=$PWD:$PWD/openpi/src:$PWD/openpi/packages/openpi-client/src:$PYTHONPATH
+
+python scripts/serve_pi05_prefix_policy.py \
+  --policy-config pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --port 8000
+```
+
+LIBERO 环境窗口，连接上面的 server，负责仿真、表面点云采集和保存训练数据：
+
+```bash
+source openpi/examples/libero/.venv/bin/activate
+export PYTHONPATH=$PWD:$PWD/openpi/packages/openpi-client/src:$PWD/openpi/third_party/libero:$PYTHONPATH
+export MUJOCO_GL=egl
+
+python scripts/collect_pi05_libero_safety_decoder_dataset.py \
+  --policy-server-host 127.0.0.1 \
+  --policy-server-port 8000 \
+  --task-suite libero_spatial \
+  --task-id 0 \
+  --num-rollouts 5 \
+  --max-samples 256 \
+  --replan-steps 5 \
+  --points-per-link 128 \
+  --output outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
+  --mujoco-gl egl
+```
+
+如果不用 websocket server，也可以在单个同时安装了 OpenPI 和 LIBERO 依赖的环境里省略 `--policy-server-host`，让采集脚本本地加载 policy。
+
+输出 `.npz` 可直接用于训练，关键字段为：
 
 ```text
 prefix_tokens: shape [S, N, D]
 action_chunks: shape [S, T, A]
 start_joint_vectors: shape [S, J]
+target_link_points: shape [S, T_fk, L, P, 3]
+current_link_points: shape [S, L, P, 3]
+future_link_offsets: shape [S, T_action, L, P, 3]
+arm_points: shape [S, K, 3], K = L * P
+target_point_offsets: shape [S, T_action, K, 3]
 ```
 
-用真实 action chunk 经 FK 生成训练目标：
+其中 `T_action == len(action_chunk)`，`pi05_libero` 默认是 10；因此 `target_link_points` 包含当前帧和 10 个未来真实执行帧，长度为 11。采集只保留拥有完整未来窗口的时间步：如果一条轨迹记录了 150 个 surface 帧、未来长度为 10，就会生成 `150 - 10 = 140` 条样本。
 
-```bash
-$LIBERO_PY scripts/build_pi05_safety_decoder_dataset.py \
-  --seed-samples outputs/pi05_prefix_seed_samples.npz \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --points-per-link 8 \
-  --samples-per-action 1 \
-  --output outputs/pi05_safety_decoder/libero_spatial_task0_decoder_dataset.npz \
-  --mujoco-gl egl
-```
+采集脚本固定使用 rollout surface 点云流：在仿真中对 `robot0_link1..robot0_link7` 的机械臂表面固定采样，因此 `L=7`，每个 link 有 `P=points_per_link` 个固定身份点。当前点云和未来点云都来自真实执行 rollout 中同一批 link-local 表面采样点在各时间步的 MuJoCo world 坐标，适合用 MSE / Flow Matching 学习 `future - current` 偏移。真实部署时可用真实机器人关节状态和 URDF / mesh 的同一套固定采样点通过 FK 生成当前机械臂点云；障碍物仍由 RGB-D 点云 / OBB 重建。
 
-训练 decoder：
+其中 `arm_points` 是 `SafetyFlowPointModel` 的当前机械臂局部点云输入，`target_point_offsets` 是 Flow Matching 的真实 `x_1 = P_arm_future - P_arm_current`。`target_link_points` 仍保留完整绝对坐标路径；第 0 帧是当前点，后续帧用于计算 `future_link_offsets`。
+
+`target_link_points` / `current_link_points` / `arm_points` 使用 MuJoCo world 坐标系保存，字段 `coordinate_frame=mujoco_world` / `target_link_points_frame=mujoco_world` / `arm_points_frame=mujoco_world` 会写入 `.npz`。偏移量字段使用 `mujoco_world_delta`。由 `scripts/libero_reconstruct_pointcloud.py` 重建出的障碍物点云，以及 `scripts/build_safe_space_from_pointcloud.py` 生成的 OBB / safe-space 也使用同一 `mujoco_world` 坐标系。
+
+旧的离线 seed + action chunk FK 建集路径不再作为当前 safety flow 数据采集入口。当前训练数据应通过上面的 rollout surface 采集脚本生成。
+
+训练 Transformer decoder。模型先把 PI05 prefix token 投影到 `hidden_dim`，经过 TransformerEncoder，再由线性层映射为未来连杆点：
 
 ```bash
 python scripts/train_pi05_safety_decoder.py \
-  --dataset outputs/pi05_safety_decoder/libero_spatial_task0_decoder_dataset.npz \
+  --dataset outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
   --output outputs/pi05_safety_decoder/decoder.pt \
   --hidden-dim 512 \
   --num-layers 4 \
+  --num-heads 8 \
+  --ffn-dim 2048 \
+  --max-tokens 1024 \
   --epochs 50 \
-  --batch-size 64
+  --batch-size 4
 ```
+
+训练新的 Flow Matching 点云安全模型 `SafetyFlowPointModel`。该模型使用 `prefix_tokens + arm_points` 作为条件，学习 `target_point_offsets` 的 velocity field：
+
+```bash
+python scripts/train_pi05_safety_flow_point_model.py \
+  --dataset outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
+  --output outputs/pi05_safety_decoder/pi05_libero_task0_safety_flow_point_model.pt \
+  --hidden-dim 256 \
+  --num-encoder-layers 4 \
+  --num-decoder-layers 4 \
+  --num-heads 8 \
+  --ffn-dim 1024 \
+  --epochs 100 \
+  --batch-size 2 \
+  --lr 1e-4 \
+  --device cpu
+```
+
+在线验证 `SafetyFlowPointModel` 时分两个窗口运行。窗口 1 在 `safety` 环境启动完整 PI05 policy + prefix token server：
+
+```bash
+conda activate safety
+export PYTHONPATH=$PWD:$PWD/openpi/src:$PWD/openpi/packages/openpi-client/src:$PYTHONPATH
+
+python scripts/serve_pi05_prefix_policy.py \
+  --policy-config pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --port 8000
+```
+
+窗口 2 在 LIBERO 环境运行在线验证。脚本会连接窗口 1 的 server，在 LIBERO 中执行任务，并生成包含机械臂执行画面、每个真实时间步预测未来 point flow、场景 OBB 方框和碰撞提示的 MP4：
+
+```bash
+source openpi/examples/libero/.venv/bin/activate
+export PYTHONPATH=$PWD:$PWD/openpi/packages/openpi-client/src:$PWD/openpi/third_party/libero:$PYTHONPATH
+export MUJOCO_GL=egl
+
+python scripts/evaluate_pi05_safety_decoder_on_libero.py \
+  --checkpoint outputs/pi05_safety_decoder/pi05_libero_task0_safety_flow_point_model.pt \
+  --policy-server-host 127.0.0.1 \
+  --policy-server-port 8000 \
+  --task-suite libero_spatial \
+  --task-id 0 \
+  --num-rollouts 1 \
+  --max-samples 16 \
+  --replan-steps 5 \
+  --points-per-link 128 \
+  --prediction-steps 10 \
+  --realtime-obbs \
+  --obb-camera-names frontview sideview leftsideview \
+  --obb-width 160 \
+  --obb-height 160 \
+  --obb-stride 4 \
+  --collision-margin 0.0 \
+  --output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.npz \
+  --video-output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.mp4 \
+  --device cpu \
+  --mujoco-gl egl
+```
+
+默认验证会在每个采样时间步用当前 LIBERO RGB-D 状态实时重建障碍物 OBB，并用同一组 OBB 绘制视频方框和判断未来 point flow 是否进入 OBB。若需要复用预生成的静态 OBB 文件，可改用 `--no-realtime-obbs --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz`。
 
 推理并用几何计算输出 `collision` 或 `safe`：
 
@@ -229,7 +343,7 @@ python scripts/run_pi05_safety_decoder.py \
   --output outputs/pi05_safety_decoder/current_safety_result.npz
 ```
 
-## 4. Upright Blocks LeRobot Demo Collection
+## 5. Upright Blocks LeRobot Demo Collection
 
 当前 UR5e upright-blocks 场景的数据采集脚本：
 
@@ -254,7 +368,7 @@ NUMBA_DISABLE_JIT=1 /home/evan/anaconda3/envs/libero/bin/python \
 如果采集环境里没有 `lerobot` 包，脚本会先保存 raw `.npz` 备份；之后可在 OpenPI 环境转换：
 
 ```bash
-cd thiry_party/openpi
+cd openpi
 UV_CACHE_DIR=/tmp/uv-cache uv run python \
   ../../scripts/collect_upright_blocks_lerobot_demos.py \
   --convert-only ../../outputs/robosuite_collision_scene/lerobot_demos/<run>/raw \
