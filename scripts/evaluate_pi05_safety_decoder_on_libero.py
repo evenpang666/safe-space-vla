@@ -75,6 +75,27 @@ class VideoFrameBuffer:
             self.frames.append(np.asarray(frame, dtype=np.uint8))
 
 
+@dataclass(frozen=True)
+class PointFlowCbfConstraint:
+    time_index: int
+    link_id: int
+    point_id: int
+    obb_id: int
+    face_axis: int
+    normal: np.ndarray
+    h: float
+    current_point: np.ndarray
+    predicted_point: np.ndarray
+
+
+@dataclass(frozen=True)
+class CbfQpProjectionResult:
+    action: np.ndarray
+    success: bool
+    max_violation: float
+    iterations: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -90,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-camera", default="agentview")
     parser.add_argument("--video-width", type=int, default=320)
     parser.add_argument("--video-height", type=int, default=320)
-    parser.add_argument("--video-point-radius", type=int, default=2)
+    parser.add_argument("--video-point-radius", type=int, default=1)
     parser.add_argument(
         "--safe-space",
         type=Path,
@@ -117,9 +138,9 @@ def parse_args() -> argparse.Namespace:
         default=["frontview", "sideview", "agentview"],
         help="MuJoCo cameras fused for runtime obstacle OBB generation.",
     )
-    parser.add_argument("--obb-width", type=int, default=160)
-    parser.add_argument("--obb-height", type=int, default=160)
-    parser.add_argument("--obb-stride", type=int, default=4)
+    parser.add_argument("--obb-width", type=int, default=256)
+    parser.add_argument("--obb-height", type=int, default=256)
+    parser.add_argument("--obb-stride", type=int, default=2)
     parser.add_argument("--obb-max-depth", type=float, default=4.0)
     parser.add_argument("--obb-robot-mask-dilation", type=int, default=2)
     parser.add_argument("--obb-workspace-bounds", nargs=6, type=float, default=None)
@@ -137,6 +158,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obb-voxel-size", type=float, default=0.04)
     parser.add_argument("--prediction-steps", type=int, default=10, help="Euler ODE steps for SafetyFlowPointModel.")
     parser.add_argument(
+        "--enable-cbf-qp",
+        action="store_true",
+        help="Filter executed PI05 actions with a point-flow-triggered CBF-QP projection.",
+    )
+    parser.add_argument("--cbf-alpha", type=float, default=1.0, help="CBF class-K gain for active OBB constraints.")
+    parser.add_argument(
+        "--cbf-trigger-margin",
+        type=float,
+        default=0.02,
+        help="Extra OBB margin used only to trigger CBF-QP from predicted future point flow.",
+    )
+    parser.add_argument("--cbf-max-constraints", type=int, default=32)
+    parser.add_argument("--cbf-finite-difference-eps", type=float, default=1e-4)
+    parser.add_argument("--cbf-projection-iterations", type=int, default=12)
+    parser.add_argument(
+        "--cbf-action-lower",
+        nargs="*",
+        type=float,
+        default=None,
+        help="Optional scalar or per-joint lower bound for CBF-corrected arm action deltas.",
+    )
+    parser.add_argument(
+        "--cbf-action-upper",
+        nargs="*",
+        type=float,
+        default=None,
+        help="Optional scalar or per-joint upper bound for CBF-corrected arm action deltas.",
+    )
+    parser.add_argument(
+        "--cbf-fallback",
+        choices=["zero", "nominal"],
+        default="zero",
+        help="Action fallback when the first-version CBF projection cannot satisfy all constraints.",
+    )
+    parser.add_argument(
         "--safety-prediction-source",
         choices=["auto", "remote", "local"],
         default="auto",
@@ -147,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-suite", default="libero_spatial", choices=sorted(collector.TASK_SUITE_MAX_STEPS))
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--num-rollouts", type=int, default=1)
-    parser.add_argument("--max-samples", type=int, default=16)
+    parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--replan-steps", type=int, default=5)
@@ -368,6 +424,25 @@ def empty_obstacle_safe_space() -> dict[str, np.ndarray]:
     }
 
 
+def safe_space_obb_arrays(safe_space: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    centers = np.asarray(safe_space["obstacle_box_centers"], dtype=np.float32)
+    axes = np.asarray(safe_space["obstacle_box_axes"], dtype=np.float32)
+    half_sizes = np.asarray(safe_space["obstacle_box_half_sizes"], dtype=np.float32)
+    if centers.ndim != 2 or centers.shape[-1] != 3:
+        raise ValueError("obstacle_box_centers must have shape (N, 3)")
+    if axes.shape != (centers.shape[0], 3, 3):
+        raise ValueError(
+            "obstacle_box_centers, obstacle_box_axes, and obstacle_box_half_sizes "
+            "must describe the same number of OBBs"
+        )
+    if half_sizes.shape != centers.shape:
+        raise ValueError(
+            "obstacle_box_centers, obstacle_box_axes, and obstacle_box_half_sizes "
+            "must describe the same number of OBBs"
+        )
+    return centers, axes, half_sizes
+
+
 def build_realtime_safe_space_from_env(
     *,
     env,
@@ -511,9 +586,7 @@ def point_flow_obb_collision(
             "collision_point_indices": np.zeros((0,), dtype=np.int64),
         }
     points = np.asarray(pred_link_points, dtype=np.float32).reshape(-1, 3)
-    centers = np.asarray(safe_space["obstacle_box_centers"], dtype=np.float32)
-    axes = np.asarray(safe_space["obstacle_box_axes"], dtype=np.float32)
-    half_sizes = np.asarray(safe_space["obstacle_box_half_sizes"], dtype=np.float32)
+    centers, axes, half_sizes = safe_space_obb_arrays(safe_space)
     if len(centers) == 0 or len(points) == 0:
         colliding = np.zeros((0,), dtype=np.int64)
     else:
@@ -528,6 +601,294 @@ def point_flow_obb_collision(
         "collision_point_count": int(len(colliding)),
         "collision_point_indices": colliding,
     }
+
+
+def point_flow_obb_cbf_constraints(
+    pred_link_points: np.ndarray,
+    current_link_points: np.ndarray,
+    safe_space: dict[str, np.ndarray] | None,
+    *,
+    collision_margin: float = 0.0,
+    trigger_margin: float = 0.02,
+    max_constraints: int = 32,
+) -> list[PointFlowCbfConstraint]:
+    """Select CBF constraints from predicted future robot-surface point flow.
+
+    The prediction is only used as a trigger and active-set selector. Each
+    returned constraint is anchored at the corresponding current FK surface
+    point, so the downstream QP can use a current-state Jacobian.
+    """
+    if safe_space is None or max_constraints <= 0:
+        return []
+    pred = np.asarray(pred_link_points, dtype=np.float32)
+    current = np.asarray(current_link_points, dtype=np.float32)
+    if pred.ndim != 4 or pred.shape[-1] != 3:
+        raise ValueError(f"pred_link_points must have shape (T, L, P, 3), got {pred.shape}")
+    if current.shape != pred.shape[1:]:
+        raise ValueError(f"current_link_points must have shape {pred.shape[1:]}, got {current.shape}")
+
+    centers, axes, half_sizes = safe_space_obb_arrays(safe_space)
+    if len(centers) == 0:
+        return []
+
+    constraints: list[PointFlowCbfConstraint] = []
+    seen: set[tuple[int, int, int]] = set()
+    cbf_margin = max(float(collision_margin), 0.0)
+    trigger = cbf_margin + max(float(trigger_margin), 0.0)
+    for obb_id, (center, box_axes, box_half_sizes) in enumerate(zip(centers, axes, half_sizes)):
+        pred_local = (pred - center) @ box_axes
+        trigger_half_sizes = box_half_sizes + trigger
+        dangerous = np.all(np.abs(pred_local) <= (trigger_half_sizes + 1e-6), axis=-1)
+        for time_index, link_id, point_id in np.argwhere(dangerous):
+            key = (int(link_id), int(point_id), int(obb_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            current_point = current[int(link_id), int(point_id)]
+            current_local = (current_point - center) @ box_axes
+            cbf_half_sizes = box_half_sizes + cbf_margin
+            ratios = np.abs(current_local) / np.maximum(cbf_half_sizes, 1e-6)
+            face_axis = int(np.argmax(ratios))
+            sign = 1.0 if float(current_local[face_axis]) >= 0.0 else -1.0
+            if abs(float(current_local[face_axis])) < 1e-9:
+                pred_value = float(pred_local[int(time_index), int(link_id), int(point_id), face_axis])
+                sign = 1.0 if pred_value >= 0.0 else -1.0
+            normal = sign * np.asarray(box_axes[:, face_axis], dtype=np.float32)
+            h = sign * float(current_local[face_axis]) - float(cbf_half_sizes[face_axis])
+            constraints.append(
+                PointFlowCbfConstraint(
+                    time_index=int(time_index),
+                    link_id=int(link_id),
+                    point_id=int(point_id),
+                    obb_id=int(obb_id),
+                    face_axis=face_axis,
+                    normal=normal.astype(np.float32, copy=False),
+                    h=float(h),
+                    current_point=np.asarray(current_point, dtype=np.float32),
+                    predicted_point=np.asarray(pred[int(time_index), int(link_id), int(point_id)], dtype=np.float32),
+                )
+            )
+            if len(constraints) >= int(max_constraints):
+                return sorted(constraints, key=lambda item: (item.h, item.time_index))
+    return sorted(constraints, key=lambda item: (item.h, item.time_index))[: int(max_constraints)]
+
+
+def solve_cbf_qp_projection(
+    nominal_action: np.ndarray,
+    a_matrix: np.ndarray,
+    b_vector: np.ndarray,
+    *,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
+    iterations: int = 12,
+    tolerance: float = 1e-7,
+) -> CbfQpProjectionResult:
+    """Project a nominal action onto linear CBF halfspaces.
+
+    This is a dependency-light first-version QP projection. For one active
+    halfspace it is the exact Euclidean projection. For several halfspaces it
+    alternates projections and bound clipping, which is sufficient as a
+    conservative online filter and easy to replace with OSQP later.
+    """
+    x = np.asarray(nominal_action, dtype=np.float64).reshape(-1).copy()
+    a = np.asarray(a_matrix, dtype=np.float64)
+    b = np.asarray(b_vector, dtype=np.float64).reshape(-1)
+    if a.size == 0:
+        return CbfQpProjectionResult(action=x, success=True, max_violation=0.0, iterations=0)
+    if a.ndim != 2 or a.shape[1] != x.size:
+        raise ValueError(f"a_matrix must have shape (N, {x.size}), got {a.shape}")
+    if b.shape != (a.shape[0],):
+        raise ValueError(f"b_vector must have shape ({a.shape[0]},), got {b.shape}")
+
+    lo = np.full_like(x, -np.inf) if lower is None else np.asarray(lower, dtype=np.float64).reshape(-1)
+    hi = np.full_like(x, np.inf) if upper is None else np.asarray(upper, dtype=np.float64).reshape(-1)
+    if lo.shape != x.shape or hi.shape != x.shape:
+        raise ValueError(f"lower/upper bounds must have shape {x.shape}")
+    x = np.minimum(np.maximum(x, lo), hi)
+
+    completed_iterations = 0
+    for iteration in range(max(int(iterations), 1)):
+        completed_iterations = iteration + 1
+        for row, rhs in zip(a, b):
+            denom = float(row @ row)
+            if denom <= 1e-12:
+                continue
+            violation = float(rhs - row @ x)
+            if violation > 0.0:
+                x = x + (violation / denom) * row
+                x = np.minimum(np.maximum(x, lo), hi)
+        if np.all((a @ x) >= (b - tolerance)):
+            break
+
+    halfspace_violation = float(np.max(np.maximum(b - a @ x, 0.0))) if len(b) else 0.0
+    lower_violation = float(np.max(np.maximum(lo - x, 0.0))) if len(x) else 0.0
+    upper_violation = float(np.max(np.maximum(x - hi, 0.0))) if len(x) else 0.0
+    max_violation = max(halfspace_violation, lower_violation, upper_violation)
+    return CbfQpProjectionResult(
+        action=x.astype(np.float64, copy=False),
+        success=bool(max_violation <= tolerance),
+        max_violation=max_violation,
+        iterations=completed_iterations,
+    )
+
+
+def _resolve_optional_action_bound(bound: list[float] | tuple[float, ...] | np.ndarray | None, dim: int) -> np.ndarray | None:
+    if bound is None:
+        return None
+    arr = np.asarray(bound, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return None
+    if arr.size == 1:
+        return np.full((dim,), float(arr[0]), dtype=np.float64)
+    if arr.size < dim:
+        raise ValueError(f"CBF action bound needs 1 or at least {dim} values, got {arr.size}")
+    return arr[:dim].astype(np.float64, copy=False)
+
+
+def finite_difference_point_jacobians(
+    point_position_fn,
+    q: np.ndarray,
+    point_keys: list[tuple[int, int]],
+    *,
+    eps: float = 1e-4,
+) -> dict[tuple[int, int], np.ndarray]:
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if eps <= 0.0:
+        raise ValueError("finite-difference eps must be positive")
+    unique_keys = sorted(set((int(link_id), int(point_id)) for link_id, point_id in point_keys))
+    jacobians = {key: np.zeros((3, q.size), dtype=np.float64) for key in unique_keys}
+    for joint_idx in range(q.size):
+        delta = np.zeros_like(q)
+        delta[joint_idx] = float(eps)
+        points_plus = np.asarray(point_position_fn(q + delta), dtype=np.float64)
+        points_minus = np.asarray(point_position_fn(q - delta), dtype=np.float64)
+        if points_plus.shape != points_minus.shape or points_plus.ndim != 3 or points_plus.shape[-1] != 3:
+            raise ValueError("point_position_fn must return link points with shape (L, P, 3)")
+        diff = (points_plus - points_minus) / (2.0 * float(eps))
+        for key in unique_keys:
+            jacobians[key][:, joint_idx] = diff[key[0], key[1]]
+    return jacobians
+
+
+def filter_action_with_pointflow_cbf_qp(
+    *,
+    env,
+    dataset_builder,
+    qpos_indices: np.ndarray,
+    geom_ids: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+    nominal_action: np.ndarray,
+    current_link_points: np.ndarray,
+    pred_link_points: np.ndarray,
+    safe_space: dict[str, np.ndarray] | None,
+    points_per_link: int,
+    samples_per_action: int,
+    skeleton_source: str,
+    collision_margin: float,
+    trigger_margin: float,
+    alpha: float,
+    max_constraints: int,
+    finite_difference_eps: float,
+    projection_iterations: int,
+    action_lower: list[float] | tuple[float, ...] | np.ndarray | None,
+    action_upper: list[float] | tuple[float, ...] | np.ndarray | None,
+    fallback: str,
+) -> tuple[np.ndarray, dict[str, object]]:
+    nominal = np.asarray(nominal_action, dtype=np.float64).reshape(-1)
+    arm_dim = int(len(qpos_indices))
+    if nominal.size < arm_dim:
+        raise ValueError(f"nominal action needs at least {arm_dim} arm values, got {nominal.size}")
+    constraints = point_flow_obb_cbf_constraints(
+        pred_link_points,
+        current_link_points,
+        safe_space,
+        collision_margin=collision_margin,
+        trigger_margin=trigger_margin,
+        max_constraints=max_constraints,
+    )
+    info: dict[str, object] = {
+        "triggered": bool(constraints),
+        "constraint_count": int(len(constraints)),
+        "success": True,
+        "max_violation": 0.0,
+    }
+    if not constraints:
+        return nominal.astype(np.float64, copy=False), info
+
+    q = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float64).reshape(-1)
+    arm_nominal = nominal[:arm_dim]
+    low = np.asarray(low, dtype=np.float64).reshape(-1)[:arm_dim]
+    high = np.asarray(high, dtype=np.float64).reshape(-1)[:arm_dim]
+    lower = low - q
+    upper = high - q
+    user_lower = _resolve_optional_action_bound(action_lower, arm_dim)
+    user_upper = _resolve_optional_action_bound(action_upper, arm_dim)
+    if user_lower is not None:
+        lower = np.maximum(lower, user_lower)
+    if user_upper is not None:
+        upper = np.minimum(upper, user_upper)
+
+    zero_action_chunk = np.zeros((0, arm_dim), dtype=np.float64)
+
+    def point_position_fn(q_vector: np.ndarray) -> np.ndarray:
+        def target_builder():
+            return dataset_builder.fk_target_link_points(
+                env,
+                qpos_indices,
+                geom_ids,
+                np.asarray(q_vector, dtype=np.float64),
+                zero_action_chunk,
+                int(points_per_link),
+                int(samples_per_action),
+                low,
+                high,
+                skeleton_source,
+            )
+
+        target, _link_names = collector.compute_fk_target_preserving_sim_state(env, target_builder)
+        return np.asarray(target[0], dtype=np.float64)
+
+    point_keys = [(item.link_id, item.point_id) for item in constraints]
+    jacobians = finite_difference_point_jacobians(
+        point_position_fn,
+        q,
+        point_keys,
+        eps=float(finite_difference_eps),
+    )
+    a_rows = []
+    b_values = []
+    for item in constraints:
+        jacobian = jacobians[(item.link_id, item.point_id)]
+        a_rows.append(np.asarray(item.normal, dtype=np.float64) @ jacobian)
+        b_values.append(-float(alpha) * float(item.h))
+
+    projection = solve_cbf_qp_projection(
+        arm_nominal,
+        np.asarray(a_rows, dtype=np.float64),
+        np.asarray(b_values, dtype=np.float64),
+        lower=lower,
+        upper=upper,
+        iterations=int(projection_iterations),
+    )
+    safe = nominal.copy()
+    if projection.success:
+        safe[:arm_dim] = projection.action
+    elif fallback == "zero":
+        safe[:arm_dim] = 0.0
+    elif fallback == "nominal":
+        safe[:arm_dim] = arm_nominal
+    else:
+        raise ValueError(f"Unsupported CBF fallback: {fallback}")
+
+    info.update(
+        {
+            "success": bool(projection.success),
+            "max_violation": float(projection.max_violation),
+            "iterations": int(projection.iterations),
+        }
+    )
+    return safe.astype(np.float64, copy=False), info
 
 
 def draw_projected_obbs(
@@ -703,6 +1064,11 @@ def save_evaluation(
     coordinate_frame: str,
     collision_flags: np.ndarray | None = None,
     collision_point_counts: np.ndarray | None = None,
+    executed_actions: np.ndarray | None = None,
+    cbf_triggered: np.ndarray | None = None,
+    cbf_success: np.ndarray | None = None,
+    cbf_constraint_counts: np.ndarray | None = None,
+    cbf_max_violations: np.ndarray | None = None,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(
@@ -722,6 +1088,16 @@ def save_evaluation(
         payload["collision_flags"] = np.asarray(collision_flags, dtype=bool)
     if collision_point_counts is not None:
         payload["collision_point_counts"] = np.asarray(collision_point_counts, dtype=np.int64)
+    if executed_actions is not None:
+        payload["executed_actions"] = np.asarray(executed_actions, dtype=np.float32)
+    if cbf_triggered is not None:
+        payload["cbf_triggered"] = np.asarray(cbf_triggered, dtype=bool)
+    if cbf_success is not None:
+        payload["cbf_success"] = np.asarray(cbf_success, dtype=bool)
+    if cbf_constraint_counts is not None:
+        payload["cbf_constraint_counts"] = np.asarray(cbf_constraint_counts, dtype=np.int64)
+    if cbf_max_violations is not None:
+        payload["cbf_max_violations"] = np.asarray(cbf_max_violations, dtype=np.float32)
     np.savez_compressed(output, **payload)
 
 
@@ -751,6 +1127,16 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--video-fps must be > 0")
     if args.collision_margin < 0.0:
         raise ValueError("--collision-margin must be >= 0")
+    if getattr(args, "cbf_trigger_margin", 0.0) < 0.0:
+        raise ValueError("--cbf-trigger-margin must be >= 0")
+    if getattr(args, "cbf_max_constraints", 1) <= 0:
+        raise ValueError("--cbf-max-constraints must be > 0")
+    if getattr(args, "cbf_finite_difference_eps", 1e-4) <= 0.0:
+        raise ValueError("--cbf-finite-difference-eps must be > 0")
+    if getattr(args, "cbf_projection_iterations", 1) <= 0:
+        raise ValueError("--cbf-projection-iterations must be > 0")
+    if getattr(args, "cbf_alpha", 1.0) < 0.0:
+        raise ValueError("--cbf-alpha must be >= 0")
     if args.realtime_obbs:
         if args.obb_width <= 0 or args.obb_height <= 0:
             raise ValueError("--obb-width and --obb-height must be > 0")
@@ -825,6 +1211,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     pred_samples: list[np.ndarray] = []
     target_samples: list[np.ndarray] = []
     action_chunks: list[np.ndarray] = []
+    executed_actions: list[np.ndarray] = []
     prefix_shapes: list[tuple[int, ...]] = []
     metrics: list[dict[str, float]] = []
     rollout_ids: list[int] = []
@@ -834,6 +1221,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     video_path = args.video_output
     static_safe_space = load_safe_space_for_video(args.safe_space) if args.safe_space is not None else None
     collision_results: list[dict[str, object]] = []
+    cbf_infos: list[dict[str, object]] = []
 
     try:
         qpos_indices = swept.get_arm_qpos_indices(env)
@@ -1004,7 +1392,47 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                 )
                 control_action = np.asarray(control_action_chunk[control_action_offset], dtype=np.float64)
                 action_dim = int(getattr(env, "action_dim", control_action.size))
-                obs, _reward, done, _info = env.step(control_action[:action_dim].tolist())
+                executed_action = control_action
+                cbf_info: dict[str, object] = {
+                    "triggered": False,
+                    "constraint_count": 0,
+                    "success": True,
+                    "max_violation": 0.0,
+                }
+                if getattr(args, "enable_cbf_qp", False):
+                    executed_action, cbf_info = filter_action_with_pointflow_cbf_qp(
+                        env=env,
+                        dataset_builder=dataset_builder,
+                        qpos_indices=qpos_indices,
+                        geom_ids=geom_ids_array,
+                        low=low,
+                        high=high,
+                        nominal_action=control_action,
+                        current_link_points=current_link_points,
+                        pred_link_points=pred,
+                        safe_space=safe_space,
+                        points_per_link=int(current_link_points.shape[1]),
+                        samples_per_action=args.samples_per_action,
+                        skeleton_source=args.skeleton_source,
+                        collision_margin=args.collision_margin,
+                        trigger_margin=getattr(args, "cbf_trigger_margin", 0.02),
+                        alpha=getattr(args, "cbf_alpha", 1.0),
+                        max_constraints=getattr(args, "cbf_max_constraints", 32),
+                        finite_difference_eps=getattr(args, "cbf_finite_difference_eps", 1e-4),
+                        projection_iterations=getattr(args, "cbf_projection_iterations", 12),
+                        action_lower=getattr(args, "cbf_action_lower", None),
+                        action_upper=getattr(args, "cbf_action_upper", None),
+                        fallback=getattr(args, "cbf_fallback", "zero"),
+                    )
+                    if bool(cbf_info.get("triggered", False)):
+                        print(
+                            f"[cbf] constraints={int(cbf_info.get('constraint_count', 0))} "
+                            f"success={bool(cbf_info.get('success', True))} "
+                            f"max_violation={float(cbf_info.get('max_violation', 0.0)):.3e}"
+                        )
+                executed_actions.append(np.asarray(executed_action[:action_dim], dtype=np.float32))
+                cbf_infos.append(cbf_info)
+                obs, _reward, done, _info = env.step(executed_action[:action_dim].tolist())
                 step_id += 1
                 control_action_offset += 1
                 control_replan_offset += 1
@@ -1020,6 +1448,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         "target_link_points": np.stack(target_samples).astype(np.float32),
         "prefix_tokens_shape": np.asarray(prefix_shapes, dtype=np.int64),
         "action_chunks": np.stack(action_chunks).astype(np.float32),
+        "executed_actions": np.stack(executed_actions).astype(np.float32),
         "metrics": stacked_metrics,
         "rollout_ids": np.asarray(rollout_ids, dtype=np.int64),
         "step_ids": np.asarray(step_ids, dtype=np.int64),
@@ -1032,6 +1461,16 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         "collision_point_counts": np.asarray(
             [item["collision_point_count"] for item in collision_results],
             dtype=np.int64,
+        ),
+        "cbf_triggered": np.asarray([bool(item.get("triggered", False)) for item in cbf_infos], dtype=bool),
+        "cbf_success": np.asarray([bool(item.get("success", True)) for item in cbf_infos], dtype=bool),
+        "cbf_constraint_counts": np.asarray(
+            [int(item.get("constraint_count", 0)) for item in cbf_infos],
+            dtype=np.int64,
+        ),
+        "cbf_max_violations": np.asarray(
+            [float(item.get("max_violation", 0.0)) for item in cbf_infos],
+            dtype=np.float32,
         ),
     }
     return result
@@ -1053,6 +1492,11 @@ def main() -> None:
         coordinate_frame=COORDINATE_FRAME,
         collision_flags=result["collision_flags"],
         collision_point_counts=result["collision_point_counts"],
+        executed_actions=result["executed_actions"],
+        cbf_triggered=result["cbf_triggered"],
+        cbf_success=result["cbf_success"],
+        cbf_constraint_counts=result["cbf_constraint_counts"],
+        cbf_max_violations=result["cbf_max_violations"],
     )
     if not args.no_video:
         swept = load_repo_script_module("libero_joint_swept_pointcloud")

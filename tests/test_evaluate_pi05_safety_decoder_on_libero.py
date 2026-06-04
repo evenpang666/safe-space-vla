@@ -25,12 +25,14 @@ from scripts.evaluate_pi05_safety_decoder_on_libero import (
     load_safety_model_checkpoint,
     load_repo_script_module,
     point_flow_obb_collision,
+    point_flow_obb_cbf_constraints,
     predict_link_points,
     predict_safety_flow_link_points,
     query_remote_safety_prediction,
     resolve_device_name,
     save_evaluation,
     select_safety_prediction_source,
+    solve_cbf_qp_projection,
 )
 
 
@@ -97,6 +99,51 @@ def test_query_remote_safety_prediction_returns_predicted_link_points():
 
     assert pred.shape == (2, 1, 2, 3)
     assert pred.dtype == np.float32
+
+
+def test_point_flow_obb_cbf_constraints_selects_future_obb_intrusion():
+    current = np.asarray([[[1.2, 0.0, 0.0]]], dtype=np.float32)
+    pred = np.asarray([[[[0.2, 0.0, 0.0]]]], dtype=np.float32)
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32),
+    }
+
+    constraints = point_flow_obb_cbf_constraints(
+        pred,
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.0,
+        max_constraints=8,
+    )
+
+    assert len(constraints) == 1
+    constraint = constraints[0]
+    assert constraint.link_id == 0
+    assert constraint.point_id == 0
+    assert constraint.obb_id == 0
+    np.testing.assert_allclose(constraint.normal, [1.0, 0.0, 0.0])
+    assert constraint.h == pytest.approx(0.7)
+
+
+def test_solve_cbf_qp_projection_removes_inward_component_and_keeps_tangent():
+    nominal = np.asarray([-0.4, 0.25], dtype=np.float64)
+    a = np.asarray([[1.0, 0.0]], dtype=np.float64)
+    b = np.asarray([0.0], dtype=np.float64)
+
+    result = solve_cbf_qp_projection(
+        nominal,
+        a,
+        b,
+        lower=np.asarray([-1.0, -1.0], dtype=np.float64),
+        upper=np.asarray([1.0, 1.0], dtype=np.float64),
+        iterations=4,
+    )
+
+    assert result.success is True
+    np.testing.assert_allclose(result.action, [0.0, 0.25], atol=1e-8)
 
 
 def test_infer_flow_points_per_link_uses_surface_checkpoint_topology():
@@ -475,6 +522,35 @@ def test_point_flow_obb_collision_flags_future_point_inside_obb():
     assert result["collision"] is True
     assert result["collision_point_count"] == 1
     np.testing.assert_array_equal(result["collision_point_indices"], [1])
+
+
+def test_point_flow_obb_collision_checks_every_obb():
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.stack([np.eye(3, dtype=np.float32), np.eye(3, dtype=np.float32)]),
+        "obstacle_box_half_sizes": np.asarray([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]], dtype=np.float32),
+        "obstacle_box_corners": np.zeros((2, 8, 3), dtype=np.float32),
+    }
+    pred = np.asarray([[[[3.25, 0.0, 0.0]]]], dtype=np.float32)
+
+    result = point_flow_obb_collision(pred, safe_space)
+
+    assert result["collision"] is True
+    assert result["collision_point_count"] == 1
+    np.testing.assert_array_equal(result["collision_point_indices"], [0])
+
+
+def test_point_flow_obb_collision_rejects_mismatched_obb_arrays():
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]], dtype=np.float32),
+        "obstacle_box_corners": np.zeros((2, 8, 3), dtype=np.float32),
+    }
+    pred = np.asarray([[[[3.25, 0.0, 0.0]]]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="same number of OBBs"):
+        point_flow_obb_collision(pred, safe_space)
 
 
 def test_draw_projected_obbs_draws_box_edges():
