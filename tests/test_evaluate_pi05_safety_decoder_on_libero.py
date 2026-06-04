@@ -27,8 +27,10 @@ from scripts.evaluate_pi05_safety_decoder_on_libero import (
     point_flow_obb_collision,
     predict_link_points,
     predict_safety_flow_link_points,
+    query_remote_safety_prediction,
     resolve_device_name,
     save_evaluation,
+    select_safety_prediction_source,
 )
 
 
@@ -67,6 +69,34 @@ def test_load_repo_script_module_ignores_openpi_scripts_package(monkeypatch):
 
 def test_resolve_device_name_accepts_gpu_alias():
     assert resolve_device_name("gpu") == "cuda"
+
+
+def test_select_safety_prediction_source_auto_prefers_remote_metadata():
+    metadata = {"returns_safety_predictions": True}
+
+    assert select_safety_prediction_source("auto", metadata) == "remote"
+
+
+def test_select_safety_prediction_source_auto_falls_back_to_local_without_remote_metadata():
+    assert select_safety_prediction_source("auto", {}) == "local"
+
+
+def test_query_remote_safety_prediction_returns_predicted_link_points():
+    class _FakePolicy:
+        def infer(self, obs):
+            np.testing.assert_allclose(obs["prefix_tokens"], [[1.0]])
+            np.testing.assert_allclose(obs["current_link_points"], np.zeros((1, 2, 3), dtype=np.float32))
+            assert obs["safety_only"] is True
+            return {"pred_link_points": np.ones((2, 1, 2, 3), dtype=np.float32)}
+
+    pred = query_remote_safety_prediction(
+        _FakePolicy(),
+        prefix_tokens=np.asarray([[1.0]], dtype=np.float32),
+        current_link_points=np.zeros((1, 2, 3), dtype=np.float32),
+    )
+
+    assert pred.shape == (2, 1, 2, 3)
+    assert pred.dtype == np.float32
 
 
 def test_infer_flow_points_per_link_uses_surface_checkpoint_topology():

@@ -297,6 +297,7 @@ export PYTHONPATH=$PWD:$PWD/openpi/src:$PWD/openpi/packages/openpi-client/src:$P
 python scripts/serve_pi05_prefix_policy.py \
   --policy-config pi05_libero \
   --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --safety-checkpoint outputs/pi05_safety_decoder/pi05_libero_task0_safety_flow_point_surface_model_6_2_18_15.pt \
   --port 8000
 ```
 
@@ -308,7 +309,6 @@ export PYTHONPATH=$PWD:$PWD/openpi/packages/openpi-client/src:$PWD/openpi/third_
 export MUJOCO_GL=egl
 
 python scripts/evaluate_pi05_safety_decoder_on_libero.py \
-  --checkpoint outputs/pi05_safety_decoder/pi05_libero_task0_safety_flow_point_model.pt \
   --policy-server-host 127.0.0.1 \
   --policy-server-port 8000 \
   --task-suite libero_spatial \
@@ -326,11 +326,12 @@ python scripts/evaluate_pi05_safety_decoder_on_libero.py \
   --collision-margin 0.0 \
   --output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.npz \
   --video-output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.mp4 \
-  --device cpu \
   --mujoco-gl egl
 ```
 
 默认验证会在每个采样时间步用当前 LIBERO RGB-D 状态实时重建障碍物 OBB，并用同一组 OBB 绘制视频方框和判断未来 point flow 是否进入 OBB。若需要复用预生成的静态 OBB 文件，可改用 `--no-realtime-obbs --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz`。
+
+当 websocket server 通过 `--safety-checkpoint` 启动时，验证脚本会根据 server metadata 自动使用远端 safety module 预测未来 point flow；验证环境不再需要选择 `cpu` / `cuda`。如果 server 没有加载 safety module，验证脚本会回退到本地 `--checkpoint`，并用 `--device auto` 自动选择设备。
 
 推理并用几何计算输出 `collision` 或 `safe`：
 

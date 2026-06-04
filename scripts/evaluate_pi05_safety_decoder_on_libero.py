@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Evaluate a trained PI05 safety decoder online in LIBERO.
+"""Evaluate PI05 safety predictions online in LIBERO.
 
 The script connects to ``scripts/serve_pi05_prefix_policy.py`` for pi05_libero
-actions and prefix tokens, predicts future link points with the decoder, and
-compares them against FK targets generated from the same action chunk.
+actions and prefix tokens. When the server also advertises a safety module, it
+uses server-side safety predictions; otherwise it falls back to a local
+checkpoint.
 """
 
 from __future__ import annotations
@@ -76,7 +77,12 @@ class VideoFrameBuffer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT, help="Trained decoder checkpoint.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=DEFAULT_CHECKPOINT,
+        help="Local trained decoder checkpoint. Used when the policy server does not serve safety predictions.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output evaluation .npz.")
     parser.add_argument("--video-output", type=Path, default=DEFAULT_VIDEO_OUTPUT, help="Output MP4 task video.")
     parser.add_argument("--no-video", action="store_true", help="Disable MP4 task video generation.")
@@ -130,6 +136,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obb-box-orientation", choices=["axis_aligned", "xy_oriented", "pca_3d"], default="xy_oriented")
     parser.add_argument("--obb-voxel-size", type=float, default=0.04)
     parser.add_argument("--prediction-steps", type=int, default=10, help="Euler ODE steps for SafetyFlowPointModel.")
+    parser.add_argument(
+        "--safety-prediction-source",
+        choices=["auto", "remote", "local"],
+        default="auto",
+        help="Use remote server-side safety predictions when available, or local checkpoint inference.",
+    )
     parser.add_argument("--policy-server-host", default="127.0.0.1", help="pi05 prefix policy websocket host.")
     parser.add_argument("--policy-server-port", type=int, default=8000, help="pi05 prefix policy websocket port.")
     parser.add_argument("--task-suite", default="libero_spatial", choices=sorted(collector.TASK_SUITE_MAX_STEPS))
@@ -155,12 +167,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-resolution", type=int, default=256)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--mujoco-gl", choices=["egl", "osmesa", "glfw"], default="egl")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
 
 def resolve_device_name(device: str) -> str:
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
     return "cuda" if device == "gpu" else device
+
+
+def select_safety_prediction_source(requested: str, server_metadata: dict | None) -> str:
+    if requested not in {"auto", "remote", "local"}:
+        raise ValueError(f"Unknown safety prediction source: {requested}")
+    metadata = server_metadata or {}
+    remote_available = bool(metadata.get("returns_safety_predictions", False))
+    if requested == "auto":
+        return "remote" if remote_available else "local"
+    if requested == "remote" and not remote_available:
+        raise RuntimeError(
+            "The connected policy server does not advertise safety predictions. "
+            "Start scripts/serve_pi05_prefix_policy.py with --safety-checkpoint, or use "
+            "--safety-prediction-source local."
+        )
+    return requested
 
 
 def infer_flow_points_per_link(
@@ -281,6 +311,19 @@ def predict_safety_flow_link_points(
     )
     offsets = delta[0].detach().cpu().numpy().astype(np.float32, copy=False)
     return absolute_link_points_from_offsets(offsets, current_link_points).astype(np.float32, copy=False)
+
+
+def query_remote_safety_prediction(policy, *, prefix_tokens: np.ndarray, current_link_points: np.ndarray) -> np.ndarray:
+    result = policy.infer(
+        {
+            "safety_only": True,
+            "prefix_tokens": np.asarray(prefix_tokens, dtype=np.float32),
+            "current_link_points": np.asarray(current_link_points, dtype=np.float32),
+        }
+    )
+    if "pred_link_points" not in result:
+        raise KeyError("Remote safety response must contain 'pred_link_points'")
+    return np.asarray(result["pred_link_points"], dtype=np.float32)
 
 
 def prediction_link_ids(pred_link_points: np.ndarray) -> np.ndarray:
@@ -737,21 +780,41 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     safe_space_builder = load_repo_script_module("build_safe_space_from_pointcloud") if args.realtime_obbs else None
 
     np.random.seed(args.seed)
-    device = torch.device(resolve_device_name(args.device))
-    loaded_model = load_safety_model_checkpoint(args.checkpoint, device)
+    policy = collector.load_remote_policy(host=args.policy_server_host, port=args.policy_server_port)
+    get_metadata = getattr(policy, "get_server_metadata", None)
+    server_metadata = dict(get_metadata()) if callable(get_metadata) else {}
+    safety_prediction_source = select_safety_prediction_source(
+        getattr(args, "safety_prediction_source", "auto"),
+        server_metadata,
+    )
+
+    device = torch.device(resolve_device_name(getattr(args, "device", "auto")))
+    loaded_model = None
+    if safety_prediction_source == "local":
+        loaded_model = load_safety_model_checkpoint(args.checkpoint, device)
+        model_type = loaded_model.model_type
+    else:
+        model_type = str(server_metadata.get("safety_model_type", ""))
+        if model_type not in {"flow", "decoder"}:
+            raise ValueError(f"Remote safety server returned unsupported safety_model_type={model_type!r}")
+
     flow_points_per_link = args.points_per_link
-    if loaded_model.model_type == "flow":
+    if model_type == "flow":
+        flow_max_points = (
+            int(loaded_model.model.flow_head.max_points)
+            if loaded_model is not None
+            else int(server_metadata["safety_flow_max_points"])
+        )
         flow_points_per_link = infer_flow_points_per_link(
-            max_points=int(loaded_model.model.flow_head.max_points),
+            max_points=flow_max_points,
             skeleton_source=args.skeleton_source,
             requested_points_per_link=args.points_per_link,
         )
         if flow_points_per_link != args.points_per_link:
             print(
                 f"[info] overriding --points-per-link {args.points_per_link} -> {flow_points_per_link} "
-                f"to match flow checkpoint max_points={int(loaded_model.model.flow_head.max_points)}"
+                f"to match flow checkpoint max_points={flow_max_points}"
             )
-    policy = collector.load_remote_policy(host=args.policy_server_host, port=args.policy_server_port)
 
     task_suite = collector.create_libero_task_suite(args.task_suite)
     task = task_suite.get_task(args.task_id)
@@ -822,7 +885,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                 def target_builder():
                     points_per_link = (
                         int(loaded_model.config.points_per_link)
-                        if loaded_model.model_type == "decoder"
+                        if loaded_model is not None and model_type == "decoder"
                         else int(flow_points_per_link)
                     )
                     return dataset_builder.fk_target_link_points(
@@ -841,17 +904,31 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                 target, link_names = collector.compute_fk_target_preserving_sim_state(env, target_builder)
                 current_link_points = target[0]
                 target_future = target
-                if loaded_model.model_type == "flow":
-                    pred = predict_safety_flow_link_points(
-                        loaded_model.model,
-                        prefix_tokens,
-                        current_link_points,
-                        device=device,
-                        prediction_steps=args.prediction_steps,
-                    )
+                if model_type == "flow":
                     target_future = target[1:]
+                    if safety_prediction_source == "remote":
+                        pred = query_remote_safety_prediction(
+                            policy,
+                            prefix_tokens=prefix_tokens,
+                            current_link_points=current_link_points,
+                        )
+                    else:
+                        pred = predict_safety_flow_link_points(
+                            loaded_model.model,
+                            prefix_tokens,
+                            current_link_points,
+                            device=device,
+                            prediction_steps=args.prediction_steps,
+                        )
                 else:
-                    pred = predict_link_points(loaded_model.model, prefix_tokens, device)
+                    if safety_prediction_source == "remote":
+                        pred = query_remote_safety_prediction(
+                            policy,
+                            prefix_tokens=prefix_tokens,
+                            current_link_points=current_link_points,
+                        )
+                    else:
+                        pred = predict_link_points(loaded_model.model, prefix_tokens, device)
                 validate_pred_target_shape(pred, target_future)
                 if args.realtime_obbs:
                     safe_space = build_realtime_safe_space_from_env(
@@ -947,7 +1024,8 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         "rollout_ids": np.asarray(rollout_ids, dtype=np.int64),
         "step_ids": np.asarray(step_ids, dtype=np.int64),
         "link_names": np.asarray(link_names),
-        "model_type": loaded_model.model_type,
+        "model_type": model_type,
+        "safety_prediction_source": safety_prediction_source,
         "video_frames": video_buffer.frames,
         "video_path": video_path,
         "collision_flags": np.asarray([item["collision"] for item in collision_results], dtype=bool),
