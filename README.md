@@ -231,6 +231,24 @@ python scripts/collect_pi05_libero_safety_decoder_dataset.py \
   --mujoco-gl egl
 ```
 
+若要一次采集 `libero_spatial` 下全部任务，并合并成一个可直接训练的 `.npz`：
+
+```bash
+python scripts/collect_pi05_libero_safety_decoder_dataset.py \
+  --policy-server-host 127.0.0.1 \
+  --policy-server-port 8000 \
+  --task-suite libero_spatial \
+  --task-ids all \
+  --num-rollouts 5 \
+  --max-samples-per-task 256 \
+  --replan-steps 5 \
+  --points-per-link 128 \
+  --output outputs/pi05_safety_decoder/pi05_libero_spatial_all_tasks_decoder_dataset.npz \
+  --mujoco-gl egl
+```
+
+也可以只采集一部分任务，例如 `--task-ids 0 1 2 3`。输出文件中的 `task_ids` 字段会记录每条样本来自哪个 LIBERO task。
+
 如果不用 websocket server，也可以在单个同时安装了 OpenPI 和 LIBERO 依赖的环境里省略 `--policy-server-host`，让采集脚本本地加载 policy。
 
 输出 `.npz` 可直接用于训练，关键字段为：
@@ -275,8 +293,8 @@ python scripts/train_pi05_safety_decoder.py \
 
 ```bash
 python scripts/train_pi05_safety_flow_point_model.py \
-  --dataset outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
-  --output outputs/pi05_safety_decoder/pi05_libero_task0_safety_flow_point_model.pt \
+  --dataset outputs/pi05_safety_decoder/pi05_libero_spatial_all_tasks_decoder_dataset.npz \
+  --output outputs/pi05_safety_decoder/pi05_libero_spatial_all_tasks_safety_flow_point_model.pt \
   --hidden-dim 256 \
   --num-encoder-layers 4 \
   --num-decoder-layers 4 \

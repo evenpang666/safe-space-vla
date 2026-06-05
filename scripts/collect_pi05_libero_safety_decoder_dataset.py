@@ -55,8 +55,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", default=DEFAULT_CHECKPOINT, help="OpenPI policy checkpoint directory.")
     parser.add_argument("--task-suite", default="libero_spatial", choices=sorted(TASK_SUITE_MAX_STEPS))
     parser.add_argument("--task-id", type=int, default=0)
+    parser.add_argument(
+        "--task-ids",
+        nargs="+",
+        default=None,
+        help="Task ids to collect into one dataset. Use 'all' to collect every task in the suite.",
+    )
     parser.add_argument("--num-rollouts", type=int, default=5)
     parser.add_argument("--max-samples", type=int, default=512, help="Maximum replan samples to collect.")
+    parser.add_argument(
+        "--max-samples-per-task",
+        type=int,
+        default=512,
+        help="Maximum replan samples to collect for each task. Defaults to --max-samples.",
+    )
     parser.add_argument("--max-steps", type=int, default=None, help="Rollout step cap after settling.")
     parser.add_argument("--num-steps-wait", type=int, default=10, help="No-op steps before policy control.")
     parser.add_argument("--replan-steps", type=int, default=10, help="Executed steps per predicted action chunk.")
@@ -601,11 +613,47 @@ def default_max_steps(task_suite: str) -> int:
         raise ValueError(f"Unknown task suite: {task_suite}") from exc
 
 
+def resolve_task_ids(*, task_id: int, task_ids: list[str] | tuple[str, ...] | None, n_tasks: int) -> list[int]:
+    n_tasks = int(n_tasks)
+    if n_tasks <= 0:
+        raise ValueError(f"task suite must contain at least one task, got {n_tasks}")
+    if task_ids is None:
+        resolved = [int(task_id)]
+    else:
+        raw_ids = [str(item) for item in task_ids]
+        lowered = [item.lower() for item in raw_ids]
+        if "all" in lowered:
+            if len(raw_ids) != 1:
+                raise ValueError("--task-ids all cannot be combined with explicit task ids")
+            resolved = list(range(n_tasks))
+        else:
+            try:
+                resolved = [int(item) for item in raw_ids]
+            except ValueError as exc:
+                raise ValueError("--task-ids entries must be integers or 'all'") from exc
+    for item in resolved:
+        if not 0 <= int(item) < n_tasks:
+            raise ValueError(f"task id {item} must be in [0, {n_tasks - 1}]")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("--task-ids must not contain duplicates")
+    return resolved
+
+
+def resolve_max_samples_per_task(*, max_samples: int, max_samples_per_task: int | None) -> int:
+    if max_samples_per_task is None:
+        return int(max_samples)
+    if int(max_samples_per_task) <= 0:
+        raise ValueError("--max-samples-per-task must be > 0")
+    return int(max_samples_per_task)
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.num_rollouts <= 0:
         raise ValueError("--num-rollouts must be > 0")
     if args.max_samples <= 0:
         raise ValueError("--max-samples must be > 0")
+    if args.max_samples_per_task is not None and args.max_samples_per_task <= 0:
+        raise ValueError("--max-samples-per-task must be > 0")
     if args.replan_steps <= 0:
         raise ValueError("--replan-steps must be > 0")
     if args.points_per_link < 2:
@@ -627,8 +675,11 @@ def main() -> None:
 
     np.random.seed(args.seed)
     task_suite = create_libero_task_suite(args.task_suite)
-    task = task_suite.get_task(args.task_id)
-    initial_states = task_suite.get_task_init_states(args.task_id)
+    task_ids = resolve_task_ids(task_id=args.task_id, task_ids=args.task_ids, n_tasks=task_suite.n_tasks)
+    max_samples_per_task = resolve_max_samples_per_task(
+        max_samples=args.max_samples,
+        max_samples_per_task=args.max_samples_per_task,
+    )
     max_steps = args.max_steps if args.max_steps is not None else default_max_steps(args.task_suite)
     remote_prefix_tokens = args.policy_server_host is not None
     if remote_prefix_tokens:
@@ -641,124 +692,135 @@ def main() -> None:
             pytorch_device=args.pytorch_device,
         )
 
-    env, task_description = create_libero_env(task, resolution=args.env_resolution, seed=args.seed)
     buffer = CollectedSampleBuffer()
     link_names = np.asarray([])
-    try:
-        qpos_indices = swept.get_arm_qpos_indices(env)
-        geom_ids = libero_pc.find_robot_geoms(env)
-        geom_ids_array = robot_geom_ids_array(geom_ids)
-        dummy_action = make_dummy_action(env)
-        local_surface_points, surface_template_geom_ids, surface_link_names = (
-            dataset_builder.build_link_surface_template(
-                env.sim.model,
-                geom_ids_array,
-                args.points_per_link,
-                np.random.default_rng(0),
-            )
+    for task_id in task_ids:
+        task_start_sample_count = len(buffer)
+        task_sample_limit = task_start_sample_count + max_samples_per_task
+        task = task_suite.get_task(task_id)
+        initial_states = task_suite.get_task_init_states(task_id)
+        env, task_description = create_libero_env(task, resolution=args.env_resolution, seed=args.seed)
+        print(
+            f"[task] collecting task_id={task_id} "
+            f"target_samples={max_samples_per_task} prompt={task_description!r}"
         )
-
-        def surface_snapshot():
-            return dataset_builder.transform_link_surface_template(
-                env.sim,
-                local_surface_points,
-                surface_template_geom_ids,
+        try:
+            qpos_indices = swept.get_arm_qpos_indices(env)
+            geom_ids = libero_pc.find_robot_geoms(env)
+            geom_ids_array = robot_geom_ids_array(geom_ids)
+            dummy_action = make_dummy_action(env)
+            local_surface_points, surface_template_geom_ids, surface_link_names = (
+                dataset_builder.build_link_surface_template(
+                    env.sim.model,
+                    geom_ids_array,
+                    args.points_per_link,
+                    np.random.default_rng(0),
+                )
             )
 
-        for rollout_id in range(args.num_rollouts):
-            if len(buffer) >= args.max_samples:
-                break
-            env.reset()
-            init_state = initial_states[rollout_id % len(initial_states)]
-            obs = env.set_init_state(init_state)
-            for _ in range(args.num_steps_wait):
-                obs, _reward, done, _info = env.step(dummy_action)
-                if done:
-                    break
-
-            step_id = 0
-            done = False
-            rollout_records: list[ReplanSampleRecord] = []
-            surface_frames: list[np.ndarray] = []
-
-            control_action_chunk = None
-            control_action_offset = 0
-            control_replan_offset = 0
-            while not done and step_id < max_steps:
-                surface_frames.append(np.asarray(surface_snapshot(), dtype=np.float32))
-                element = build_libero_policy_input(obs, prompt=task_description, resize_size=args.resize_size)
-                need_control_query = (
-                    control_action_chunk is None
-                    or control_action_offset >= len(control_action_chunk)
-                    or control_replan_offset >= args.replan_steps
+            def surface_snapshot():
+                return dataset_builder.transform_link_surface_template(
+                    env.sim,
+                    local_surface_points,
+                    surface_template_geom_ids,
                 )
-                if need_control_query:
-                    action_chunk, prefix_tokens = query_policy_action_and_prefix(
-                        policy,
-                        element,
-                        remote_prefix_tokens=remote_prefix_tokens,
-                    )
-                    control_action_chunk = action_chunk
-                    control_action_offset = 0
-                    control_replan_offset = 0
-                elif len(buffer) + len(rollout_records) < args.max_samples:
-                    action_chunk, prefix_tokens = query_policy_action_and_prefix(
-                        policy,
-                        element,
-                        remote_prefix_tokens=remote_prefix_tokens,
-                    )
-                else:
-                    action_chunk = control_action_chunk
-                    prefix_tokens = None
-                start_joint_vector = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float32)
 
-                if prefix_tokens is not None and len(buffer) + len(rollout_records) < args.max_samples:
-                    rollout_records.append(
-                        ReplanSampleRecord(
-                            prefix_tokens=prefix_tokens,
-                            action_chunk=action_chunk,
-                            start_joint_vector=start_joint_vector,
-                            task_id=args.task_id,
-                            rollout_id=rollout_id,
-                            step_id=step_id,
-                        )
-                    )
-
-                actions_to_execute = [control_action_chunk[control_action_offset]]
-                for action in actions_to_execute:
-                    env_action = np.asarray(action, dtype=np.float64)
-                    action_dim = int(getattr(env, "action_dim", env_action.size))
-                    obs, _reward, done, _info = env.step(env_action[:action_dim].tolist())
-                    step_id += 1
-                    control_action_offset += 1
-                    control_replan_offset += 1
-                    if done or step_id >= max_steps:
+            for rollout_id in range(args.num_rollouts):
+                if len(buffer) >= task_sample_limit:
+                    break
+                env.reset()
+                init_state = initial_states[rollout_id % len(initial_states)]
+                obs = env.set_init_state(init_state)
+                for _ in range(args.num_steps_wait):
+                    obs, _reward, done, _info = env.step(dummy_action)
+                    if done:
                         break
 
-            link_names = surface_link_names
-            append_surface_trajectory_samples(
-                buffer,
-                records=rollout_records,
-                surface_frames=np.stack(surface_frames).astype(np.float32),
-                link_names=link_names,
-                max_samples=args.max_samples,
-            )
+                step_id = 0
+                done = False
+                rollout_records: list[ReplanSampleRecord] = []
+                surface_frames: list[np.ndarray] = []
 
-        save_collected_dataset(
-            args.output,
-            buffer=buffer,
-            link_names=link_names,
-            task_suite=args.task_suite,
-            points_per_link=args.points_per_link,
-            samples_per_action=1,
-            policy_config=args.policy_config,
-            checkpoint_dir=args.checkpoint_dir,
-            skeleton_source="surface",
-            target_source="rollout_surface",
-        )
-        print(f"[done] saved {len(buffer)} samples to {args.output}")
-    finally:
-        env.close()
+                control_action_chunk = None
+                control_action_offset = 0
+                control_replan_offset = 0
+                while not done and step_id < max_steps:
+                    surface_frames.append(np.asarray(surface_snapshot(), dtype=np.float32))
+                    element = build_libero_policy_input(obs, prompt=task_description, resize_size=args.resize_size)
+                    need_control_query = (
+                        control_action_chunk is None
+                        or control_action_offset >= len(control_action_chunk)
+                        or control_replan_offset >= args.replan_steps
+                    )
+                    if need_control_query:
+                        action_chunk, prefix_tokens = query_policy_action_and_prefix(
+                            policy,
+                            element,
+                            remote_prefix_tokens=remote_prefix_tokens,
+                        )
+                        control_action_chunk = action_chunk
+                        control_action_offset = 0
+                        control_replan_offset = 0
+                    elif len(buffer) + len(rollout_records) < task_sample_limit:
+                        action_chunk, prefix_tokens = query_policy_action_and_prefix(
+                            policy,
+                            element,
+                            remote_prefix_tokens=remote_prefix_tokens,
+                        )
+                    else:
+                        action_chunk = control_action_chunk
+                        prefix_tokens = None
+                    start_joint_vector = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float32)
+
+                    if prefix_tokens is not None and len(buffer) + len(rollout_records) < task_sample_limit:
+                        rollout_records.append(
+                            ReplanSampleRecord(
+                                prefix_tokens=prefix_tokens,
+                                action_chunk=action_chunk,
+                                start_joint_vector=start_joint_vector,
+                                task_id=task_id,
+                                rollout_id=rollout_id,
+                                step_id=step_id,
+                            )
+                        )
+
+                    actions_to_execute = [control_action_chunk[control_action_offset]]
+                    for action in actions_to_execute:
+                        env_action = np.asarray(action, dtype=np.float64)
+                        action_dim = int(getattr(env, "action_dim", env_action.size))
+                        obs, _reward, done, _info = env.step(env_action[:action_dim].tolist())
+                        step_id += 1
+                        control_action_offset += 1
+                        control_replan_offset += 1
+                        if done or step_id >= max_steps:
+                            break
+
+                link_names = surface_link_names
+                if surface_frames:
+                    append_surface_trajectory_samples(
+                        buffer,
+                        records=rollout_records,
+                        surface_frames=np.stack(surface_frames).astype(np.float32),
+                        link_names=link_names,
+                        max_samples=task_sample_limit,
+                    )
+            print(f"[task] task_id={task_id} saved_samples={len(buffer) - task_start_sample_count}")
+        finally:
+            env.close()
+
+    save_collected_dataset(
+        args.output,
+        buffer=buffer,
+        link_names=link_names,
+        task_suite=args.task_suite,
+        points_per_link=args.points_per_link,
+        samples_per_action=1,
+        policy_config=args.policy_config,
+        checkpoint_dir=args.checkpoint_dir,
+        skeleton_source="surface",
+        target_source="rollout_surface",
+    )
+    print(f"[done] saved {len(buffer)} samples from {len(task_ids)} tasks to {args.output}")
 
 
 if __name__ == "__main__":

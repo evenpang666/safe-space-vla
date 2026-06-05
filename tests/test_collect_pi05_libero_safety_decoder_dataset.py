@@ -12,6 +12,8 @@ from scripts.collect_pi05_libero_safety_decoder_dataset import (
     compute_fk_target_preserving_sim_state,
     compute_rollout_surface_target_preserving_sim_state,
     collect_rollout_surface_target,
+    resolve_max_samples_per_task,
+    resolve_task_ids,
     robot_geom_ids_array,
     save_collected_dataset,
     surface_trajectory_target,
@@ -24,8 +26,61 @@ def test_parse_args_defaults_to_dense_link_points(monkeypatch):
     args = collector.parse_args()
 
     assert args.points_per_link == 128
+    assert args.task_ids is None
+    assert args.max_samples_per_task is None
     assert not hasattr(args, "skeleton_source")
     assert not hasattr(args, "target_source")
+
+
+def test_parse_args_accepts_all_task_ids_and_per_task_limit(monkeypatch):
+    monkeypatch.setattr(
+        collector.sys,
+        "argv",
+        [
+            "collect_pi05_libero_safety_decoder_dataset.py",
+            "--task-ids",
+            "all",
+            "--max-samples-per-task",
+            "32",
+        ],
+    )
+
+    args = collector.parse_args()
+
+    assert args.task_ids == ["all"]
+    assert args.max_samples_per_task == 32
+
+
+def test_resolve_task_ids_expands_all_and_validates_bounds():
+    assert resolve_task_ids(task_id=0, task_ids=["all"], n_tasks=3) == [0, 1, 2]
+    assert resolve_task_ids(task_id=0, task_ids=["2", "0"], n_tasks=3) == [2, 0]
+    assert resolve_task_ids(task_id=1, task_ids=None, n_tasks=3) == [1]
+
+    try:
+        resolve_task_ids(task_id=0, task_ids=["all", "1"], n_tasks=3)
+    except ValueError as exc:
+        assert "cannot be combined" in str(exc)
+    else:
+        raise AssertionError("combined all and explicit task ids were accepted")
+
+    try:
+        resolve_task_ids(task_id=3, task_ids=None, n_tasks=3)
+    except ValueError as exc:
+        assert "must be in [0, 2]" in str(exc)
+    else:
+        raise AssertionError("out-of-range task id was accepted")
+
+
+def test_resolve_max_samples_per_task_prefers_explicit_per_task_limit():
+    assert resolve_max_samples_per_task(max_samples=512, max_samples_per_task=None) == 512
+    assert resolve_max_samples_per_task(max_samples=512, max_samples_per_task=64) == 64
+
+    try:
+        resolve_max_samples_per_task(max_samples=512, max_samples_per_task=0)
+    except ValueError as exc:
+        assert "--max-samples-per-task must be > 0" in str(exc)
+    else:
+        raise AssertionError("non-positive per-task sample limit was accepted")
 
 
 def test_parse_args_rejects_removed_collection_modes(monkeypatch):
