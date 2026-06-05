@@ -16,7 +16,9 @@ import importlib.util
 import math
 import os
 from pathlib import Path
+import re
 import sys
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -47,6 +49,312 @@ TASK_SUITE_MAX_STEPS = {
     "libero_10": 520,
     "libero_90": 400,
 }
+
+EVAL_SCENE_WINE_BOTTLE_CATEGORY = "eval_scene_wine_bottle_obstacle"
+EVAL_SCENE_WINE_BOTTLE_SCALE = 1.8
+
+
+@dataclass(frozen=True)
+class SceneObstacleSpec:
+    kind: str = "none"
+    xy: tuple[float, float] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.kind != "none"
+
+
+def _format_bddl_float(value: float) -> str:
+    return f"{float(value):.6g}"
+
+
+def _format_xml_floats(values: list[float]) -> str:
+    return " ".join(_format_bddl_float(value) for value in values)
+
+
+def _scaled_xml_vector(raw: str | None, scale: float) -> str | None:
+    if raw is None:
+        return None
+    values = [float(item) * float(scale) for item in raw.split()]
+    return _format_xml_floats(values)
+
+
+def materialize_eval_scene_wine_bottle_xml(
+    source_xml: Path,
+    *,
+    output_dir: Path,
+    scale: float = EVAL_SCENE_WINE_BOTTLE_SCALE,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_xml = output_dir / "eval_scene_wine_bottle_obstacle.xml"
+    tree = ET.parse(source_xml)
+    root = tree.getroot()
+    root.set("model", "eval_scene_wine_bottle_obstacle")
+
+    source_dir = source_xml.parent
+    for asset in root.findall(".//asset/*"):
+        file_attr = asset.get("file")
+        if file_attr:
+            asset.set("file", str((source_dir / file_attr).resolve()))
+        if asset.tag == "mesh" and asset.get("scale") is not None:
+            asset.set("scale", _scaled_xml_vector(asset.get("scale"), scale))
+
+    for element in root.findall(".//geom") + root.findall(".//site"):
+        for attr_name in ("pos", "size"):
+            scaled = _scaled_xml_vector(element.get(attr_name), scale)
+            if scaled is not None:
+                element.set(attr_name, scaled)
+
+    tree.write(output_xml, encoding="unicode")
+    return output_xml
+
+
+def register_eval_scene_obstacle_objects(*, scale: float = EVAL_SCENE_WINE_BOTTLE_SCALE) -> None:
+    ensure_third_party_paths()
+    from libero.libero.envs.base_object import OBJECTS_DICT, register_object
+    from robosuite.models.objects import MujocoXMLObject
+
+    if EVAL_SCENE_WINE_BOTTLE_CATEGORY in OBJECTS_DICT:
+        return
+
+    source_xml = (
+        LIBERO_ROOT
+        / "libero"
+        / "libero"
+        / "assets"
+        / "turbosquid_objects"
+        / "wine_bottle"
+        / "wine_bottle.xml"
+    )
+    output_xml = materialize_eval_scene_wine_bottle_xml(
+        source_xml,
+        output_dir=Path(os.environ.get("TMPDIR", "/tmp")) / "safety_module_libero_scene_obstacles" / "assets",
+        scale=scale,
+    )
+
+    class EvalSceneWineBottleObstacle(MujocoXMLObject):
+        def __init__(self, name=EVAL_SCENE_WINE_BOTTLE_CATEGORY, joints=None):
+            super().__init__(
+                str(output_xml),
+                name=name,
+                joints=joints,
+                obj_type="all",
+                duplicate_collision_geoms=False,
+            )
+            self.category_name = EVAL_SCENE_WINE_BOTTLE_CATEGORY
+            self.rotation = (0, 0)
+            self.rotation_axis = "z"
+            self.object_properties = {"vis_site_names": {}}
+
+    EvalSceneWineBottleObstacle.__name__ = "EvalSceneWineBottleObstacle"
+    register_object(EvalSceneWineBottleObstacle)
+
+
+def _find_bddl_section_span(text: str, section_name: str) -> tuple[int, int]:
+    match = re.search(r"\(:" + re.escape(section_name) + r"\b", text)
+    if match is None:
+        raise ValueError(f"BDDL text is missing :{section_name} section")
+    start = int(match.start())
+    depth = 0
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return start, idx + 1
+    raise ValueError(f"BDDL :{section_name} section is not balanced")
+
+
+def _insert_before_bddl_section_close(text: str, section_name: str, insertion: str) -> str:
+    _start, end = _find_bddl_section_span(text, section_name)
+    return text[: end - 1] + insertion + text[end - 1 :]
+
+
+def patch_bddl_with_scene_obstacle(
+    bddl_text: str,
+    obstacle: SceneObstacleSpec,
+    *,
+    region_half_extent: float = 0.01,
+) -> str:
+    """Add an optional scene obstacle to a LIBERO BDDL problem.
+
+    The inserted object is intentionally not added to ``:obj_of_interest`` so
+    task success predicates keep their original semantics.
+    """
+    if not obstacle.enabled:
+        return bddl_text
+    if obstacle.kind != "wine_bottle":
+        raise ValueError(f"Unsupported scene obstacle kind: {obstacle.kind!r}")
+    if "eval_scene_obstacle_1" in bddl_text:
+        return bddl_text
+    xy = obstacle.xy if obstacle.xy is not None else (0.0, 0.0)
+    x, y = float(xy[0]), float(xy[1])
+    half = float(region_half_extent)
+    x0, y0 = x - half, y - half
+    x1, y1 = x + half, y + half
+
+    region = (
+        "\n"
+        "      (eval_scene_obstacle_region\n"
+        "          (:target main_table)\n"
+        "          (:ranges (\n"
+        f"              ({_format_bddl_float(x0)} {_format_bddl_float(y0)} "
+        f"{_format_bddl_float(x1)} {_format_bddl_float(y1)})\n"
+        "            )\n"
+        "          )\n"
+        "      )"
+    )
+    fixture = f"\n    eval_scene_obstacle_1 - {EVAL_SCENE_WINE_BOTTLE_CATEGORY}"
+    init = "\n    (On eval_scene_obstacle_1 main_table_eval_scene_obstacle_region)"
+
+    patched = _insert_before_bddl_section_close(bddl_text, "regions", region)
+    patched = _insert_before_bddl_section_close(patched, "fixtures", fixture)
+    return _insert_before_bddl_section_close(patched, "init", init)
+
+
+def materialize_scene_obstacle_bddl(
+    task_bddl_file: Path,
+    obstacle: SceneObstacleSpec | None,
+    *,
+    output_dir: Path | None = None,
+) -> Path:
+    if obstacle is None or not obstacle.enabled:
+        return task_bddl_file
+    output_dir = output_dir or (Path(os.environ.get("TMPDIR", "/tmp")) / "safety_module_libero_scene_obstacles")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xy_suffix = "center" if obstacle.xy is None else f"{_format_bddl_float(obstacle.xy[0])}_{_format_bddl_float(obstacle.xy[1])}"
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{obstacle.kind}_{xy_suffix}")
+    output_path = output_dir / f"{task_bddl_file.stem}_{safe_suffix}.bddl"
+    patched = patch_bddl_with_scene_obstacle(task_bddl_file.read_text(), obstacle)
+    output_path.write_text(patched)
+    return output_path
+
+
+def _joint_state_widths(joint_type: int) -> tuple[int, int]:
+    # MuJoCo joint type ids used by robosuite bindings: free, ball, slide, hinge.
+    if int(joint_type) == 0:
+        return 7, 6
+    if int(joint_type) == 1:
+        return 4, 3
+    return 1, 1
+
+
+def _scene_obstacle_joint_spans(model) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    qpos_spans: list[tuple[int, int]] = []
+    qvel_spans: list[tuple[int, int]] = []
+    for joint_id in range(int(getattr(model, "njnt", 0))):
+        joint_name = model.joint_id2name(joint_id)
+        if not joint_name or "eval_scene_obstacle_" not in str(joint_name):
+            continue
+        q_width, v_width = _joint_state_widths(int(model.jnt_type[joint_id]))
+        q_start = int(model.jnt_qposadr[joint_id])
+        v_start = int(model.jnt_dofadr[joint_id])
+        qpos_spans.append((q_start, q_start + q_width))
+        qvel_spans.append((v_start, v_start + v_width))
+    return sorted(qpos_spans), sorted(qvel_spans)
+
+
+def _copy_old_state_around_spans(
+    *,
+    adapted: np.ndarray,
+    target_offset: int,
+    target_size: int,
+    old_values: np.ndarray,
+    preserved_spans: list[tuple[int, int]],
+) -> None:
+    old_offset = 0
+    cursor = 0
+    for span_start, span_end in preserved_spans:
+        if span_start < cursor or span_end > target_size:
+            raise ValueError(f"invalid or overlapping scene obstacle state span {(span_start, span_end)}")
+        segment_len = span_start - cursor
+        adapted[target_offset + cursor : target_offset + span_start] = old_values[old_offset : old_offset + segment_len]
+        old_offset += segment_len
+        cursor = span_end
+    segment_len = target_size - cursor
+    adapted[target_offset + cursor : target_offset + target_size] = old_values[old_offset : old_offset + segment_len]
+    old_offset += segment_len
+    if old_offset != old_values.size:
+        raise ValueError(
+            f"scene obstacle state copy consumed {old_offset} old values, expected {old_values.size}"
+        )
+
+
+def adapt_init_state_for_scene_obstacle(
+    init_state: np.ndarray,
+    env,
+    obstacle: SceneObstacleSpec | None,
+) -> np.ndarray:
+    """Pad an original LIBERO init state after adding free-joint obstacles.
+
+    Benchmark init states are saved for the original BDDL model. Adding one
+    free-joint scene object appends 7 qpos and 6 qvel entries, so the old flat
+    state no longer matches the patched model. We copy the original model state
+    prefix and keep the new obstacle qpos/qvel from the just-reset environment.
+    """
+    state = np.asarray(init_state)
+    if obstacle is None or not obstacle.enabled:
+        return state
+
+    if hasattr(env, "get_sim_state"):
+        current = np.asarray(env.get_sim_state(), dtype=state.dtype)
+    else:
+        current = np.asarray(env.sim.get_state().flatten(), dtype=state.dtype)
+    if state.size == current.size:
+        return state
+    if state.size > current.size:
+        raise ValueError(
+            f"scene obstacle init state adaptation expected old state <= current state, "
+            f"got old={state.size}, current={current.size}"
+        )
+
+    model = env.sim.model
+    qpos_spans, qvel_spans = _scene_obstacle_joint_spans(model)
+    if not qpos_spans or not qvel_spans:
+        raise ValueError("scene obstacle is enabled, but no eval_scene_obstacle joints were found in the model")
+
+    extra = int(current.size - state.size)
+    preserved_qpos = sum(span_end - span_start for span_start, span_end in qpos_spans)
+    preserved_qvel = sum(span_end - span_start for span_start, span_end in qvel_spans)
+    if extra != preserved_qpos + preserved_qvel:
+        raise ValueError(
+            f"scene obstacle init state size delta does not match obstacle joints: "
+            f"old={state.size}, current={current.size}, delta={extra}, "
+            f"obstacle_qpos={preserved_qpos}, obstacle_qvel={preserved_qvel}"
+        )
+
+    new_nq = int(model.nq)
+    new_nv = int(model.nv)
+    old_nq = new_nq - preserved_qpos
+    old_nv = new_nv - preserved_qvel
+    expected_old_size = 1 + old_nq + old_nv
+    if state.size != expected_old_size:
+        raise ValueError(
+            f"cannot infer scene obstacle state layout: old={state.size}, "
+            f"expected={expected_old_size}, current={current.size}"
+        )
+
+    adapted = current.copy()
+    adapted[0] = state[0]
+    old_qvel_start = 1 + old_nq
+    new_qvel_start = 1 + new_nq
+    _copy_old_state_around_spans(
+        adapted=adapted,
+        target_offset=1,
+        target_size=new_nq,
+        old_values=state[1 : 1 + old_nq],
+        preserved_spans=qpos_spans,
+    )
+    _copy_old_state_around_spans(
+        adapted=adapted,
+        target_offset=new_qvel_start,
+        target_size=new_nv,
+        old_values=state[old_qvel_start : old_qvel_start + old_nv],
+        preserved_spans=qvel_spans,
+    )
+    return adapted
 
 
 def parse_args() -> argparse.Namespace:
@@ -591,12 +899,21 @@ def create_libero_task_suite(task_suite_name: str):
     return benchmark_dict[task_suite_name]()
 
 
-def create_libero_env(task, *, resolution: int, seed: int):
+def create_libero_env(
+    task,
+    *,
+    resolution: int,
+    seed: int,
+    scene_obstacle: SceneObstacleSpec | None = None,
+):
     ensure_third_party_paths()
+    if scene_obstacle is not None and scene_obstacle.enabled:
+        register_eval_scene_obstacle_objects()
     from libero.libero import get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
 
     task_bddl_file = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    task_bddl_file = materialize_scene_obstacle_bddl(task_bddl_file, scene_obstacle)
     env = OffScreenRenderEnv(
         bddl_file_name=task_bddl_file,
         camera_heights=resolution,

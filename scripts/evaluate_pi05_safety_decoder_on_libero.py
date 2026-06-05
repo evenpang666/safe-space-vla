@@ -202,6 +202,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-server-port", type=int, default=8000, help="pi05 prefix policy websocket port.")
     parser.add_argument("--task-suite", default="libero_spatial", choices=sorted(collector.TASK_SUITE_MAX_STEPS))
     parser.add_argument("--task-id", type=int, default=0)
+    parser.add_argument(
+        "--scene-obstacle",
+        choices=["none", "wine_bottle"],
+        default="none",
+        help="Optionally insert a physical obstacle into the LIBERO scene before evaluation.",
+    )
+    parser.add_argument(
+        "--scene-obstacle-xy",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("X", "Y"),
+        help="Optional x y placement for --scene-obstacle. Defaults to the table center.",
+    )
     parser.add_argument("--num-rollouts", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -1137,6 +1151,8 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--cbf-projection-iterations must be > 0")
     if getattr(args, "cbf_alpha", 1.0) < 0.0:
         raise ValueError("--cbf-alpha must be >= 0")
+    if getattr(args, "scene_obstacle", "none") == "none" and getattr(args, "scene_obstacle_xy", None) is not None:
+        raise ValueError("--scene-obstacle-xy requires --scene-obstacle wine_bottle")
     if args.realtime_obbs:
         if args.obb_width <= 0 or args.obb_height <= 0:
             raise ValueError("--obb-width and --obb-height must be > 0")
@@ -1207,7 +1223,16 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     initial_states = task_suite.get_task_init_states(args.task_id)
     max_steps = args.max_steps if args.max_steps is not None else collector.default_max_steps(args.task_suite)
 
-    env, task_description = collector.create_libero_env(task, resolution=args.env_resolution, seed=args.seed)
+    obstacle_xy = None
+    if getattr(args, "scene_obstacle_xy", None) is not None:
+        obstacle_xy = (float(args.scene_obstacle_xy[0]), float(args.scene_obstacle_xy[1]))
+    scene_obstacle = collector.SceneObstacleSpec(kind=getattr(args, "scene_obstacle", "none"), xy=obstacle_xy)
+    env, task_description = collector.create_libero_env(
+        task,
+        resolution=args.env_resolution,
+        seed=args.seed,
+        scene_obstacle=scene_obstacle,
+    )
     pred_samples: list[np.ndarray] = []
     target_samples: list[np.ndarray] = []
     action_chunks: list[np.ndarray] = []
@@ -1235,6 +1260,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                 break
             env.reset()
             init_state = initial_states[rollout_id % len(initial_states)]
+            init_state = collector.adapt_init_state_for_scene_obstacle(init_state, env, scene_obstacle)
             obs = env.set_init_state(init_state)
             for _ in range(args.num_steps_wait):
                 obs, _reward, done, _info = env.step(dummy_action)

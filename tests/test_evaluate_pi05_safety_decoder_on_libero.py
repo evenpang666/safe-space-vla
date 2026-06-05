@@ -9,6 +9,12 @@ import pytest
 import torch
 
 import scripts.evaluate_pi05_safety_decoder_on_libero as evaluator
+from scripts.collect_pi05_libero_safety_decoder_dataset import (
+    SceneObstacleSpec,
+    adapt_init_state_for_scene_obstacle,
+    materialize_eval_scene_wine_bottle_xml,
+    patch_bddl_with_scene_obstacle,
+)
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig
 from safety_module.safety_flow_point_model import SafetyFlowPointModel
 from scripts.evaluate_pi05_safety_decoder_on_libero import (
@@ -56,6 +62,173 @@ def test_evaluate_script_help_runs_when_invoked_by_path():
     assert "--realtime-obbs" in result.stdout
     assert "--no-realtime-obbs" in result.stdout
     assert "--skeleton-source" in result.stdout
+    assert "--scene-obstacle" in result.stdout
+    assert "--scene-obstacle-xy" in result.stdout
+
+
+def test_patch_bddl_with_scene_obstacle_inserts_default_center_wine_bottle():
+    bddl = """(define (problem LIBERO_Tabletop_Manipulation)
+  (:domain robosuite)
+  (:language Pick the bowl)
+  (:regions
+    (table_center
+      (:target main_table)
+      (:ranges (
+        (-0.1 -0.01 -0.05 0.01)
+      ))
+    )
+  )
+  (:fixtures
+    main_table - table
+  )
+  (:objects
+    akita_black_bowl_1 - akita_black_bowl
+  )
+  (:obj_of_interest
+    akita_black_bowl_1
+  )
+  (:init
+    (On akita_black_bowl_1 main_table_table_center)
+  )
+  (:goal
+    (And (On akita_black_bowl_1 main_table_table_center))
+  )
+)"""
+
+    patched = patch_bddl_with_scene_obstacle(bddl, SceneObstacleSpec(kind="wine_bottle"))
+
+    assert "eval_scene_obstacle_region" in patched
+    assert "eval_scene_obstacle_1 - eval_scene_wine_bottle_obstacle" in patched
+    assert "(On eval_scene_obstacle_1 main_table_eval_scene_obstacle_region)" in patched
+    assert "(-0.01 -0.01 0.01 0.01)" in patched
+
+
+def test_materialize_eval_scene_wine_bottle_xml_scales_mesh_geoms_and_sites(tmp_path: Path):
+    source_dir = tmp_path / "wine_bottle"
+    source_dir.mkdir()
+    source = source_dir / "wine_bottle.xml"
+    source.write_text(
+        """<mujoco model="wine_bottle">
+  <asset>
+    <texture file="label.png" name="label" type="2d"/>
+    <mesh file="visual/body.msh" name="body" scale="0.5 0.5 0.5"/>
+  </asset>
+  <worldbody>
+    <body>
+      <body name="object">
+        <geom type="mesh" mesh="body" group="1"/>
+        <geom type="box" pos="0 0 0.1" size="0.01 0.02 0.03" group="0"/>
+      </body>
+      <site name="bottom_site" pos="0 0 -0.05"/>
+      <site name="top_site" pos="0 0 0.05"/>
+    </body>
+  </worldbody>
+</mujoco>"""
+    )
+
+    output = materialize_eval_scene_wine_bottle_xml(source, output_dir=tmp_path / "out", scale=2.0)
+
+    text = output.read_text()
+    assert f'file="{source_dir / "label.png"}"' in text
+    assert f'file="{source_dir / "visual/body.msh"}"' in text
+    assert 'scale="1 1 1"' in text
+    assert 'pos="0 0 0.2"' in text
+    assert 'size="0.02 0.04 0.06"' in text
+    assert 'pos="0 0 -0.1"' in text
+
+
+def test_patch_bddl_with_scene_obstacle_uses_explicit_xy():
+    bddl = """(define (problem LIBERO_Tabletop_Manipulation)
+  (:domain robosuite)
+  (:language Pick the bowl)
+  (:regions
+    (table_center
+      (:target main_table)
+      (:ranges (
+        (-0.1 -0.01 -0.05 0.01)
+      ))
+    )
+  )
+  (:fixtures
+    main_table - table
+  )
+  (:objects
+    akita_black_bowl_1 - akita_black_bowl
+  )
+  (:obj_of_interest
+    akita_black_bowl_1
+  )
+  (:init
+    (On akita_black_bowl_1 main_table_table_center)
+  )
+  (:goal
+    (And (On akita_black_bowl_1 main_table_table_center))
+  )
+)"""
+
+    patched = patch_bddl_with_scene_obstacle(
+        bddl,
+        SceneObstacleSpec(kind="wine_bottle", xy=(0.12, -0.08)),
+    )
+
+    assert "(0.11 -0.09 0.13 -0.07)" in patched
+
+
+def test_adapt_init_state_for_scene_obstacle_pads_added_free_joint_state():
+    class _FakeSim:
+        class _Model:
+            nq = 10
+            nv = 9
+            njnt = 1
+            jnt_qposadr = np.asarray([2], dtype=np.int64)
+            jnt_dofadr = np.asarray([1], dtype=np.int64)
+            jnt_type = np.asarray([0], dtype=np.int64)
+
+            def joint_id2name(self, _joint_id):
+                return "eval_scene_obstacle_1_joint0"
+
+        model = _Model()
+
+    class _FakeEnv:
+        sim = _FakeSim()
+
+        def get_sim_state(self):
+            # time + 10 qpos + 9 qvel
+            return np.asarray([9.0, *range(10), *range(100, 109)], dtype=np.float64)
+
+    original = np.asarray([1.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0], dtype=np.float64)
+
+    adapted = adapt_init_state_for_scene_obstacle(
+        original,
+        _FakeEnv(),
+        SceneObstacleSpec(kind="wine_bottle"),
+    )
+
+    np.testing.assert_allclose(
+        adapted,
+        [
+            1.0,
+            10.0,
+            11.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            12.0,
+            20.0,
+            101.0,
+            102.0,
+            103.0,
+            104.0,
+            105.0,
+            106.0,
+            21.0,
+            22.0,
+        ],
+    )
 
 
 def test_load_repo_script_module_ignores_openpi_scripts_package(monkeypatch):
