@@ -9,6 +9,7 @@ import torch
 
 from safety_module.safety_flow_point_model import SafetyFlowPointModel
 from scripts.train_pi05_safety_flow_point_model import (
+    apply_prefix_ablation,
     build_model_kwargs,
     default_loss_csv_path,
     default_loss_plot_path,
@@ -38,6 +39,7 @@ def test_train_flow_script_help_runs_when_invoked_by_path():
     assert "--num-encoder-layers" in result.stdout
     assert "--num-decoder-layers" in result.stdout
     assert "--num-heads" in result.stdout
+    assert "--prefix-ablation" in result.stdout
 
 
 def test_load_dataset_tensors_reads_flow_fields(tmp_path: Path):
@@ -95,6 +97,27 @@ def test_build_model_kwargs_uses_dataset_shapes():
     assert kwargs["num_decoder_layers"] == 2
 
 
+def test_apply_prefix_ablation_zero_returns_zero_prefix_without_mutating_input():
+    prefix = torch.randn(2, 3, 4)
+    original = prefix.clone()
+
+    ablated = apply_prefix_ablation(prefix, "zero")
+
+    assert torch.count_nonzero(ablated) == 0
+    assert ablated.shape == prefix.shape
+    assert ablated.dtype == prefix.dtype
+    assert ablated.device == prefix.device
+    torch.testing.assert_close(prefix, original)
+
+
+def test_apply_prefix_ablation_none_returns_original_tensor():
+    prefix = torch.randn(2, 3, 4)
+
+    ablated = apply_prefix_ablation(prefix, "none")
+
+    assert ablated is prefix
+
+
 def test_train_one_epoch_updates_flow_model_parameters_on_tiny_dataset():
     torch.manual_seed(0)
     prefix = torch.randn(4, 3, 5)
@@ -145,17 +168,19 @@ def test_save_checkpoint_writes_flow_model_metadata(tmp_path: Path):
     }
     model = SafetyFlowPointModel(**model_kwargs)
 
-    save_checkpoint(path, model, model_kwargs, epoch=3, loss=0.5)
+    save_checkpoint(path, model, model_kwargs, epoch=3, loss=0.5, training_metadata={"prefix_ablation": "zero"})
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     assert checkpoint["model_type"] == "SafetyFlowPointModel"
     assert checkpoint["model_kwargs"] == model_kwargs
     assert checkpoint["epoch"] == 3
     assert checkpoint["loss"] == 0.5
+    assert checkpoint["training_metadata"]["prefix_ablation"] == "zero"
 
     sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
     assert sidecar["model_type"] == "SafetyFlowPointModel"
     assert sidecar["model_kwargs"]["prefix_dim"] == 5
+    assert sidecar["training_metadata"]["prefix_ablation"] == "zero"
 
 
 def test_periodic_checkpoint_path_inserts_epoch_before_suffix():

@@ -8,12 +8,16 @@ import numpy as np
 import pytest
 import torch
 
+import scripts.collect_pi05_libero_safety_decoder_dataset as collector
 import scripts.evaluate_pi05_safety_decoder_on_libero as evaluator
 from scripts.collect_pi05_libero_safety_decoder_dataset import (
+    EVAL_SCENE_WINE_BOTTLE_CATEGORY,
     SceneObstacleSpec,
     adapt_init_state_for_scene_obstacle,
     materialize_eval_scene_wine_bottle_xml,
     patch_bddl_with_scene_obstacle,
+    register_eval_scene_obstacle_objects,
+    reset_scene_obstacle_pose,
 )
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig
 from safety_module.safety_flow_point_model import SafetyFlowPointModel
@@ -24,6 +28,7 @@ from scripts.evaluate_pi05_safety_decoder_on_libero import (
     append_prediction_video_frame,
     build_realtime_safe_space_from_env,
     compute_point_error_metrics,
+    current_point_obb_cbf_constraints,
     draw_projected_obbs,
     infer_flow_points_per_link,
     load_safe_space_for_video,
@@ -40,6 +45,19 @@ from scripts.evaluate_pi05_safety_decoder_on_libero import (
     select_safety_prediction_source,
     solve_cbf_qp_projection,
 )
+
+
+def _bddl_section_text(text: str, section_name: str) -> str:
+    start = text.index(f"(:{section_name}")
+    depth = 0
+    for idx in range(start, len(text)):
+        if text[idx] == "(":
+            depth += 1
+        elif text[idx] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    raise AssertionError(f"BDDL :{section_name} section is not balanced")
 
 
 def test_evaluate_script_help_runs_when_invoked_by_path():
@@ -97,13 +115,17 @@ def test_patch_bddl_with_scene_obstacle_inserts_default_center_wine_bottle():
 
     patched = patch_bddl_with_scene_obstacle(bddl, SceneObstacleSpec(kind="wine_bottle"))
 
+    fixtures = _bddl_section_text(patched, "fixtures")
+    objects = _bddl_section_text(patched, "objects")
+
     assert "eval_scene_obstacle_region" in patched
-    assert "eval_scene_obstacle_1 - eval_scene_wine_bottle_obstacle" in patched
+    assert "eval_scene_obstacle_1 - eval_scene_wine_bottle_obstacle" not in fixtures
+    assert "eval_scene_obstacle_1 - eval_scene_wine_bottle_obstacle" in objects
     assert "(On eval_scene_obstacle_1 main_table_eval_scene_obstacle_region)" in patched
     assert "(-0.01 -0.01 0.01 0.01)" in patched
 
 
-def test_materialize_eval_scene_wine_bottle_xml_scales_mesh_geoms_and_sites(tmp_path: Path):
+def test_materialize_eval_scene_wine_bottle_xml_scales_mesh_geoms_and_aligns_sites(tmp_path: Path):
     source_dir = tmp_path / "wine_bottle"
     source_dir.mkdir()
     source = source_dir / "wine_bottle.xml"
@@ -134,7 +156,45 @@ def test_materialize_eval_scene_wine_bottle_xml_scales_mesh_geoms_and_sites(tmp_
     assert 'scale="1 1 1"' in text
     assert 'pos="0 0 0.2"' in text
     assert 'size="0.02 0.04 0.06"' in text
-    assert 'pos="0 0 -0.1"' in text
+    assert 'pos="0 0 0.14"' in text
+    assert 'pos="0 0 0.26"' in text
+
+
+def test_registered_eval_scene_obstacle_defaults_to_damped_free_joint(monkeypatch, tmp_path: Path):
+    fake_objects_dict = {}
+    registered = {}
+
+    def fake_register_object(cls):
+        registered["cls"] = cls
+        fake_objects_dict[EVAL_SCENE_WINE_BOTTLE_CATEGORY] = cls
+
+    class FakeMujocoXMLObject:
+        def __init__(self, xml_path, *, name, joints, obj_type, duplicate_collision_geoms):
+            self.xml_path = xml_path
+            self.name = name
+            self.joints = joints
+            self.obj_type = obj_type
+            self.duplicate_collision_geoms = duplicate_collision_geoms
+
+    fake_base_object = types.ModuleType("libero.libero.envs.base_object")
+    fake_base_object.OBJECTS_DICT = fake_objects_dict
+    fake_base_object.register_object = fake_register_object
+    fake_objects = types.ModuleType("robosuite.models.objects")
+    fake_objects.MujocoXMLObject = FakeMujocoXMLObject
+
+    monkeypatch.setattr(collector, "ensure_third_party_paths", lambda: None)
+    monkeypatch.setattr(
+        collector,
+        "materialize_eval_scene_wine_bottle_xml",
+        lambda _source_xml, *, output_dir, scale: tmp_path / "eval_scene_wine_bottle_obstacle.xml",
+    )
+    monkeypatch.setitem(sys.modules, "libero.libero.envs.base_object", fake_base_object)
+    monkeypatch.setitem(sys.modules, "robosuite.models.objects", fake_objects)
+
+    register_eval_scene_obstacle_objects()
+    obstacle = registered["cls"](name="eval_scene_obstacle_1")
+
+    assert obstacle.joints == [dict(type="free", damping="0.0005")]
 
 
 def test_patch_bddl_with_scene_obstacle_uses_explicit_xy():
@@ -174,7 +234,7 @@ def test_patch_bddl_with_scene_obstacle_uses_explicit_xy():
     assert "(0.11 -0.09 0.13 -0.07)" in patched
 
 
-def test_adapt_init_state_for_scene_obstacle_pads_added_free_joint_state():
+def test_adapt_init_state_for_scene_obstacle_pads_upright_zero_velocity_free_joint_state():
     class _FakeSim:
         class _Model:
             nq = 10
@@ -210,25 +270,62 @@ def test_adapt_init_state_for_scene_obstacle_pads_added_free_joint_state():
             1.0,
             10.0,
             11.0,
-            2.0,
-            3.0,
+            0.0,
+            0.0,
             4.0,
-            5.0,
-            6.0,
-            7.0,
-            8.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
             12.0,
             20.0,
-            101.0,
-            102.0,
-            103.0,
-            104.0,
-            105.0,
-            106.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             21.0,
             22.0,
         ],
     )
+
+
+def test_reset_scene_obstacle_pose_sets_upright_pose_and_refreshes_sim():
+    class _FakeSim:
+        class _Model:
+            nq = 7
+            nv = 6
+            njnt = 1
+            jnt_qposadr = np.asarray([0], dtype=np.int64)
+            jnt_dofadr = np.asarray([0], dtype=np.int64)
+            jnt_type = np.asarray([0], dtype=np.int64)
+
+            def joint_id2name(self, _joint_id):
+                return "eval_scene_obstacle_1_joint0"
+
+        class _Data:
+            qpos = np.asarray([0.4, -0.2, 0.91, 0.707, 0.0, 0.707, 0.0], dtype=np.float64)
+            qvel = np.asarray([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float64)
+
+        model = _Model()
+        data = _Data()
+        forwarded = False
+
+        def forward(self):
+            self.forwarded = True
+
+    class _FakeEnv:
+        sim = _FakeSim()
+
+    reset_scene_obstacle_pose(
+        _FakeEnv(),
+        SceneObstacleSpec(kind="wine_bottle", xy=(0.12, -0.08)),
+    )
+
+    np.testing.assert_allclose(_FakeEnv.sim.data.qpos, [0.12, -0.08, 0.91, 1.0, 0.0, 0.0, 0.0])
+    np.testing.assert_allclose(_FakeEnv.sim.data.qvel, np.zeros(6))
+    assert _FakeEnv.sim.forwarded
 
 
 def test_load_repo_script_module_ignores_openpi_scripts_package(monkeypatch):
@@ -299,6 +396,57 @@ def test_point_flow_obb_cbf_constraints_selects_future_obb_intrusion():
     assert constraint.obb_id == 0
     np.testing.assert_allclose(constraint.normal, [1.0, 0.0, 0.0])
     assert constraint.h == pytest.approx(0.7)
+
+
+def test_current_point_obb_cbf_constraints_selects_current_near_obstacle_points():
+    current = np.asarray(
+        [
+            [[0.53, 0.0, 0.0], [1.2, 0.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32),
+    }
+
+    constraints = current_point_obb_cbf_constraints(
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.05,
+        max_constraints=8,
+    )
+
+    assert len(constraints) == 1
+    constraint = constraints[0]
+    assert constraint.link_id == 0
+    assert constraint.point_id == 0
+    assert constraint.time_index == 0
+    np.testing.assert_allclose(constraint.normal, [1.0, 0.0, 0.0])
+    np.testing.assert_allclose(constraint.current_point, [0.53, 0.0, 0.0])
+    np.testing.assert_allclose(constraint.predicted_point, constraint.current_point)
+    assert constraint.h == pytest.approx(0.03)
+
+
+def test_current_point_obb_cbf_constraints_does_not_double_count_collision_margin():
+    current = np.asarray([[[0.535, 0.0, 0.0]]], dtype=np.float32)
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32),
+    }
+
+    constraints = current_point_obb_cbf_constraints(
+        current,
+        safe_space,
+        collision_margin=0.01,
+        trigger_margin=0.02,
+        max_constraints=8,
+    )
+
+    assert constraints == []
 
 
 def test_solve_cbf_qp_projection_removes_inward_component_and_keeps_tangent():

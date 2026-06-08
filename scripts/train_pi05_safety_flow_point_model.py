@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cpu", help="Use cpu by default; set cuda only with a compatible PyTorch build.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--prefix-ablation",
+        choices=["none", "zero"],
+        default="none",
+        help="Ablation for VLA prefix conditioning. 'zero' trains with zeroed prefix tokens.",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +142,14 @@ def build_model_kwargs(
     }
 
 
+def apply_prefix_ablation(prefix_tokens: torch.Tensor, prefix_ablation: str) -> torch.Tensor:
+    if prefix_ablation == "none":
+        return prefix_tokens
+    if prefix_ablation == "zero":
+        return torch.zeros_like(prefix_tokens)
+    raise ValueError(f"Unsupported prefix ablation: {prefix_ablation}")
+
+
 def train_one_epoch(
     model: SafetyFlowPointModel,
     optimizer: torch.optim.Optimizer,
@@ -146,6 +160,7 @@ def train_one_epoch(
     batch_size: int,
     device: torch.device,
     grad_clip_norm: float | None = None,
+    prefix_ablation: str = "none",
 ) -> float:
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -158,7 +173,7 @@ def train_one_epoch(
 
     for start in range(0, num_samples, batch_size):
         batch_idx = order[start : start + batch_size]
-        batch_prefix = prefix_tokens[batch_idx].to(device=device)
+        batch_prefix = apply_prefix_ablation(prefix_tokens[batch_idx].to(device=device), prefix_ablation)
         batch_arm_points = arm_points[batch_idx].to(device=device)
         batch_offsets = target_point_offsets[batch_idx].to(device=device)
         x_s, s, x_0, _v_target = sample_flow_matching_batch(batch_offsets)
@@ -187,6 +202,7 @@ def save_checkpoint(
     model_kwargs: dict,
     epoch: int,
     loss: float,
+    training_metadata: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -195,6 +211,7 @@ def save_checkpoint(
         "model_kwargs": model_kwargs,
         "epoch": int(epoch),
         "loss": float(loss),
+        "training_metadata": dict(training_metadata or {}),
     }
     torch.save(payload, path)
     path.with_suffix(".json").write_text(
@@ -204,6 +221,7 @@ def save_checkpoint(
                 "model_kwargs": model_kwargs,
                 "epoch": int(epoch),
                 "loss": float(loss),
+                "training_metadata": payload["training_metadata"],
             },
             indent=2,
             sort_keys=True,
@@ -294,6 +312,7 @@ def main() -> None:
     )
     model = SafetyFlowPointModel(**model_kwargs).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    training_metadata = {"prefix_ablation": str(args.prefix_ablation)}
 
     loss = float("nan")
     loss_history: list[tuple[int, float]] = []
@@ -309,6 +328,7 @@ def main() -> None:
             batch_size=args.batch_size,
             device=device,
             grad_clip_norm=args.grad_clip_norm,
+            prefix_ablation=args.prefix_ablation,
         )
         print(f"epoch={epoch} loss={loss:.6f}")
         loss_history.append((epoch, loss))
@@ -319,10 +339,24 @@ def main() -> None:
         )
         if should_save_periodic_checkpoint(epoch=epoch, checkpoint_every=args.checkpoint_every):
             checkpoint_path = periodic_checkpoint_path(args.output, epoch=epoch)
-            save_checkpoint(checkpoint_path, model, model_kwargs, epoch=epoch, loss=loss)
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                model_kwargs,
+                epoch=epoch,
+                loss=loss,
+                training_metadata=training_metadata,
+            )
             print(f"saved periodic checkpoint to {checkpoint_path}")
 
-    save_checkpoint(args.output, model, model_kwargs, epoch=args.epochs, loss=loss)
+    save_checkpoint(
+        args.output,
+        model,
+        model_kwargs,
+        epoch=args.epochs,
+        loss=loss,
+        training_metadata=training_metadata,
+    )
     print(f"saved checkpoint to {args.output}")
     print(f"saved loss history to {loss_csv}")
     if args.plot_every > 0:

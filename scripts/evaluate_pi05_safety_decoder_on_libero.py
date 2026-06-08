@@ -173,6 +173,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cbf-finite-difference-eps", type=float, default=1e-4)
     parser.add_argument("--cbf-projection-iterations", type=int, default=12)
     parser.add_argument(
+        "--cbf-trigger-source",
+        choices=["predicted_point_flow", "current_pointcloud"],
+        default="predicted_point_flow",
+        help="Active-set source for CBF-QP constraints.",
+    )
+    parser.add_argument(
         "--cbf-action-lower",
         nargs="*",
         type=float,
@@ -687,6 +693,61 @@ def point_flow_obb_cbf_constraints(
     return sorted(constraints, key=lambda item: (item.h, item.time_index))[: int(max_constraints)]
 
 
+def current_point_obb_cbf_constraints(
+    current_link_points: np.ndarray,
+    safe_space: dict[str, np.ndarray] | None,
+    *,
+    collision_margin: float = 0.0,
+    trigger_margin: float = 0.02,
+    max_constraints: int = 32,
+) -> list[PointFlowCbfConstraint]:
+    """Select CBF constraints from current robot-surface points near OBBs."""
+    if safe_space is None or max_constraints <= 0:
+        return []
+    current = np.asarray(current_link_points, dtype=np.float32)
+    if current.ndim != 3 or current.shape[-1] != 3:
+        raise ValueError(f"current_link_points must have shape (L, P, 3), got {current.shape}")
+
+    centers, axes, half_sizes = safe_space_obb_arrays(safe_space)
+    if len(centers) == 0:
+        return []
+
+    constraints: list[PointFlowCbfConstraint] = []
+    cbf_margin = max(float(collision_margin), 0.0)
+    trigger = max(float(trigger_margin), 0.0)
+    for obb_id, (center, box_axes, box_half_sizes) in enumerate(zip(centers, axes, half_sizes)):
+        local = (current - center) @ box_axes
+        cbf_half_sizes = box_half_sizes + cbf_margin
+        ratios = np.abs(local) / np.maximum(cbf_half_sizes, 1e-6)
+        face_axes = np.argmax(ratios, axis=-1)
+        for link_id in range(current.shape[0]):
+            for point_id in range(current.shape[1]):
+                face_axis = int(face_axes[link_id, point_id])
+                local_value = float(local[link_id, point_id, face_axis])
+                sign = 1.0 if local_value >= 0.0 else -1.0
+                h = sign * local_value - float(cbf_half_sizes[face_axis])
+                if h > trigger:
+                    continue
+                normal = sign * np.asarray(box_axes[:, face_axis], dtype=np.float32)
+                current_point = np.asarray(current[link_id, point_id], dtype=np.float32)
+                constraints.append(
+                    PointFlowCbfConstraint(
+                        time_index=0,
+                        link_id=int(link_id),
+                        point_id=int(point_id),
+                        obb_id=int(obb_id),
+                        face_axis=face_axis,
+                        normal=normal.astype(np.float32, copy=False),
+                        h=float(h),
+                        current_point=current_point,
+                        predicted_point=current_point,
+                    )
+                )
+                if len(constraints) >= int(max_constraints):
+                    return sorted(constraints, key=lambda item: item.h)
+    return sorted(constraints, key=lambda item: item.h)[: int(max_constraints)]
+
+
 def solve_cbf_qp_projection(
     nominal_action: np.ndarray,
     a_matrix: np.ndarray,
@@ -808,24 +869,37 @@ def filter_action_with_pointflow_cbf_qp(
     action_lower: list[float] | tuple[float, ...] | np.ndarray | None,
     action_upper: list[float] | tuple[float, ...] | np.ndarray | None,
     fallback: str,
+    trigger_source: str = "predicted_point_flow",
 ) -> tuple[np.ndarray, dict[str, object]]:
     nominal = np.asarray(nominal_action, dtype=np.float64).reshape(-1)
     arm_dim = int(len(qpos_indices))
     if nominal.size < arm_dim:
         raise ValueError(f"nominal action needs at least {arm_dim} arm values, got {nominal.size}")
-    constraints = point_flow_obb_cbf_constraints(
-        pred_link_points,
-        current_link_points,
-        safe_space,
-        collision_margin=collision_margin,
-        trigger_margin=trigger_margin,
-        max_constraints=max_constraints,
-    )
+    if trigger_source == "predicted_point_flow":
+        constraints = point_flow_obb_cbf_constraints(
+            pred_link_points,
+            current_link_points,
+            safe_space,
+            collision_margin=collision_margin,
+            trigger_margin=trigger_margin,
+            max_constraints=max_constraints,
+        )
+    elif trigger_source == "current_pointcloud":
+        constraints = current_point_obb_cbf_constraints(
+            current_link_points,
+            safe_space,
+            collision_margin=collision_margin,
+            trigger_margin=trigger_margin,
+            max_constraints=max_constraints,
+        )
+    else:
+        raise ValueError(f"Unsupported CBF trigger source: {trigger_source}")
     info: dict[str, object] = {
         "triggered": bool(constraints),
         "constraint_count": int(len(constraints)),
         "success": True,
         "max_violation": 0.0,
+        "trigger_source": trigger_source,
     }
     if not constraints:
         return nominal.astype(np.float64, copy=False), info
@@ -1262,10 +1336,16 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
             init_state = initial_states[rollout_id % len(initial_states)]
             init_state = collector.adapt_init_state_for_scene_obstacle(init_state, env, scene_obstacle)
             obs = env.set_init_state(init_state)
+            refreshed_obs = collector.reset_scene_obstacle_pose(env, scene_obstacle, refresh_observation=True)
+            if refreshed_obs is not None:
+                obs = refreshed_obs
             for _ in range(args.num_steps_wait):
                 obs, _reward, done, _info = env.step(dummy_action)
                 if done:
                     break
+            refreshed_obs = collector.reset_scene_obstacle_pose(env, scene_obstacle, refresh_observation=True)
+            if refreshed_obs is not None:
+                obs = refreshed_obs
 
             step_id = 0
             done = False
@@ -1449,6 +1529,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                         action_lower=getattr(args, "cbf_action_lower", None),
                         action_upper=getattr(args, "cbf_action_upper", None),
                         fallback=getattr(args, "cbf_fallback", "zero"),
+                        trigger_source=getattr(args, "cbf_trigger_source", "predicted_point_flow"),
                     )
                     if bool(cbf_info.get("triggered", False)):
                         print(

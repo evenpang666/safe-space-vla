@@ -52,6 +52,7 @@ TASK_SUITE_MAX_STEPS = {
 
 EVAL_SCENE_WINE_BOTTLE_CATEGORY = "eval_scene_wine_bottle_obstacle"
 EVAL_SCENE_WINE_BOTTLE_SCALE = 1.8
+EVAL_SCENE_OBSTACLE_FREE_JOINT = dict(type="free", damping="0.0005")
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,64 @@ def _scaled_xml_vector(raw: str | None, scale: float) -> str | None:
     return _format_xml_floats(values)
 
 
+def _parse_xml_floats(raw: str | None, *, default: tuple[float, ...]) -> np.ndarray:
+    if raw is None:
+        return np.asarray(default, dtype=np.float64)
+    return np.asarray([float(item) for item in raw.split()], dtype=np.float64)
+
+
+def _mujoco_quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float64)
+    norm = float(np.linalg.norm(quat))
+    if norm <= 0.0:
+        return np.eye(3, dtype=np.float64)
+    w, x, y, z = quat / norm
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _collision_box_bounds(root: ET.Element) -> tuple[np.ndarray, np.ndarray] | None:
+    mins: list[np.ndarray] = []
+    maxs: list[np.ndarray] = []
+    for geom in root.findall(".//geom"):
+        if geom.get("type", "sphere") != "box":
+            continue
+        if geom.get("group") == "1":
+            continue
+        pos = _parse_xml_floats(geom.get("pos"), default=(0.0, 0.0, 0.0))
+        size = _parse_xml_floats(geom.get("size"), default=(0.0, 0.0, 0.0))
+        quat = _parse_xml_floats(geom.get("quat"), default=(1.0, 0.0, 0.0, 0.0))
+        if pos.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
+            continue
+        extent = np.abs(_mujoco_quat_to_matrix(quat)) @ size
+        mins.append(pos - extent)
+        maxs.append(pos + extent)
+    if not mins:
+        return None
+    return np.min(np.stack(mins, axis=0), axis=0), np.max(np.stack(maxs, axis=0), axis=0)
+
+
+def _align_object_sites_to_collision_bounds(root: ET.Element) -> None:
+    bounds = _collision_box_bounds(root)
+    if bounds is None:
+        return
+    lower, upper = bounds
+    radius = max(abs(float(lower[0])), abs(float(upper[0])), abs(float(lower[1])), abs(float(upper[1])))
+    sites = {site.get("name"): site for site in root.findall(".//site")}
+    if "bottom_site" in sites:
+        sites["bottom_site"].set("pos", _format_xml_floats([0.0, 0.0, float(lower[2])]))
+    if "top_site" in sites:
+        sites["top_site"].set("pos", _format_xml_floats([0.0, 0.0, float(upper[2])]))
+    if "horizontal_radius_site" in sites:
+        sites["horizontal_radius_site"].set("pos", _format_xml_floats([radius, radius, 0.0]))
+
+
 def materialize_eval_scene_wine_bottle_xml(
     source_xml: Path,
     *,
@@ -104,6 +163,8 @@ def materialize_eval_scene_wine_bottle_xml(
             scaled = _scaled_xml_vector(element.get(attr_name), scale)
             if scaled is not None:
                 element.set(attr_name, scaled)
+
+    _align_object_sites_to_collision_bounds(root)
 
     tree.write(output_xml, encoding="unicode")
     return output_xml
@@ -134,6 +195,8 @@ def register_eval_scene_obstacle_objects(*, scale: float = EVAL_SCENE_WINE_BOTTL
 
     class EvalSceneWineBottleObstacle(MujocoXMLObject):
         def __init__(self, name=EVAL_SCENE_WINE_BOTTLE_CATEGORY, joints=None):
+            if joints is None:
+                joints = [dict(EVAL_SCENE_OBSTACLE_FREE_JOINT)]
             super().__init__(
                 str(output_xml),
                 name=name,
@@ -206,11 +269,11 @@ def patch_bddl_with_scene_obstacle(
         "          )\n"
         "      )"
     )
-    fixture = f"\n    eval_scene_obstacle_1 - {EVAL_SCENE_WINE_BOTTLE_CATEGORY}"
+    object_decl = f"\n    eval_scene_obstacle_1 - {EVAL_SCENE_WINE_BOTTLE_CATEGORY}"
     init = "\n    (On eval_scene_obstacle_1 main_table_eval_scene_obstacle_region)"
 
     patched = _insert_before_bddl_section_close(bddl_text, "regions", region)
-    patched = _insert_before_bddl_section_close(patched, "fixtures", fixture)
+    patched = _insert_before_bddl_section_close(patched, "objects", object_decl)
     return _insert_before_bddl_section_close(patched, "init", init)
 
 
@@ -254,6 +317,74 @@ def _scene_obstacle_joint_spans(model) -> tuple[list[tuple[int, int]], list[tupl
         qpos_spans.append((q_start, q_start + q_width))
         qvel_spans.append((v_start, v_start + v_width))
     return sorted(qpos_spans), sorted(qvel_spans)
+
+
+def _scene_obstacle_xy(obstacle: SceneObstacleSpec | None) -> tuple[float, float]:
+    if obstacle is None or obstacle.xy is None:
+        return 0.0, 0.0
+    return float(obstacle.xy[0]), float(obstacle.xy[1])
+
+
+def _set_scene_obstacle_upright_pose(
+    *,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    qpos_spans: list[tuple[int, int]],
+    qvel_spans: list[tuple[int, int]],
+    obstacle: SceneObstacleSpec | None,
+) -> None:
+    x, y = _scene_obstacle_xy(obstacle)
+    for q_start, q_end in qpos_spans:
+        if q_end - q_start != 7:
+            continue
+        qpos[q_start : q_start + 2] = [x, y]
+        qpos[q_start + 3 : q_start + 7] = [1.0, 0.0, 0.0, 0.0]
+    for v_start, v_end in qvel_spans:
+        qvel[v_start:v_end] = 0.0
+
+
+def _observation_from_current_sim_state(env):
+    if hasattr(env, "regenerate_obs_from_state") and hasattr(env.sim, "get_state"):
+        return env.regenerate_obs_from_state(env.sim.get_state().flatten())
+    if hasattr(env, "_get_observations"):
+        return env._get_observations()
+    inner_env = getattr(env, "env", None)
+    if inner_env is not None and hasattr(inner_env, "_get_observations"):
+        return inner_env._get_observations()
+    return None
+
+
+def reset_scene_obstacle_pose(
+    env,
+    obstacle: SceneObstacleSpec | None,
+    *,
+    refresh_observation: bool = False,
+):
+    """Reset added scene obstacles to an upright free-joint pose in-place.
+
+    This is intentionally applied after loading benchmark init states because
+    the original states do not contain the extra obstacle joint, and reset-time
+    settling can leave a tall free object tilted before policy execution starts.
+    """
+    if obstacle is None or not obstacle.enabled:
+        return None
+
+    model = env.sim.model
+    qpos_spans, qvel_spans = _scene_obstacle_joint_spans(model)
+    if not qpos_spans or not qvel_spans:
+        raise ValueError("scene obstacle is enabled, but no eval_scene_obstacle joints were found in the model")
+
+    _set_scene_obstacle_upright_pose(
+        qpos=np.asarray(env.sim.data.qpos),
+        qvel=np.asarray(env.sim.data.qvel),
+        qpos_spans=qpos_spans,
+        qvel_spans=qvel_spans,
+        obstacle=obstacle,
+    )
+    env.sim.forward()
+    if refresh_observation:
+        return _observation_from_current_sim_state(env)
+    return None
 
 
 def _copy_old_state_around_spans(
@@ -353,6 +484,13 @@ def adapt_init_state_for_scene_obstacle(
         target_size=new_nv,
         old_values=state[old_qvel_start : old_qvel_start + old_nv],
         preserved_spans=qvel_spans,
+    )
+    _set_scene_obstacle_upright_pose(
+        qpos=adapted[1 : 1 + new_nq],
+        qvel=adapted[new_qvel_start : new_qvel_start + new_nv],
+        qpos_spans=qpos_spans,
+        qvel_spans=qvel_spans,
+        obstacle=obstacle,
     )
     return adapted
 
@@ -1047,11 +1185,18 @@ def main() -> None:
                     break
                 env.reset()
                 init_state = initial_states[rollout_id % len(initial_states)]
+                init_state = adapt_init_state_for_scene_obstacle(init_state, env, scene_obstacle)
                 obs = env.set_init_state(init_state)
+                refreshed_obs = reset_scene_obstacle_pose(env, scene_obstacle, refresh_observation=True)
+                if refreshed_obs is not None:
+                    obs = refreshed_obs
                 for _ in range(args.num_steps_wait):
                     obs, _reward, done, _info = env.step(dummy_action)
                     if done:
                         break
+                refreshed_obs = reset_scene_obstacle_pose(env, scene_obstacle, refresh_observation=True)
+                if refreshed_obs is not None:
+                    obs = refreshed_obs
 
                 step_id = 0
                 done = False

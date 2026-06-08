@@ -306,6 +306,24 @@ python scripts/train_pi05_safety_flow_point_model.py \
   --device cpu
 ```
 
+训练“去掉 prefix 条件”的 ablation 时，保持同一份数据和模型结构，只在训练批次中把 `prefix_tokens` 置零，并在 checkpoint metadata 中记录 `prefix_ablation=zero`：
+
+```bash
+python scripts/train_pi05_safety_flow_point_model.py \
+  --dataset outputs/pi05_safety_decoder/pi05_libero_spatial_all_tasks_decoder_dataset.npz \
+  --output outputs/pi05_safety_decoder/pi05_libero_spatial_all_tasks_safety_flow_point_model_no_prefix.pt \
+  --hidden-dim 256 \
+  --num-encoder-layers 4 \
+  --num-decoder-layers 4 \
+  --num-heads 8 \
+  --ffn-dim 1024 \
+  --epochs 100 \
+  --batch-size 2 \
+  --lr 1e-4 \
+  --prefix-ablation zero \
+  --device cpu
+```
+
 在线验证 `SafetyFlowPointModel` 时分两个窗口运行。窗口 1 在 `safety` 环境启动完整 PI05 policy + prefix token server：
 
 ```bash
@@ -344,6 +362,27 @@ python scripts/evaluate_pi05_safety_decoder_on_libero.py \
   --collision-margin 0.0 \
   --output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.npz \
   --video-output outputs/pi05_safety_decoder/pi05_libero_task0_flow_online_eval.mp4 \
+  --mujoco-gl egl
+```
+
+运行“无预测 point-flow、仅当前机械臂点云触发 CBF-QP”的 eval ablation 时，复用同一验证脚本，打开 CBF-QP 并把 active-set 来源切到当前点云：
+
+```bash
+python scripts/evaluate_pi05_safety_decoder_on_libero.py \
+  --policy-server-host 127.0.0.1 \
+  --policy-server-port 8000 \
+  --task-suite libero_spatial \
+  --task-id 0 \
+  --num-rollouts 1 \
+  --max-samples 16 \
+  --replan-steps 5 \
+  --points-per-link 128 \
+  --prediction-steps 10 \
+  --realtime-obbs \
+  --enable-cbf-qp \
+  --cbf-trigger-source current_pointcloud \
+  --output outputs/pi05_safety_decoder/pi05_libero_task0_current_pointcloud_cbf_eval.npz \
+  --video-output outputs/pi05_safety_decoder/pi05_libero_task0_current_pointcloud_cbf_eval.mp4 \
   --mujoco-gl egl
 ```
 
