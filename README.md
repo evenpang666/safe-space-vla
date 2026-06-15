@@ -302,7 +302,7 @@ python scripts/evaluate_pi05_safety_decoder_on_libero.py   \
 
 CBF-QP 默认使用 `--cbf-action-space auto`：当 LIBERO 环境 `action_dim == 4` 或 `action_dim == 7` 时，脚本按 OSC_POSITION 语义处理 PI05 动作，直接在可执行的笛卡尔 `xyz` action 空间做 QP，点云对 action 的 Jacobian 由“扰动 `xyz` -> 临时 `env.step` -> 重建下一帧机械臂点云”的有限差分估计，并保留原 orientation / gripper；其他环境默认沿用 joint-delta CBF。可用 `--cbf-action-space joint_delta` 强制使用关节增量模式，或用 `--cbf-action-space cartesian_delta` 选择上一版“笛卡尔动作先通过末端 Jacobian / pseudo-inverse 转 nominal 关节增量，再映射回 `xyz`”的模式。通常不建议在 LIBERO OSC_POSITION 实验里强制 `cartesian_delta`，因为它会把可执行的 `xyz` 动作绕到关节空间再映射回来，切向动作更容易被多约束投影改变。
 
-当前默认 CBF-QP 的 active set 只来自预测未来点云：如果预测未来第 `k` 帧点云进入 OBB，脚本会修正 active action chunk 中 `current_offset + k` 对应的 action，其中未来第 `0` 帧会映射到当前 action。修正后的 chunk 会缓存到对应 action 真正执行时使用；这避免了“未来帧碰撞却总是修改当前 action”的错位。默认不会额外检查当前帧机械臂点云；若需要把当前帧点云约束也混入预测 point-flow CBF，可加 `--cbf-include-current-points`。若需要复现实验中的旧行为，可显式使用 `--cbf-correction-target current_action`。
+当前默认 CBF-QP 的 active set 只来自预测未来点云，且 `--cbf-correction-target` 默认为 `current_action`：如果预测未来任意第 `k` 帧点云进入 OBB，脚本会把这些 future-point 约束都投影到当前即将执行的 action 上。默认不会额外检查当前帧机械臂点云；若需要把当前帧点云约束也混入预测 point-flow CBF，可加 `--cbf-include-current-points`。若希望按预测时间对齐修正 action，可显式使用 `--cbf-correction-target predicted_frame_action`：此时预测未来第 `k` 帧触发的约束会修正 active action chunk 中 `current_offset + k` 对应的 action，其中未来第 `0` 帧会映射到当前 action；修正后的 chunk 会缓存到对应 action 真正执行时使用。
 
 CBF-QP 当前实现的数学形式如下。对第 $j$ 个 OBB，设中心为 $c_j$，世界系轴为 $R_j[:, a]$，半边长为 $d_j$，碰撞 margin 为 $m$，则使用膨胀半边长 $\bar d_j=d_j+m$。对一个被预测点云触发的机械臂表面点 $p_i$，先用当前帧点 $p_i^0$ 选择最近需要远离的 OBB face：
 
@@ -324,25 +324,25 @@ h_i^{(k)} = n_i^\top (p_i^k - c_j) - \bar d_j[a^\star],
 \tilde h_i = \min(h_i, h_i^{(k)}).
 $$
 
-这样当未来预测点已经进入 OBB 时，QP 会看到 $\tilde h_i < 0$，而不是只看到当前点仍在 OBB 外侧。若显式加 `--cbf-include-current-points`，当前帧点云触发的约束直接使用 $h_i$。设 QP 变量为 $u$，它可以是关节增量、可执行 Cartesian `xyz` 动作，或旧版 Cartesian-to-joint 变量；点云对该变量的一步 Jacobian 为 $J_i = \partial p_i^+ / \partial u$。脚本使用一阶线性化的离散 CBF 约束：
+这样当未来预测点已经进入 OBB 时，QP 会看到 $\tilde h_i < 0$，而不是只看到当前点仍在 OBB 外侧。若显式加 `--cbf-include-current-points`，当前帧点云触发的约束直接使用 $h_i$。设 QP 变量为 $u_r$，它可以是关节增量、可执行 Cartesian `xyz` 动作，或旧版 Cartesian-to-joint 变量；点云对该变量的一步 Jacobian 为 $J_i = \partial p_i^+ / \partial u_r$。在默认 `current_action` 下，对所有预测时间 `k` 触发的约束都有 $r=t$，即都修正当前 action；在 `predicted_frame_action` 下，约束按 $r=t+k$ 分组，各自修正对应 action chunk 行。脚本对每个被修正的 action 使用一阶线性化的离散 CBF 约束：
 
 $$
 \begin{aligned}
-\tilde h_i(p_i^+) &\approx \tilde h_i + n_i^\top J_i u, \\
-\tilde h_i + n_i^\top J_i u &\ge (1 - \alpha) \tilde h_i, \\
-n_i^\top J_i u &\ge -\alpha \tilde h_i.
+\tilde h_i(p_i^+) &\approx \tilde h_i + n_i^\top J_i u_r, \\
+\tilde h_i + n_i^\top J_i u_r &\ge (1 - \alpha) \tilde h_i, \\
+n_i^\top J_i u_r &\ge -\alpha \tilde h_i.
 \end{aligned}
 $$
 
-因此每个 active point 生成一行 $A_i = n_i^\top J_i$、$b_i = -\alpha \tilde h_i$。最终求解的是保持 nominal action 尽量不变的投影问题：
+因此每个 active point 生成一行 $A_i = n_i^\top J_i$、$b_i = -\alpha \tilde h_i$。最终对当前被修正的 action 求解保持 nominal action 尽量不变的投影问题：
 
 $$
 \begin{aligned}
-u_{\mathrm{safe}}
-&= \arg\min_u \frac{1}{2}\lVert u - u_{\mathrm{nom}}\rVert_2^2 \\
+u_{r,\mathrm{safe}}
+&= \arg\min_{u_r} \frac{1}{2}\lVert u_r - u_{r,\mathrm{nom}}\rVert_2^2 \\
 \text{s.t.}\quad
-A u &\ge b, \\
-u_{\mathrm{lower}} &\le u \le u_{\mathrm{upper}}.
+A u_r &\ge b, \\
+u_{\mathrm{lower}} &\le u_r \le u_{\mathrm{upper}}.
 \end{aligned}
 $$
 
@@ -350,7 +350,7 @@ $$
 
 运行“无预测 point-flow、仅当前机械臂点云触发 CBF-QP”的 eval ablation 时，复用同一验证脚本，打开 CBF-QP 并把 active-set 来源切到当前点云 `--cbf-trigger-source current_pointcloud`.
 
-默认验证会在每个采样时间步用当前 LIBERO RGB-D 状态实时重建障碍物 OBB，并用同一组 OBB 绘制视频方框和判断未来 point flow 是否进入 OBB。实时 OBB 默认通过 MuJoCo segmentation 只保留名称匹配 `eval_scene_obstacle` / `wine_bottle` / `winebottle` 的 geom/body 像素，因此当前只会给插入的 wine bottle 建 OBB；若要恢复旧的整张桌面障碍物建模，可使用 `--obb-target-geom-name-patterns all`。实时 OBB 默认使用 `--obb-component-connectivity 6`，只把共享面的体素连成同一障碍物，比旧的 26 邻接更不容易把相邻障碍物混成一个大 OBB；需要更细的建模时可同时减小 `--obb-stride`、`--obb-component-voxel-size` 和 `--obb-box-margin`。若需要复用预生成的静态 OBB 文件，可改用 `--no-realtime-obbs --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz`。
+默认验证会在每个采样时间步用当前 LIBERO RGB-D 状态实时重建障碍物 OBB，并用同一组 OBB 绘制视频方框和判断未来 point flow 是否进入 OBB。实时 OBB 默认通过 MuJoCo segmentation 只保留名称匹配 `eval_scene_obstacle` / `wine_bottle` / `winebottle` 的 geom/body 像素，因此当前只会给插入的 wine bottle 建 OBB；若要恢复旧的整张桌面障碍物建模，可使用 `--obb-target-geom-name-patterns all`。在 `all` 模式下，实时 OBB 不再做目标 geom 过滤，只排除 robot mask；桌面高度 / workspace 来自非机器人场景点云，桌面上方障碍物点也来自同一批非机器人场景点云，然后再通过体素连通聚类分割成 OBB。实时 OBB 默认使用 `--obb-component-connectivity 6`，只把共享面的体素连成同一障碍物，比旧的 26 邻接更不容易把相邻障碍物混成一个大 OBB；需要更细的建模时可同时减小 `--obb-stride`、`--obb-component-voxel-size` 和 `--obb-box-margin`。若需要复用预生成的静态 OBB 文件，可改用 `--no-realtime-obbs --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz`。
 
 当 websocket server 通过 `--safety-checkpoint` 启动时，验证脚本会根据 server metadata 自动使用远端 safety module 预测未来 point flow；验证环境不再需要选择 `cpu` / `cuda`。如果 server 没有加载 safety module，验证脚本会回退到本地 `--checkpoint`，并用 `--device auto` 自动选择设备。
 
