@@ -111,6 +111,16 @@ def parse_args() -> argparse.Namespace:
         help="Voxel size used only for connected-component grouping in tabletop_boxes mode.",
     )
     parser.add_argument(
+        "--component-connectivity",
+        type=int,
+        choices=[6, 18, 26],
+        default=6,
+        help=(
+            "3D voxel connectivity used for tabletop component grouping. "
+            "Use 6 for tighter obstacle separation; 26 preserves legacy corner-connected grouping."
+        ),
+    )
+    parser.add_argument(
         "--min-component-points",
         type=int,
         default=40,
@@ -379,23 +389,31 @@ def voxel_centers(indices: np.ndarray, bounds: np.ndarray, voxel_size: float) ->
     return origin + (indices.astype(np.float32) + 0.5) * voxel_size
 
 
-def neighbor_offsets_3d() -> list[tuple[int, int, int]]:
-    return [
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-        if not (dx == 0 and dy == 0 and dz == 0)
-    ]
+def neighbor_offsets_3d(connectivity: int = 26) -> list[tuple[int, int, int]]:
+    if int(connectivity) not in (6, 18, 26):
+        raise ValueError("connectivity must be one of 6, 18, or 26")
+    offsets = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                manhattan = abs(dx) + abs(dy) + abs(dz)
+                if connectivity == 6 and manhattan != 1:
+                    continue
+                if connectivity == 18 and manhattan > 2:
+                    continue
+                offsets.append((dx, dy, dz))
+    return offsets
 
 
-def connected_components_from_indices(indices: np.ndarray) -> list[np.ndarray]:
+def connected_components_from_indices(indices: np.ndarray, *, connectivity: int = 26) -> list[np.ndarray]:
     if len(indices) == 0:
         return []
 
     active = {tuple(int(v) for v in index) for index in indices}
     visited: set[tuple[int, int, int]] = set()
-    offsets = neighbor_offsets_3d()
+    offsets = neighbor_offsets_3d(connectivity)
     components = []
 
     for start in active:
@@ -597,9 +615,12 @@ def component_boxes_from_tabletop_points(
     box_margin: float,
     box_shape: str,
     box_orientation: str,
+    component_connectivity: int = 6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if component_voxel_size <= 0.0:
         raise ValueError("--component-voxel-size must be positive")
+    if int(component_connectivity) not in (6, 18, 26):
+        raise ValueError("--component-connectivity must be one of 6, 18, or 26")
 
     mins = np.array([bounds[0], bounds[2], table_z], dtype=np.float32)
     maxs = np.array([bounds[1], bounds[3], bounds[5]], dtype=np.float32)
@@ -622,7 +643,7 @@ def component_boxes_from_tabletop_points(
     voxel_indices = np.floor((points - mins) / component_voxel_size).astype(np.int64)
     voxel_indices = np.clip(voxel_indices, 0, dims - 1)
     unique_indices = np.unique(voxel_indices, axis=0)
-    components = connected_components_from_indices(unique_indices)
+    components = connected_components_from_indices(unique_indices, connectivity=int(component_connectivity))
 
     voxel_to_component = {}
     for component_id, component in enumerate(components):
@@ -1099,6 +1120,7 @@ def main() -> None:
             bounds=bounds,
             table_z=table_z,
             component_voxel_size=args.component_voxel_size,
+            component_connectivity=args.component_connectivity,
             min_component_points=args.min_component_points,
             box_margin=args.box_margin,
             box_shape=args.box_shape,
@@ -1133,6 +1155,7 @@ def main() -> None:
         table_obstacle_min_height=np.array(args.table_obstacle_min_height, dtype=np.float32),
         table_obstacle_max_height=np.array(args.table_obstacle_max_height, dtype=np.float32),
         component_voxel_size=np.array(args.component_voxel_size, dtype=np.float32),
+        component_connectivity=np.array(args.component_connectivity, dtype=np.int64),
         min_component_points=np.array(args.min_component_points, dtype=np.int64),
         box_margin=np.array(args.box_margin, dtype=np.float32),
         box_shape=np.array(args.box_shape),

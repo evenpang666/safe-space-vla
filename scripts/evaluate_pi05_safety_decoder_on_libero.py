@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable runtime OBB generation and use --safe-space if provided.",
     )
-    parser.add_argument("--collision-margin", type=float, default=0.0, help="Extra OBB margin for collision checks.")
+    parser.add_argument("--collision-margin", type=float, default=0.02, help="Extra OBB margin for collision checks.")
     parser.add_argument(
         "--obb-camera-names",
         nargs="+",
@@ -151,11 +151,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obb-table-obstacle-min-height", type=float, default=0.02)
     parser.add_argument("--obb-table-obstacle-max-height", type=float, default=0.35)
     parser.add_argument("--obb-component-voxel-size", type=float, default=0.02)
+    parser.add_argument(
+        "--obb-component-connectivity",
+        type=int,
+        choices=[6, 18, 26],
+        default=6,
+        help=(
+            "3D voxel connectivity for realtime OBB component grouping. "
+            "6 separates obstacles more aggressively; 26 preserves legacy corner-connected grouping."
+        ),
+    )
     parser.add_argument("--obb-min-component-points", type=int, default=40)
     parser.add_argument("--obb-box-margin", type=float, default=0.01)
     parser.add_argument("--obb-box-shape", choices=["cuboid", "cube"], default="cuboid")
     parser.add_argument("--obb-box-orientation", choices=["axis_aligned", "xy_oriented", "pca_3d"], default="xy_oriented")
     parser.add_argument("--obb-voxel-size", type=float, default=0.04)
+    parser.add_argument(
+        "--obb-target-geom-name-patterns",
+        nargs="*",
+        default=["eval_scene_obstacle", "wine_bottle", "winebottle"],
+        help=(
+            "Case-insensitive geom/body name substrings kept for realtime OBBs. "
+            "Default keeps the inserted wine-bottle obstacle only. Use 'all' to restore legacy tabletop OBBs."
+        ),
+    )
     parser.add_argument("--prediction-steps", type=int, default=10, help="Euler ODE steps for SafetyFlowPointModel.")
     parser.add_argument(
         "--enable-cbf-qp",
@@ -163,6 +182,23 @@ def parse_args() -> argparse.Namespace:
         help="Filter executed PI05 actions with a point-flow-triggered CBF-QP projection.",
     )
     parser.add_argument("--cbf-alpha", type=float, default=1.0, help="CBF class-K gain for active OBB constraints.")
+    parser.add_argument(
+        "--cbf-action-space",
+        choices=["auto", "joint_delta", "cartesian_delta", "cartesian_action"],
+        default="auto",
+        help=(
+            "Action parameterization used by CBF-QP. 'joint_delta' optimizes arm joint deltas; "
+            "'cartesian_delta' maps OSC_POSITION xyz deltas through an EEF Jacobian; "
+            "'cartesian_action' directly optimizes executable OSC_POSITION xyz actions; "
+            "'auto' uses cartesian_action for LIBERO OSC_POSITION action_dim=4 or 7 and joint_delta otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--cbf-cartesian-damping",
+        type=float,
+        default=1e-4,
+        help="Damping for pseudo-inverse mapping from Cartesian xyz action to joint deltas.",
+    )
     parser.add_argument(
         "--cbf-trigger-margin",
         type=float,
@@ -179,24 +215,46 @@ def parse_args() -> argparse.Namespace:
         help="Active-set source for CBF-QP constraints.",
     )
     parser.add_argument(
+        "--cbf-include-current-points",
+        action="store_true",
+        help=(
+            "When using predicted point-flow CBF, also add current-frame robot pointcloud constraints. "
+            "By default, predicted point-flow CBF only uses future predicted point constraints."
+        ),
+    )
+    parser.add_argument(
+        "--cbf-correction-target",
+        choices=["current_action", "predicted_frame_action"],
+        default="current_action",
+        help=(
+            "Which action to correct when predicted point flow enters an OBB. "
+            "'current_action' preserves the legacy behavior; 'predicted_frame_action' "
+            "corrects the action at current_offset + predicted collision time_index."
+        ),
+    )
+    parser.add_argument(
         "--cbf-action-lower",
         nargs="*",
         type=float,
         default=None,
-        help="Optional scalar or per-joint lower bound for CBF-corrected arm action deltas.",
+        help="Optional scalar or per-variable lower bound for CBF QP variables.",
     )
     parser.add_argument(
         "--cbf-action-upper",
         nargs="*",
         type=float,
         default=None,
-        help="Optional scalar or per-joint upper bound for CBF-corrected arm action deltas.",
+        help="Optional scalar or per-variable upper bound for CBF QP variables.",
     )
     parser.add_argument(
         "--cbf-fallback",
-        choices=["zero", "nominal"],
-        default="zero",
-        help="Action fallback when the first-version CBF projection cannot satisfy all constraints.",
+        choices=["projected", "zero", "nominal"],
+        default="projected",
+        help=(
+            "Action fallback when CBF projection cannot fully satisfy all constraints. "
+            "'projected' keeps the best-effort projection, preserving tangent motion; "
+            "'zero' stops the optimized variables; 'nominal' executes the unfiltered action."
+        ),
     )
     parser.add_argument(
         "--safety-prediction-source",
@@ -211,7 +269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scene-obstacle",
         choices=["none", "wine_bottle"],
-        default="none",
+        default="wine_bottle",
         help="Optionally insert a physical obstacle into the LIBERO scene before evaluation.",
     )
     parser.add_argument(
@@ -463,6 +521,116 @@ def safe_space_obb_arrays(safe_space: dict[str, np.ndarray]) -> tuple[np.ndarray
     return centers, axes, half_sizes
 
 
+def normalize_obb_target_geom_name_patterns(patterns) -> tuple[str, ...]:
+    if patterns is None:
+        return ()
+    normalized = tuple(str(item).strip().lower() for item in patterns if str(item).strip())
+    if any(item in {"all", "none", "*"} for item in normalized):
+        return ()
+    return normalized
+
+
+def _model_name(model, kind: str, idx: int) -> str:
+    try:
+        return str(getattr(model, f"{kind}_id2name")(int(idx)) or "")
+    except Exception:
+        names = getattr(model, f"{kind}_names", None)
+        if names is not None and int(idx) < len(names):
+            return str(names[int(idx)] or "")
+    return ""
+
+
+def realtime_obb_target_geom_ids(model, patterns) -> set[int] | None:
+    """Resolve realtime OBB target geom ids by matching geom or parent body names.
+
+    ``None`` means no target filtering, while an empty set means filtering was
+    requested but no MuJoCo geom matched the requested patterns.
+    """
+    normalized = normalize_obb_target_geom_name_patterns(patterns)
+    if not normalized:
+        return None
+
+    target_ids: set[int] = set()
+    geom_bodyid = np.asarray(getattr(model, "geom_bodyid", []), dtype=np.int64).reshape(-1)
+    for geom_id in range(int(getattr(model, "ngeom", len(geom_bodyid)))):
+        names = [_model_name(model, "geom", geom_id).lower()]
+        if geom_id < len(geom_bodyid):
+            names.append(_model_name(model, "body", int(geom_bodyid[geom_id])).lower())
+        if any(pattern in name for pattern in normalized for name in names):
+            target_ids.add(int(geom_id))
+    return target_ids
+
+
+def geom_pixel_mask_from_segmentation(
+    *,
+    libero_pc,
+    sim,
+    camera_name: str,
+    width: int,
+    height: int,
+    geom_ids: set[int],
+) -> np.ndarray:
+    if not geom_ids:
+        return np.zeros((int(height), int(width)), dtype=bool)
+    segmentation = np.asarray(
+        libero_pc.render_segmentation(sim, camera_name, int(width), int(height)),
+        dtype=np.int32,
+    )
+    obj_types = segmentation[..., 0]
+    rendered_geom_ids = segmentation[..., 1]
+    mask = np.isin(rendered_geom_ids, list(geom_ids))
+    geom_objtype = None
+    if hasattr(libero_pc, "mujoco_geom_objtype"):
+        geom_objtype = libero_pc.mujoco_geom_objtype()
+    if geom_objtype is not None:
+        mask &= obj_types == int(geom_objtype)
+    return mask
+
+
+def real_robot_obstacle_collision(
+    env,
+    *,
+    robot_geom_ids,
+    target_geom_name_patterns=None,
+) -> dict[str, object]:
+    robot_geom_set = set(int(x) for x in np.asarray(list(robot_geom_ids), dtype=np.int64).reshape(-1))
+    empty = {"collision": False, "contact_count": 0, "contact_geom_pairs": np.zeros((0, 2), dtype=np.int64)}
+    if not hasattr(env, "sim") or not hasattr(env.sim, "data") or not hasattr(env.sim.data, "contact"):
+        return empty
+    if not hasattr(env.sim, "model"):
+        return empty
+    target_patterns = normalize_obb_target_geom_name_patterns(target_geom_name_patterns)
+    target_geom_set = realtime_obb_target_geom_ids(env.sim.model, target_patterns) if target_patterns else None
+    if target_geom_set is not None and not target_geom_set:
+        return empty
+    if target_geom_set is None:
+        target_geom_set = {
+            int(geom_id)
+            for geom_id in range(int(getattr(env.sim.model, "ngeom", 0)))
+            if int(geom_id) not in robot_geom_set
+        }
+
+    contacts = getattr(env.sim.data, "contact", [])
+    ncon = int(getattr(env.sim.data, "ncon", len(contacts)))
+    pairs: list[tuple[int, int]] = []
+    for contact_index in range(ncon):
+        contact = contacts[contact_index]
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        geom1_robot = geom1 in robot_geom_set
+        geom2_robot = geom2 in robot_geom_set
+        geom1_target = geom1 in target_geom_set
+        geom2_target = geom2 in target_geom_set
+        if (geom1_robot and geom2_target) or (geom2_robot and geom1_target):
+            pairs.append((geom1, geom2))
+    pair_array = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    return {
+        "collision": bool(len(pair_array) > 0),
+        "contact_count": int(len(pair_array)),
+        "contact_geom_pairs": pair_array,
+    }
+
+
 def build_realtime_safe_space_from_env(
     *,
     env,
@@ -483,11 +651,13 @@ def build_realtime_safe_space_from_env(
     table_obstacle_min_height: float,
     table_obstacle_max_height: float,
     component_voxel_size: float,
+    component_connectivity: int,
     min_component_points: int,
     box_margin: float,
     box_shape: str,
     box_orientation: str,
     voxel_size: float,
+    target_geom_name_patterns=None,
 ) -> dict[str, np.ndarray]:
     """Rebuild obstacle OBBs from the current simulator RGB-D state.
 
@@ -497,17 +667,33 @@ def build_realtime_safe_space_from_env(
     all_points: list[np.ndarray] = []
     all_colors: list[np.ndarray] = []
     robot_geom_set = set(int(x) for x in np.asarray(list(robot_geom_ids), dtype=np.int64).reshape(-1))
+    target_patterns = normalize_obb_target_geom_name_patterns(target_geom_name_patterns)
+    target_geom_set = realtime_obb_target_geom_ids(env.sim.model, target_patterns) if target_patterns else None
+    if target_geom_set is not None and not target_geom_set:
+        print(f"[warn] no realtime OBB target geoms matched patterns {tuple(target_geom_name_patterns)!r}")
+        return empty_obstacle_safe_space()
     for camera_name in camera_names:
         try:
             rgb, depth_m = libero_pc.render_rgbd(env.sim, camera_name, int(width), int(height))
-            robot_mask = libero_pc.robot_pixel_mask(
-                sim=env.sim,
-                camera_name=camera_name,
-                width=int(width),
-                height=int(height),
-                robot_geom_ids=robot_geom_set,
-                dilation=int(robot_mask_dilation),
-            )
+            if target_geom_set is None:
+                robot_mask = libero_pc.robot_pixel_mask(
+                    sim=env.sim,
+                    camera_name=camera_name,
+                    width=int(width),
+                    height=int(height),
+                    robot_geom_ids=robot_geom_set,
+                    dilation=int(robot_mask_dilation),
+                )
+                keep_mask = ~robot_mask
+            else:
+                keep_mask = geom_pixel_mask_from_segmentation(
+                    libero_pc=libero_pc,
+                    sim=env.sim,
+                    camera_name=camera_name,
+                    width=int(width),
+                    height=int(height),
+                    geom_ids=target_geom_set,
+                )
         except Exception as exc:
             print(f"[warn] skipped realtime OBB camera {camera_name!r}: {exc}")
             continue
@@ -518,7 +704,7 @@ def build_realtime_safe_space_from_env(
             depth_m=depth_m,
             stride=max(int(stride), 1),
             max_depth=float(max_depth),
-            keep_mask=~robot_mask,
+            keep_mask=keep_mask,
         )
         if len(points) > 0:
             all_points.append(np.asarray(points, dtype=np.float32))
@@ -579,6 +765,7 @@ def build_realtime_safe_space_from_env(
         bounds=bounds,
         table_z=resolved_table_z,
         component_voxel_size=float(component_voxel_size),
+        component_connectivity=int(component_connectivity),
         min_component_points=int(min_component_points),
         box_margin=float(box_margin),
         box_shape=box_shape,
@@ -631,6 +818,7 @@ def point_flow_obb_cbf_constraints(
     collision_margin: float = 0.0,
     trigger_margin: float = 0.02,
     max_constraints: int = 32,
+    allowed_time_indices: set[int] | frozenset[int] | None = None,
 ) -> list[PointFlowCbfConstraint]:
     """Select CBF constraints from predicted future robot-surface point flow.
 
@@ -653,6 +841,7 @@ def point_flow_obb_cbf_constraints(
 
     constraints: list[PointFlowCbfConstraint] = []
     seen: set[tuple[int, int, int]] = set()
+    allowed_times = None if allowed_time_indices is None else {int(item) for item in allowed_time_indices}
     cbf_margin = max(float(collision_margin), 0.0)
     trigger = cbf_margin + max(float(trigger_margin), 0.0)
     for obb_id, (center, box_axes, box_half_sizes) in enumerate(zip(centers, axes, half_sizes)):
@@ -660,6 +849,8 @@ def point_flow_obb_cbf_constraints(
         trigger_half_sizes = box_half_sizes + trigger
         dangerous = np.all(np.abs(pred_local) <= (trigger_half_sizes + 1e-6), axis=-1)
         for time_index, link_id, point_id in np.argwhere(dangerous):
+            if allowed_times is not None and int(time_index) not in allowed_times:
+                continue
             key = (int(link_id), int(point_id), int(obb_id))
             if key in seen:
                 continue
@@ -674,7 +865,12 @@ def point_flow_obb_cbf_constraints(
                 pred_value = float(pred_local[int(time_index), int(link_id), int(point_id), face_axis])
                 sign = 1.0 if pred_value >= 0.0 else -1.0
             normal = sign * np.asarray(box_axes[:, face_axis], dtype=np.float32)
-            h = sign * float(current_local[face_axis]) - float(cbf_half_sizes[face_axis])
+            current_h = sign * float(current_local[face_axis]) - float(cbf_half_sizes[face_axis])
+            predicted_h = (
+                sign * float(pred_local[int(time_index), int(link_id), int(point_id), face_axis])
+                - float(cbf_half_sizes[face_axis])
+            )
+            h = min(current_h, predicted_h)
             constraints.append(
                 PointFlowCbfConstraint(
                     time_index=int(time_index),
@@ -748,6 +944,112 @@ def current_point_obb_cbf_constraints(
     return sorted(constraints, key=lambda item: item.h)[: int(max_constraints)]
 
 
+def predicted_frame_action_cbf_constraints(
+    pred_link_points: np.ndarray,
+    current_link_points: np.ndarray,
+    safe_space: dict[str, np.ndarray] | None,
+    *,
+    collision_margin: float = 0.0,
+    trigger_margin: float = 0.02,
+    max_constraints: int = 32,
+    allowed_time_indices: set[int] | frozenset[int] | None = None,
+    include_current_points: bool = False,
+) -> list[PointFlowCbfConstraint]:
+    """Select predicted-frame constraints for chunk-indexed CBF."""
+    if max_constraints <= 0:
+        return []
+    allowed_times = None if allowed_time_indices is None else {int(item) for item in allowed_time_indices}
+    if include_current_points and (allowed_times is None or 0 in allowed_times):
+        current_constraints = current_point_obb_cbf_constraints(
+            current_link_points,
+            safe_space,
+            collision_margin=collision_margin,
+            trigger_margin=trigger_margin,
+            max_constraints=max_constraints,
+        )
+    else:
+        current_constraints = []
+    predicted_constraints = point_flow_obb_cbf_constraints(
+        pred_link_points,
+        current_link_points,
+        safe_space,
+        collision_margin=collision_margin,
+        trigger_margin=trigger_margin,
+        max_constraints=max_constraints,
+        allowed_time_indices=allowed_time_indices,
+    )
+    constraints = current_constraints + predicted_constraints
+    return sorted(constraints, key=lambda item: (item.h, item.time_index))[: int(max_constraints)]
+
+
+def cbf_action_indices_from_constraints(
+    constraints: list[PointFlowCbfConstraint],
+    *,
+    current_action_offset: int,
+    action_count: int,
+) -> list[int]:
+    offset = int(current_action_offset)
+    count = int(action_count)
+    if offset < 0:
+        raise ValueError(f"current_action_offset must be >= 0, got {offset}")
+    if count < 0:
+        raise ValueError(f"action_count must be >= 0, got {count}")
+    return sorted(
+        {
+            offset + int(item.time_index)
+            for item in constraints
+            if 0 <= offset + int(item.time_index) < count
+        }
+    )
+
+
+def apply_frame_indexed_cbf_corrections(
+    action_chunk: np.ndarray,
+    constraints: list[PointFlowCbfConstraint],
+    *,
+    current_action_offset: int,
+    correct_action_fn,
+) -> tuple[np.ndarray, dict[str, object]]:
+    chunk = np.asarray(action_chunk, dtype=np.float64).copy()
+    if chunk.ndim != 2:
+        raise ValueError(f"action_chunk must have shape (T, A), got {chunk.shape}")
+    action_indices = cbf_action_indices_from_constraints(
+        constraints,
+        current_action_offset=int(current_action_offset),
+        action_count=int(chunk.shape[0]),
+    )
+    info: dict[str, object] = {
+        "triggered": bool(action_indices),
+        "constraint_count": int(len(constraints)),
+        "success": True,
+        "max_violation": 0.0,
+        "corrected_action_indices": action_indices,
+    }
+    for action_index in action_indices:
+        selected = [
+            item
+            for item in constraints
+            if int(current_action_offset) + int(item.time_index) == int(action_index)
+        ]
+        corrected_action, correction_info = correct_action_fn(int(action_index), chunk[action_index].copy(), selected)
+        chunk[action_index] = np.asarray(corrected_action, dtype=np.float64).reshape(chunk.shape[1])
+        info["success"] = bool(info["success"]) and bool(correction_info.get("success", True))
+        info["max_violation"] = max(float(info["max_violation"]), float(correction_info.get("max_violation", 0.0)))
+        if "action_space" not in info and "action_space" in correction_info:
+            info["action_space"] = correction_info["action_space"]
+    return chunk, info
+
+
+def cbf_corrected_action_masks(cbf_infos: list[dict[str, object]], *, action_count: int) -> np.ndarray:
+    masks = np.zeros((len(cbf_infos), int(action_count)), dtype=bool)
+    for sample_id, info in enumerate(cbf_infos):
+        for action_index in info.get("corrected_action_indices", []):
+            action_index = int(action_index)
+            if 0 <= action_index < masks.shape[1]:
+                masks[sample_id, action_index] = True
+    return masks
+
+
 def solve_cbf_qp_projection(
     nominal_action: np.ndarray,
     a_matrix: np.ndarray,
@@ -807,6 +1109,24 @@ def solve_cbf_qp_projection(
     )
 
 
+def cbf_qp_action_from_projection(
+    projection: CbfQpProjectionResult,
+    *,
+    qp_to_action,
+    qp_nominal: np.ndarray,
+    nominal: np.ndarray,
+    fallback: str,
+) -> np.ndarray:
+    if projection.success or fallback == "projected":
+        return np.asarray(qp_to_action(projection.action), dtype=np.float64)
+    if fallback == "zero":
+        zero_qp_action = np.zeros_like(np.asarray(qp_nominal, dtype=np.float64))
+        return np.asarray(qp_to_action(zero_qp_action), dtype=np.float64)
+    if fallback == "nominal":
+        return np.asarray(nominal, dtype=np.float64).copy()
+    raise ValueError(f"Unsupported CBF fallback: {fallback}")
+
+
 def _resolve_optional_action_bound(bound: list[float] | tuple[float, ...] | np.ndarray | None, dim: int) -> np.ndarray | None:
     if bound is None:
         return None
@@ -818,6 +1138,113 @@ def _resolve_optional_action_bound(bound: list[float] | tuple[float, ...] | np.n
     if arr.size < dim:
         raise ValueError(f"CBF action bound needs 1 or at least {dim} values, got {arr.size}")
     return arr[:dim].astype(np.float64, copy=False)
+
+
+def resolve_cbf_action_space(requested: str, *, action_dim: int, arm_dim: int) -> str:
+    if requested not in {"auto", "joint_delta", "cartesian_delta", "cartesian_action"}:
+        raise ValueError(f"Unsupported CBF action space: {requested}")
+    if requested != "auto":
+        return requested
+    # LIBERO / PI05 uses OSC_POSITION-like executable actions: either compact
+    # xyz+gripper (4-D) or xyz+orientation+gripper (7-D). These are not arm
+    # joint deltas even when action_dim equals the number of arm joints.
+    return "cartesian_action" if int(action_dim) in (4, 7) and int(arm_dim) >= 7 else "joint_delta"
+
+
+def executable_libero_action(action: np.ndarray, *, action_dim: int) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float64).reshape(-1)
+    action_dim = int(action_dim)
+    if action_dim <= 0:
+        raise ValueError(f"action_dim must be positive, got {action_dim}")
+    if action_dim == 4 and action.size > 4:
+        return np.concatenate((action[:3], action[-1:]), axis=0).astype(np.float64, copy=False)
+    if action.size < action_dim:
+        raise ValueError(f"action needs at least {action_dim} values, got {action.size}")
+    return action[:action_dim].astype(np.float64, copy=False)
+
+
+def damped_pseudoinverse(matrix: np.ndarray, *, damping: float = 1e-4) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim != 2:
+        raise ValueError(f"matrix must be 2-D, got {matrix.shape}")
+    damping = float(damping)
+    if damping < 0.0:
+        raise ValueError(f"damping must be >= 0, got {damping}")
+    if damping == 0.0:
+        return np.linalg.pinv(matrix)
+    rows = matrix.shape[0]
+    return matrix.T @ np.linalg.inv(matrix @ matrix.T + (damping * damping) * np.eye(rows, dtype=np.float64))
+
+
+def cartesian_delta_action_to_joint_delta(
+    nominal_action: np.ndarray,
+    eef_jacobian: np.ndarray,
+    *,
+    arm_dim: int,
+    damping: float = 1e-4,
+):
+    nominal = np.asarray(nominal_action, dtype=np.float64).reshape(-1)
+    if nominal.size < 3:
+        raise ValueError(f"Cartesian action needs at least 3 xyz values, got {nominal.size}")
+    jacobian = np.asarray(eef_jacobian, dtype=np.float64)
+    arm_dim = int(arm_dim)
+    if jacobian.shape != (3, arm_dim):
+        raise ValueError(f"eef_jacobian must have shape (3, {arm_dim}), got {jacobian.shape}")
+    pseudo_inverse = damped_pseudoinverse(jacobian, damping=float(damping))
+    joint_delta = pseudo_inverse @ nominal[:3]
+
+    def joint_delta_to_action(safe_joint_delta: np.ndarray) -> np.ndarray:
+        safe_joint_delta = np.asarray(safe_joint_delta, dtype=np.float64).reshape(-1)
+        if safe_joint_delta.shape != (arm_dim,):
+            raise ValueError(f"safe_joint_delta must have shape ({arm_dim},), got {safe_joint_delta.shape}")
+        safe = nominal.copy()
+        safe[:3] = jacobian @ safe_joint_delta
+        return safe
+
+    return joint_delta.astype(np.float64, copy=False), joint_delta_to_action
+
+
+def cartesian_action_to_qp_action(nominal_action: np.ndarray, *, action_dim: int):
+    executable = executable_libero_action(nominal_action, action_dim=int(action_dim))
+    if executable.size < 3:
+        raise ValueError(f"Cartesian executable action needs at least 3 xyz values, got {executable.size}")
+    action_xyz = executable[:3].astype(np.float64, copy=True)
+
+    def xyz_to_action(safe_xyz: np.ndarray) -> np.ndarray:
+        safe_xyz = np.asarray(safe_xyz, dtype=np.float64).reshape(-1)
+        if safe_xyz.shape != (3,):
+            raise ValueError(f"safe_xyz must have shape (3,), got {safe_xyz.shape}")
+        safe = executable.copy()
+        safe[:3] = safe_xyz
+        return safe
+
+    return action_xyz, xyz_to_action
+
+
+def finite_difference_eef_position_jacobian(
+    eef_position_fn,
+    q: np.ndarray,
+    *,
+    eps: float = 1e-4,
+) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if eps <= 0.0:
+        raise ValueError("finite-difference eps must be positive")
+    jacobian = np.zeros((3, q.size), dtype=np.float64)
+    for joint_idx in range(q.size):
+        delta = np.zeros_like(q)
+        delta[joint_idx] = float(eps)
+        pos_plus = np.asarray(eef_position_fn(q + delta), dtype=np.float64).reshape(-1)
+        pos_minus = np.asarray(eef_position_fn(q - delta), dtype=np.float64).reshape(-1)
+        if pos_plus.shape != (3,) or pos_minus.shape != (3,):
+            raise ValueError("eef_position_fn must return shape (3,)")
+        jacobian[:, joint_idx] = (pos_plus - pos_minus) / (2.0 * float(eps))
+    return jacobian
+
+
+def eef_body_position(env, *, body_name: str = "gripper0_eef") -> np.ndarray:
+    body_id = int(env.sim.model.body_name2id(body_name))
+    return np.asarray(env.sim.data.body_xpos[body_id], dtype=np.float64).copy()
 
 
 def finite_difference_point_jacobians(
@@ -845,6 +1272,46 @@ def finite_difference_point_jacobians(
     return jacobians
 
 
+def finite_difference_action_point_jacobians(
+    action_position_fn,
+    action_xyz: np.ndarray,
+    point_keys: list[tuple[int, int]],
+    *,
+    eps: float = 1e-4,
+) -> dict[tuple[int, int], np.ndarray]:
+    action_xyz = np.asarray(action_xyz, dtype=np.float64).reshape(-1)
+    if action_xyz.shape != (3,):
+        raise ValueError(f"action_xyz must have shape (3,), got {action_xyz.shape}")
+    if eps <= 0.0:
+        raise ValueError("finite-difference eps must be positive")
+    unique_keys = sorted(set((int(link_id), int(point_id)) for link_id, point_id in point_keys))
+    jacobians = {key: np.zeros((3, action_xyz.size), dtype=np.float64) for key in unique_keys}
+    for action_idx in range(action_xyz.size):
+        delta = np.zeros_like(action_xyz)
+        delta[action_idx] = float(eps)
+        points_plus = np.asarray(action_position_fn(action_xyz + delta), dtype=np.float64)
+        points_minus = np.asarray(action_position_fn(action_xyz - delta), dtype=np.float64)
+        if points_plus.shape != points_minus.shape or points_plus.ndim != 3 or points_plus.shape[-1] != 3:
+            raise ValueError("action_position_fn must return link points with shape (L, P, 3)")
+        diff = (points_plus - points_minus) / (2.0 * float(eps))
+        for key in unique_keys:
+            jacobians[key][:, action_idx] = diff[key[0], key[1]]
+    return jacobians
+
+
+def snapshot_env_runtime_state(env) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for name in ("timestep", "cur_time", "_elapsed_steps"):
+        if hasattr(env, name):
+            snapshot[name] = getattr(env, name)
+    return snapshot
+
+
+def restore_env_runtime_state(env, snapshot: dict[str, object]) -> None:
+    for name, value in snapshot.items():
+        setattr(env, name, value)
+
+
 def filter_action_with_pointflow_cbf_qp(
     *,
     env,
@@ -854,6 +1321,7 @@ def filter_action_with_pointflow_cbf_qp(
     low: np.ndarray,
     high: np.ndarray,
     nominal_action: np.ndarray,
+    action_dim: int,
     current_link_points: np.ndarray,
     pred_link_points: np.ndarray,
     safe_space: dict[str, np.ndarray] | None,
@@ -870,19 +1338,31 @@ def filter_action_with_pointflow_cbf_qp(
     action_upper: list[float] | tuple[float, ...] | np.ndarray | None,
     fallback: str,
     trigger_source: str = "predicted_point_flow",
+    action_space: str = "auto",
+    cartesian_damping: float = 1e-4,
+    precomputed_constraints: list[PointFlowCbfConstraint] | None = None,
+    allowed_time_indices: set[int] | frozenset[int] | None = None,
+    include_current_points: bool = False,
 ) -> tuple[np.ndarray, dict[str, object]]:
     nominal = np.asarray(nominal_action, dtype=np.float64).reshape(-1)
     arm_dim = int(len(qpos_indices))
-    if nominal.size < arm_dim:
-        raise ValueError(f"nominal action needs at least {arm_dim} arm values, got {nominal.size}")
-    if trigger_source == "predicted_point_flow":
-        constraints = point_flow_obb_cbf_constraints(
+    resolved_action_space = resolve_cbf_action_space(action_space, action_dim=int(action_dim), arm_dim=arm_dim)
+    if resolved_action_space == "joint_delta" and nominal.size < arm_dim:
+        raise ValueError(f"joint_delta CBF action needs at least {arm_dim} arm values, got {nominal.size}")
+    if resolved_action_space == "cartesian_delta" and nominal.size < 3:
+        raise ValueError(f"cartesian_delta CBF action needs at least 3 xyz values, got {nominal.size}")
+    if precomputed_constraints is not None:
+        constraints = list(precomputed_constraints)
+    elif trigger_source == "predicted_point_flow":
+        constraints = predicted_frame_action_cbf_constraints(
             pred_link_points,
             current_link_points,
             safe_space,
             collision_margin=collision_margin,
             trigger_margin=trigger_margin,
             max_constraints=max_constraints,
+            allowed_time_indices=allowed_time_indices,
+            include_current_points=include_current_points,
         )
     elif trigger_source == "current_pointcloud":
         constraints = current_point_obb_cbf_constraints(
@@ -900,12 +1380,12 @@ def filter_action_with_pointflow_cbf_qp(
         "success": True,
         "max_violation": 0.0,
         "trigger_source": trigger_source,
+        "action_space": resolved_action_space,
     }
     if not constraints:
         return nominal.astype(np.float64, copy=False), info
 
     q = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float64).reshape(-1)
-    arm_nominal = nominal[:arm_dim]
     low = np.asarray(low, dtype=np.float64).reshape(-1)[:arm_dim]
     high = np.asarray(high, dtype=np.float64).reshape(-1)[:arm_dim]
     lower = low - q
@@ -918,6 +1398,10 @@ def filter_action_with_pointflow_cbf_qp(
         upper = np.minimum(upper, user_upper)
 
     zero_action_chunk = np.zeros((0, arm_dim), dtype=np.float64)
+
+    def set_q_and_forward(q_vector: np.ndarray) -> None:
+        swept = dataset_builder.import_script_module("libero_joint_swept_pointcloud")
+        swept.set_arm_joint_vector(env.sim, qpos_indices, np.asarray(q_vector, dtype=np.float64))
 
     def point_position_fn(q_vector: np.ndarray) -> np.ndarray:
         def target_builder():
@@ -938,12 +1422,79 @@ def filter_action_with_pointflow_cbf_qp(
         return np.asarray(target[0], dtype=np.float64)
 
     point_keys = [(item.link_id, item.point_id) for item in constraints]
-    jacobians = finite_difference_point_jacobians(
-        point_position_fn,
-        q,
-        point_keys,
-        eps=float(finite_difference_eps),
-    )
+    if resolved_action_space == "joint_delta":
+        qp_nominal = nominal[:arm_dim]
+        qp_lower = lower
+        qp_upper = upper
+
+        def qp_to_action(safe_joint_delta: np.ndarray) -> np.ndarray:
+            safe = nominal.copy()
+            safe[:arm_dim] = np.asarray(safe_joint_delta, dtype=np.float64).reshape(-1)
+            return safe
+
+        jacobians = finite_difference_point_jacobians(
+            point_position_fn,
+            q,
+            point_keys,
+            eps=float(finite_difference_eps),
+        )
+    elif resolved_action_space == "cartesian_delta":
+        def eef_position_fn(q_vector: np.ndarray) -> np.ndarray:
+            def position_builder():
+                set_q_and_forward(q_vector)
+                return eef_body_position(env)
+
+            return collector.compute_fk_target_preserving_sim_state(env, position_builder)
+
+        eef_jacobian = finite_difference_eef_position_jacobian(
+            eef_position_fn,
+            q,
+            eps=float(finite_difference_eps),
+        )
+        qp_nominal, qp_to_action = cartesian_delta_action_to_joint_delta(
+            nominal,
+            eef_jacobian,
+            arm_dim=arm_dim,
+            damping=float(cartesian_damping),
+        )
+        qp_lower = lower
+        qp_upper = upper
+
+        jacobians = finite_difference_point_jacobians(
+            point_position_fn,
+            q,
+            point_keys,
+            eps=float(finite_difference_eps),
+        )
+    else:
+        qp_nominal, qp_to_action = cartesian_action_to_qp_action(nominal, action_dim=int(action_dim))
+        qp_lower = np.full_like(qp_nominal, -np.inf, dtype=np.float64)
+        qp_upper = np.full_like(qp_nominal, np.inf, dtype=np.float64)
+        user_lower = _resolve_optional_action_bound(action_lower, qp_nominal.size)
+        user_upper = _resolve_optional_action_bound(action_upper, qp_nominal.size)
+        if user_lower is not None:
+            qp_lower = np.maximum(qp_lower, user_lower)
+        if user_upper is not None:
+            qp_upper = np.minimum(qp_upper, user_upper)
+
+        def action_position_fn(action_xyz: np.ndarray) -> np.ndarray:
+            executable_action = qp_to_action(action_xyz)
+            env_runtime_state = snapshot_env_runtime_state(env)
+            snapshot = collector.snapshot_sim_state(env.sim)
+            try:
+                env.step(executable_action.tolist())
+                q_after = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float64).reshape(-1)
+                return point_position_fn(q_after)
+            finally:
+                collector.restore_sim_state(env.sim, snapshot)
+                restore_env_runtime_state(env, env_runtime_state)
+
+        jacobians = finite_difference_action_point_jacobians(
+            action_position_fn,
+            qp_nominal,
+            point_keys,
+            eps=float(finite_difference_eps),
+        )
     a_rows = []
     b_values = []
     for item in constraints:
@@ -952,28 +1503,28 @@ def filter_action_with_pointflow_cbf_qp(
         b_values.append(-float(alpha) * float(item.h))
 
     projection = solve_cbf_qp_projection(
-        arm_nominal,
+        qp_nominal,
         np.asarray(a_rows, dtype=np.float64),
         np.asarray(b_values, dtype=np.float64),
-        lower=lower,
-        upper=upper,
+        lower=qp_lower,
+        upper=qp_upper,
         iterations=int(projection_iterations),
     )
-    safe = nominal.copy()
-    if projection.success:
-        safe[:arm_dim] = projection.action
-    elif fallback == "zero":
-        safe[:arm_dim] = 0.0
-    elif fallback == "nominal":
-        safe[:arm_dim] = arm_nominal
-    else:
-        raise ValueError(f"Unsupported CBF fallback: {fallback}")
+    safe = cbf_qp_action_from_projection(
+        projection,
+        qp_to_action=qp_to_action,
+        qp_nominal=qp_nominal,
+        nominal=nominal,
+        fallback=fallback,
+    )
 
     info.update(
         {
             "success": bool(projection.success),
             "max_violation": float(projection.max_violation),
             "iterations": int(projection.iterations),
+            "qp_nominal_norm": float(np.linalg.norm(qp_nominal)),
+            "fallback": str(fallback),
         }
     )
     return safe.astype(np.float64, copy=False), info
@@ -1034,6 +1585,7 @@ def append_prediction_video_frame(
     pred_link_points: np.ndarray,
     obb_corners: np.ndarray | None = None,
     collision_result: dict[str, object] | None = None,
+    real_collision_result: dict[str, object] | None = None,
     camera_name: str,
     width: int,
     height: int,
@@ -1074,6 +1626,7 @@ def append_prediction_video_frame(
         step_id=step_id,
         sample_id=sample_id,
         collision_result=collision_result,
+        real_collision_result=real_collision_result,
     )
     buffer.append(frame)
 
@@ -1085,6 +1638,7 @@ def annotate_video_frame(
     step_id: int,
     sample_id: int,
     collision_result: dict[str, object] | None = None,
+    real_collision_result: dict[str, object] | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
@@ -1095,6 +1649,18 @@ def annotate_video_frame(
     bbox = draw.textbbox((x0, y0), text)
     draw.rectangle((bbox[0] - 4, bbox[1] - 3, bbox[2] + 4, bbox[3] + 3), fill=(0, 0, 0))
     draw.text((x0, y0), text, fill=(255, 255, 255))
+    if real_collision_result is not None:
+        real_collides = bool(real_collision_result.get("collision", False))
+        contact_count = int(real_collision_result.get("contact_count", 0))
+        real_status = f"REAL COLLISION | contacts: {contact_count}" if real_collides else "NO REAL COLLISION | contacts: 0"
+        real_fill = (220, 100, 0) if real_collides else (0, 90, 120)
+        x_real, y_real = 6, max(6, image.height - 44)
+        real_bbox = draw.textbbox((x_real, y_real), real_status)
+        draw.rectangle(
+            (real_bbox[0] - 4, real_bbox[1] - 3, real_bbox[2] + 4, real_bbox[3] + 3),
+            fill=real_fill,
+        )
+        draw.text((x_real, y_real), real_status, fill=(255, 255, 255))
     if collision_result is not None:
         collides = bool(collision_result.get("collision", False))
         count = int(collision_result.get("collision_point_count", 0))
@@ -1138,6 +1704,16 @@ def stack_metric_dicts(sample_metrics: list[dict[str, float]]) -> dict[str, np.n
     }
 
 
+def cbf_action_delta_norms(nominal_actions: np.ndarray, executed_actions: np.ndarray) -> np.ndarray:
+    nominal = np.asarray(nominal_actions, dtype=np.float32)
+    executed = np.asarray(executed_actions, dtype=np.float32)
+    if nominal.shape != executed.shape:
+        raise ValueError(f"nominal_actions and executed_actions must have the same shape, got {nominal.shape} and {executed.shape}")
+    if nominal.ndim != 2:
+        raise ValueError(f"nominal_actions must have shape (S, A), got {nominal.shape}")
+    return np.linalg.norm(executed - nominal, axis=1).astype(np.float32)
+
+
 def save_evaluation(
     output: Path,
     *,
@@ -1152,11 +1728,16 @@ def save_evaluation(
     coordinate_frame: str,
     collision_flags: np.ndarray | None = None,
     collision_point_counts: np.ndarray | None = None,
+    real_collision_flags: np.ndarray | None = None,
+    real_collision_contact_counts: np.ndarray | None = None,
+    nominal_actions: np.ndarray | None = None,
     executed_actions: np.ndarray | None = None,
+    cbf_action_delta_norms: np.ndarray | None = None,
     cbf_triggered: np.ndarray | None = None,
     cbf_success: np.ndarray | None = None,
     cbf_constraint_counts: np.ndarray | None = None,
     cbf_max_violations: np.ndarray | None = None,
+    cbf_corrected_action_masks: np.ndarray | None = None,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(
@@ -1176,8 +1757,16 @@ def save_evaluation(
         payload["collision_flags"] = np.asarray(collision_flags, dtype=bool)
     if collision_point_counts is not None:
         payload["collision_point_counts"] = np.asarray(collision_point_counts, dtype=np.int64)
+    if real_collision_flags is not None:
+        payload["real_collision_flags"] = np.asarray(real_collision_flags, dtype=bool)
+    if real_collision_contact_counts is not None:
+        payload["real_collision_contact_counts"] = np.asarray(real_collision_contact_counts, dtype=np.int64)
+    if nominal_actions is not None:
+        payload["nominal_actions"] = np.asarray(nominal_actions, dtype=np.float32)
     if executed_actions is not None:
         payload["executed_actions"] = np.asarray(executed_actions, dtype=np.float32)
+    if cbf_action_delta_norms is not None:
+        payload["cbf_action_delta_norms"] = np.asarray(cbf_action_delta_norms, dtype=np.float32)
     if cbf_triggered is not None:
         payload["cbf_triggered"] = np.asarray(cbf_triggered, dtype=bool)
     if cbf_success is not None:
@@ -1186,6 +1775,8 @@ def save_evaluation(
         payload["cbf_constraint_counts"] = np.asarray(cbf_constraint_counts, dtype=np.int64)
     if cbf_max_violations is not None:
         payload["cbf_max_violations"] = np.asarray(cbf_max_violations, dtype=np.float32)
+    if cbf_corrected_action_masks is not None:
+        payload["cbf_corrected_action_masks"] = np.asarray(cbf_corrected_action_masks, dtype=bool)
     np.savez_compressed(output, **payload)
 
 
@@ -1225,6 +1816,8 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--cbf-projection-iterations must be > 0")
     if getattr(args, "cbf_alpha", 1.0) < 0.0:
         raise ValueError("--cbf-alpha must be >= 0")
+    if getattr(args, "cbf_cartesian_damping", 1e-4) < 0.0:
+        raise ValueError("--cbf-cartesian-damping must be >= 0")
     if getattr(args, "scene_obstacle", "none") == "none" and getattr(args, "scene_obstacle_xy", None) is not None:
         raise ValueError("--scene-obstacle-xy requires --scene-obstacle wine_bottle")
     if args.realtime_obbs:
@@ -1238,6 +1831,8 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("--obb-table-obstacle-max-height must be greater than --obb-table-obstacle-min-height")
         if args.obb_component_voxel_size <= 0.0:
             raise ValueError("--obb-component-voxel-size must be > 0")
+        if args.obb_component_connectivity not in (6, 18, 26):
+            raise ValueError("--obb-component-connectivity must be one of 6, 18, or 26")
         if args.obb_min_component_points <= 0:
             raise ValueError("--obb-min-component-points must be > 0")
         if args.obb_voxel_size <= 0.0:
@@ -1310,6 +1905,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     pred_samples: list[np.ndarray] = []
     target_samples: list[np.ndarray] = []
     action_chunks: list[np.ndarray] = []
+    nominal_actions: list[np.ndarray] = []
     executed_actions: list[np.ndarray] = []
     prefix_shapes: list[tuple[int, ...]] = []
     metrics: list[dict[str, float]] = []
@@ -1320,6 +1916,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
     video_path = args.video_output
     static_safe_space = load_safe_space_for_video(args.safe_space) if args.safe_space is not None else None
     collision_results: list[dict[str, object]] = []
+    real_collision_results: list[dict[str, object]] = []
     cbf_infos: list[dict[str, object]] = []
 
     try:
@@ -1350,6 +1947,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
             step_id = 0
             done = False
             control_action_chunk = None
+            control_prefix_tokens = None
             control_action_offset = 0
             control_replan_offset = 0
             while not done and step_id < max_steps and len(pred_samples) < args.max_samples:
@@ -1358,20 +1956,30 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                     prompt=task_description,
                     resize_size=args.resize_size,
                 )
-                action_chunk, prefix_tokens = collector.query_policy_action_and_prefix(
-                    policy,
-                    element,
-                    remote_prefix_tokens=True,
-                )
-                if action_chunk.shape[0] <= 0:
-                    raise ValueError("policy returned an empty action_chunk")
                 need_control_query = (
                     control_action_chunk is None
                     or control_action_offset >= len(control_action_chunk)
                     or control_replan_offset >= args.replan_steps
                 )
+                chunk_aligned_cbf = (
+                    bool(getattr(args, "enable_cbf_qp", False))
+                    and getattr(args, "cbf_correction_target", "predicted_frame_action") == "predicted_frame_action"
+                    and getattr(args, "cbf_trigger_source", "predicted_point_flow") == "predicted_point_flow"
+                )
+                if need_control_query or not chunk_aligned_cbf:
+                    action_chunk, prefix_tokens = collector.query_policy_action_and_prefix(
+                        policy,
+                        element,
+                        remote_prefix_tokens=True,
+                    )
+                    if action_chunk.shape[0] <= 0:
+                        raise ValueError("policy returned an empty action_chunk")
+                else:
+                    action_chunk = np.asarray(control_action_chunk, dtype=np.float32)
+                    prefix_tokens = np.asarray(control_prefix_tokens, dtype=np.float32)
                 if need_control_query:
-                    control_action_chunk = action_chunk
+                    control_action_chunk = np.asarray(action_chunk, dtype=np.float64).copy()
+                    control_prefix_tokens = np.asarray(prefix_tokens, dtype=np.float32).copy()
                     control_action_offset = 0
                     control_replan_offset = 0
                 start_joint_vector = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float32)
@@ -1444,11 +2052,13 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                         table_obstacle_min_height=args.obb_table_obstacle_min_height,
                         table_obstacle_max_height=args.obb_table_obstacle_max_height,
                         component_voxel_size=args.obb_component_voxel_size,
+                        component_connectivity=args.obb_component_connectivity,
                         min_component_points=args.obb_min_component_points,
                         box_margin=args.obb_box_margin,
                         box_shape=args.obb_box_shape,
                         box_orientation=args.obb_box_orientation,
                         voxel_size=args.obb_voxel_size,
+                        target_geom_name_patterns=args.obb_target_geom_name_patterns,
                     )
                 else:
                     safe_space = static_safe_space
@@ -1458,6 +2068,11 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                     safe_space,
                     collision_margin=args.collision_margin,
                 )
+                real_collision_result = real_robot_obstacle_collision(
+                    env,
+                    robot_geom_ids=geom_ids_array,
+                    target_geom_name_patterns=getattr(args, "obb_target_geom_name_patterns", None),
+                )
 
                 pred_samples.append(pred)
                 target_samples.append(target_future)
@@ -1465,6 +2080,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                 prefix_shapes.append(tuple(np.asarray(prefix_tokens).shape))
                 metrics.append(compute_point_error_metrics(pred, target_future))
                 collision_results.append(collision_result)
+                real_collision_results.append(real_collision_result)
                 rollout_ids.append(rollout_id)
                 step_ids.append(step_id)
 
@@ -1474,11 +2090,16 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                     if collision_result["collision"]
                     else " collision=NO"
                 )
+                real_collision_text = (
+                    f" real_collision=YES contacts={real_collision_result['contact_count']}"
+                    if real_collision_result["collision"]
+                    else " real_collision=NO"
+                )
                 print(
                     f"[eval] sample={len(pred_samples)}/{args.max_samples} "
                     f"rollout={rollout_id} step={step_id} "
                     f"mean_l2={latest['mean_l2']:.6f} max_l2={latest['max_l2']:.6f}"
-                    f"{collision_text}"
+                    f"{collision_text}{real_collision_text}"
                 )
 
                 append_prediction_video_frame(
@@ -1488,6 +2109,7 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                     pred_link_points=pred,
                     obb_corners=obb_corners,
                     collision_result=collision_result if safe_space is not None else None,
+                    real_collision_result=real_collision_result,
                     camera_name=args.video_camera,
                     width=args.video_width,
                     height=args.video_height,
@@ -1496,50 +2118,127 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
                     step_id=step_id,
                     sample_id=len(pred_samples),
                 )
-                control_action = np.asarray(control_action_chunk[control_action_offset], dtype=np.float64)
+                control_action = np.asarray(control_action_chunk[control_action_offset], dtype=np.float64).copy()
                 action_dim = int(getattr(env, "action_dim", control_action.size))
-                executed_action = control_action
+                executed_action = control_action.copy()
                 cbf_info: dict[str, object] = {
                     "triggered": False,
                     "constraint_count": 0,
                     "success": True,
                     "max_violation": 0.0,
+                    "corrected_action_indices": [],
                 }
                 if getattr(args, "enable_cbf_qp", False):
-                    executed_action, cbf_info = filter_action_with_pointflow_cbf_qp(
-                        env=env,
-                        dataset_builder=dataset_builder,
-                        qpos_indices=qpos_indices,
-                        geom_ids=geom_ids_array,
-                        low=low,
-                        high=high,
-                        nominal_action=control_action,
-                        current_link_points=current_link_points,
-                        pred_link_points=pred,
-                        safe_space=safe_space,
-                        points_per_link=int(current_link_points.shape[1]),
-                        samples_per_action=args.samples_per_action,
-                        skeleton_source=args.skeleton_source,
-                        collision_margin=args.collision_margin,
-                        trigger_margin=getattr(args, "cbf_trigger_margin", 0.02),
-                        alpha=getattr(args, "cbf_alpha", 1.0),
-                        max_constraints=getattr(args, "cbf_max_constraints", 32),
-                        finite_difference_eps=getattr(args, "cbf_finite_difference_eps", 1e-4),
-                        projection_iterations=getattr(args, "cbf_projection_iterations", 12),
-                        action_lower=getattr(args, "cbf_action_lower", None),
-                        action_upper=getattr(args, "cbf_action_upper", None),
-                        fallback=getattr(args, "cbf_fallback", "zero"),
-                        trigger_source=getattr(args, "cbf_trigger_source", "predicted_point_flow"),
-                    )
+                    cbf_trigger_source = getattr(args, "cbf_trigger_source", "predicted_point_flow")
+                    cbf_correction_target = getattr(args, "cbf_correction_target", "predicted_frame_action")
+                    if cbf_correction_target == "predicted_frame_action" and cbf_trigger_source == "predicted_point_flow":
+                        chunk_constraints = predicted_frame_action_cbf_constraints(
+                            pred,
+                            current_link_points,
+                            safe_space,
+                            collision_margin=args.collision_margin,
+                            trigger_margin=getattr(args, "cbf_trigger_margin", 0.02),
+                            max_constraints=getattr(args, "cbf_max_constraints", 32),
+                            include_current_points=getattr(args, "cbf_include_current_points", False),
+                        )
+
+                        def correct_chunk_action(action_index: int, nominal_chunk_action: np.ndarray, selected_constraints):
+                            safe_action, action_info = filter_action_with_pointflow_cbf_qp(
+                                env=env,
+                                dataset_builder=dataset_builder,
+                                qpos_indices=qpos_indices,
+                                geom_ids=geom_ids_array,
+                                low=low,
+                                high=high,
+                                nominal_action=nominal_chunk_action,
+                                action_dim=action_dim,
+                                current_link_points=current_link_points,
+                                pred_link_points=pred,
+                                safe_space=safe_space,
+                                points_per_link=int(current_link_points.shape[1]),
+                                samples_per_action=args.samples_per_action,
+                                skeleton_source=args.skeleton_source,
+                                collision_margin=args.collision_margin,
+                                trigger_margin=getattr(args, "cbf_trigger_margin", 0.02),
+                                alpha=getattr(args, "cbf_alpha", 1.0),
+                                max_constraints=len(selected_constraints),
+                                finite_difference_eps=getattr(args, "cbf_finite_difference_eps", 1e-4),
+                                projection_iterations=getattr(args, "cbf_projection_iterations", 12),
+                                action_lower=getattr(args, "cbf_action_lower", None),
+                                action_upper=getattr(args, "cbf_action_upper", None),
+                                fallback=getattr(args, "cbf_fallback", "zero"),
+                                trigger_source=cbf_trigger_source,
+                                action_space=getattr(args, "cbf_action_space", "auto"),
+                                cartesian_damping=getattr(args, "cbf_cartesian_damping", 1e-4),
+                                precomputed_constraints=list(selected_constraints),
+                                include_current_points=getattr(args, "cbf_include_current_points", False),
+                            )
+                            safe_action = np.asarray(safe_action, dtype=np.float64).reshape(-1)
+                            nominal_chunk_action = np.asarray(nominal_chunk_action, dtype=np.float64).reshape(-1)
+                            if safe_action.shape != nominal_chunk_action.shape:
+                                if int(action_dim) == 4 and safe_action.size == 4 and nominal_chunk_action.size > 4:
+                                    patched = nominal_chunk_action.copy()
+                                    patched[:3] = safe_action[:3]
+                                    patched[-1] = safe_action[-1]
+                                    safe_action = patched
+                                else:
+                                    raise ValueError(
+                                        "CBF-corrected action shape does not match chunk row shape: "
+                                        f"safe={safe_action.shape}, chunk={nominal_chunk_action.shape}"
+                                    )
+                            return safe_action, action_info
+
+                        control_action_chunk, cbf_info = apply_frame_indexed_cbf_corrections(
+                            control_action_chunk,
+                            chunk_constraints,
+                            current_action_offset=control_action_offset,
+                            correct_action_fn=correct_chunk_action,
+                        )
+                        executed_action = np.asarray(control_action_chunk[control_action_offset], dtype=np.float64).copy()
+                    else:
+                        executed_action, cbf_info = filter_action_with_pointflow_cbf_qp(
+                            env=env,
+                            dataset_builder=dataset_builder,
+                            qpos_indices=qpos_indices,
+                            geom_ids=geom_ids_array,
+                            low=low,
+                            high=high,
+                            nominal_action=control_action,
+                            action_dim=action_dim,
+                            current_link_points=current_link_points,
+                            pred_link_points=pred,
+                            safe_space=safe_space,
+                            points_per_link=int(current_link_points.shape[1]),
+                            samples_per_action=args.samples_per_action,
+                            skeleton_source=args.skeleton_source,
+                            collision_margin=args.collision_margin,
+                            trigger_margin=getattr(args, "cbf_trigger_margin", 0.02),
+                            alpha=getattr(args, "cbf_alpha", 1.0),
+                            max_constraints=getattr(args, "cbf_max_constraints", 32),
+                            finite_difference_eps=getattr(args, "cbf_finite_difference_eps", 1e-4),
+                            projection_iterations=getattr(args, "cbf_projection_iterations", 12),
+                            action_lower=getattr(args, "cbf_action_lower", None),
+                            action_upper=getattr(args, "cbf_action_upper", None),
+                            fallback=getattr(args, "cbf_fallback", "zero"),
+                            trigger_source=cbf_trigger_source,
+                            action_space=getattr(args, "cbf_action_space", "auto"),
+                            cartesian_damping=getattr(args, "cbf_cartesian_damping", 1e-4),
+                            include_current_points=getattr(args, "cbf_include_current_points", False),
+                        )
                     if bool(cbf_info.get("triggered", False)):
                         print(
                             f"[cbf] constraints={int(cbf_info.get('constraint_count', 0))} "
                             f"success={bool(cbf_info.get('success', True))} "
-                            f"max_violation={float(cbf_info.get('max_violation', 0.0)):.3e}"
+                            f"max_violation={float(cbf_info.get('max_violation', 0.0)):.3e} "
+                            f"action_space={cbf_info.get('action_space', 'unknown')} "
+                            f"corrected_actions={cbf_info.get('corrected_action_indices', [])}"
                         )
-                executed_actions.append(np.asarray(executed_action[:action_dim], dtype=np.float32))
+                nominal_executable_action = executable_libero_action(control_action, action_dim=action_dim)
+                executed_executable_action = executable_libero_action(executed_action, action_dim=action_dim)
+                nominal_actions.append(np.asarray(nominal_executable_action, dtype=np.float32))
+                executed_actions.append(np.asarray(executed_executable_action, dtype=np.float32))
                 cbf_infos.append(cbf_info)
-                obs, _reward, done, _info = env.step(executed_action[:action_dim].tolist())
+                obs, _reward, done, _info = env.step(executed_executable_action.tolist())
                 step_id += 1
                 control_action_offset += 1
                 control_replan_offset += 1
@@ -1555,7 +2254,12 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         "target_link_points": np.stack(target_samples).astype(np.float32),
         "prefix_tokens_shape": np.asarray(prefix_shapes, dtype=np.int64),
         "action_chunks": np.stack(action_chunks).astype(np.float32),
+        "nominal_actions": np.stack(nominal_actions).astype(np.float32),
         "executed_actions": np.stack(executed_actions).astype(np.float32),
+        "cbf_action_delta_norms": cbf_action_delta_norms(
+            np.stack(nominal_actions).astype(np.float32),
+            np.stack(executed_actions).astype(np.float32),
+        ),
         "metrics": stacked_metrics,
         "rollout_ids": np.asarray(rollout_ids, dtype=np.int64),
         "step_ids": np.asarray(step_ids, dtype=np.int64),
@@ -1569,6 +2273,11 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
             [item["collision_point_count"] for item in collision_results],
             dtype=np.int64,
         ),
+        "real_collision_flags": np.asarray([item["collision"] for item in real_collision_results], dtype=bool),
+        "real_collision_contact_counts": np.asarray(
+            [item["contact_count"] for item in real_collision_results],
+            dtype=np.int64,
+        ),
         "cbf_triggered": np.asarray([bool(item.get("triggered", False)) for item in cbf_infos], dtype=bool),
         "cbf_success": np.asarray([bool(item.get("success", True)) for item in cbf_infos], dtype=bool),
         "cbf_constraint_counts": np.asarray(
@@ -1578,6 +2287,10 @@ def evaluate_online(args: argparse.Namespace) -> dict[str, object]:
         "cbf_max_violations": np.asarray(
             [float(item.get("max_violation", 0.0)) for item in cbf_infos],
             dtype=np.float32,
+        ),
+        "cbf_corrected_action_masks": cbf_corrected_action_masks(
+            cbf_infos,
+            action_count=int(np.stack(action_chunks).shape[1]),
         ),
     }
     return result
@@ -1599,11 +2312,16 @@ def main() -> None:
         coordinate_frame=COORDINATE_FRAME,
         collision_flags=result["collision_flags"],
         collision_point_counts=result["collision_point_counts"],
+        real_collision_flags=result["real_collision_flags"],
+        real_collision_contact_counts=result["real_collision_contact_counts"],
+        nominal_actions=result["nominal_actions"],
         executed_actions=result["executed_actions"],
+        cbf_action_delta_norms=result["cbf_action_delta_norms"],
         cbf_triggered=result["cbf_triggered"],
         cbf_success=result["cbf_success"],
         cbf_constraint_counts=result["cbf_constraint_counts"],
         cbf_max_violations=result["cbf_max_violations"],
+        cbf_corrected_action_masks=result["cbf_corrected_action_masks"],
     )
     if not args.no_video:
         swept = load_repo_script_module("libero_joint_swept_pointcloud")

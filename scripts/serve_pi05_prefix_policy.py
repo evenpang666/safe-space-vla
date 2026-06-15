@@ -26,6 +26,26 @@ for path in (OPENPI_SRC, OPENPI_CLIENT_SRC, REPO_ROOT):
 DEFAULT_CHECKPOINT = "gs://openpi-assets/checkpoints/pi05_libero"
 
 
+def _is_missing_jaxlib_error(exc: BaseException) -> bool:
+    cursor: BaseException | None = exc
+    while cursor is not None:
+        message = str(cursor).lower()
+        if "jaxlib" in message and ("no module named" in message or "requires jaxlib" in message):
+            return True
+        cursor = cursor.__cause__ or cursor.__context__
+    return False
+
+
+def _raise_openpi_dependency_error(exc: BaseException) -> None:
+    raise RuntimeError(
+        "OpenPI policy loading failed because jaxlib is missing. "
+        "This server must run in an OpenPI runtime with Python >=3.11 and JAX/JAXLIB installed "
+        "(see openpi/pyproject.toml). From the repository root, start it with: "
+        "uv run --project openpi scripts/serve_pi05_prefix_policy.py --policy-config pi05_libero "
+        "--checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero --port 8000"
+    ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy-config", default="pi05_libero")
@@ -59,9 +79,14 @@ def resolve_torch_device(device: str | None):
 
 
 def extract_prefix_tokens(policy, obs: dict) -> np.ndarray:
-    import jax
-    import jax.numpy as jnp
-    from openpi.models import model as _model
+    try:
+        import jax
+        import jax.numpy as jnp
+        from openpi.models import model as _model
+    except ModuleNotFoundError as exc:
+        if _is_missing_jaxlib_error(exc):
+            _raise_openpi_dependency_error(exc)
+        raise
 
     inputs = jax.tree.map(lambda x: x, obs)
     inputs = policy._input_transform(inputs)
@@ -239,8 +264,13 @@ def load_safety_predictor(path: Path, *, device_name: str | None, prediction_ste
 
 
 def create_policy(args: argparse.Namespace):
-    from openpi.policies import policy_config as _policy_config
-    from openpi.training import config as _config
+    try:
+        from openpi.policies import policy_config as _policy_config
+        from openpi.training import config as _config
+    except ModuleNotFoundError as exc:
+        if _is_missing_jaxlib_error(exc):
+            _raise_openpi_dependency_error(exc)
+        raise
 
     base_policy = _policy_config.create_trained_policy(
         _config.get_config(args.policy_config),

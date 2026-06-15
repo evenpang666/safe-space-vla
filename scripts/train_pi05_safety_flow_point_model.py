@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,13 @@ DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "pi05_safety_decoder" / "pi05_libero_ta
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        nargs="+",
+        default=[DEFAULT_DATASET],
+        help="Input dataset .npz file(s), or directory/directories containing .npz shards.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-encoder-layers", type=int, default=4)
@@ -58,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Update loss PNG every N epochs. Use 0 to disable PNG updates while still writing CSV.",
     )
-    parser.add_argument("--device", default="cpu", help="Use cpu by default; set cuda only with a compatible PyTorch build.")
+    parser.add_argument("--device", default="cuda", help="Use cpu by default; set cuda only with a compatible PyTorch build.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--prefix-ablation",
@@ -69,12 +76,73 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_dataset_tensors(path: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+DatasetInput = os.PathLike[str] | str | Sequence[os.PathLike[str] | str]
+
+
+def _coerce_dataset_inputs(dataset: DatasetInput) -> list[Path]:
+    if isinstance(dataset, (str, os.PathLike)):
+        paths = [Path(dataset)]
+    else:
+        paths = [Path(path) for path in dataset]
+    if not paths:
+        raise ValueError("at least one dataset path is required")
+    return paths
+
+
+def resolve_dataset_paths(dataset: DatasetInput) -> list[Path]:
+    paths: list[Path] = []
+    for path in _coerce_dataset_inputs(dataset):
+        if path.is_dir():
+            shard_paths = sorted(path.glob("*.npz"))
+            if not shard_paths:
+                raise FileNotFoundError(f"dataset directory contains no .npz files: {path}")
+            paths.extend(shard_paths)
+        else:
+            paths.append(path)
+    if not paths:
+        raise ValueError("at least one dataset path is required")
+    return paths
+
+
+def _load_dataset_tensors_file(path: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with np.load(path, allow_pickle=False) as data:
         prefix_tokens = torch.as_tensor(np.asarray(data["prefix_tokens"], dtype=np.float32))
         arm_points = torch.as_tensor(np.asarray(data["arm_points"], dtype=np.float32))
         target_point_offsets = torch.as_tensor(np.asarray(data["target_point_offsets"], dtype=np.float32))
 
+    validate_dataset_tensors(prefix_tokens, arm_points, target_point_offsets)
+    return prefix_tokens, arm_points, target_point_offsets
+
+
+def load_dataset_tensors(dataset: DatasetInput) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    paths = resolve_dataset_paths(dataset)
+    loaded = [_load_dataset_tensors_file(path) for path in paths]
+    if len(loaded) == 1:
+        return loaded[0]
+
+    reference_prefix_shape = tuple(loaded[0][0].shape[1:])
+    reference_arm_shape = tuple(loaded[0][1].shape[1:])
+    reference_offset_shape = tuple(loaded[0][2].shape[1:])
+    for path, (prefix_tokens, arm_points, target_point_offsets) in zip(paths[1:], loaded[1:], strict=True):
+        if tuple(prefix_tokens.shape[1:]) != reference_prefix_shape:
+            raise ValueError(
+                f"{path} prefix_tokens non-sample dimensions {tuple(prefix_tokens.shape[1:])} "
+                f"do not match {reference_prefix_shape}"
+            )
+        if tuple(arm_points.shape[1:]) != reference_arm_shape:
+            raise ValueError(
+                f"{path} arm_points non-sample dimensions {tuple(arm_points.shape[1:])} "
+                f"do not match {reference_arm_shape}"
+            )
+        if tuple(target_point_offsets.shape[1:]) != reference_offset_shape:
+            raise ValueError(
+                f"{path} target_point_offsets non-sample dimensions {tuple(target_point_offsets.shape[1:])} "
+                f"do not match {reference_offset_shape}"
+            )
+
+    prefix_tokens = torch.cat([prefix for prefix, _arm_points, _offsets in loaded], dim=0)
+    arm_points = torch.cat([points for _prefix, points, _offsets in loaded], dim=0)
+    target_point_offsets = torch.cat([offsets for _prefix, _points, offsets in loaded], dim=0)
     validate_dataset_tensors(prefix_tokens, arm_points, target_point_offsets)
     return prefix_tokens, arm_points, target_point_offsets
 

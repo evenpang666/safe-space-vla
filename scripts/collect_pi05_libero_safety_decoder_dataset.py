@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import gc
 import importlib.util
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -42,6 +44,35 @@ DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "pi05_safety_decoder" / "pi05_libero_de
 DEFAULT_CHECKPOINT = "gs://openpi-assets/checkpoints/pi05_libero"
 COORDINATE_FRAME = "mujoco_world"
 OFFSET_FRAME = "mujoco_world_delta"
+DATASET_SAMPLE_KEYS = (
+    "prefix_tokens",
+    "action_chunks",
+    "start_joint_vectors",
+    "target_link_points",
+    "current_link_points",
+    "future_link_offsets",
+    "arm_points",
+    "target_point_offsets",
+    "task_ids",
+    "rollout_ids",
+    "step_ids",
+)
+DATASET_REQUIRED_METADATA_KEYS = (
+    "link_names",
+    "coordinate_frame",
+    "target_link_points_frame",
+    "current_link_points_frame",
+    "future_link_offsets_frame",
+    "arm_points_frame",
+    "target_point_offsets_frame",
+    "task_suite",
+    "points_per_link",
+    "samples_per_action",
+    "skeleton_source",
+    "target_source",
+    "policy_config",
+    "checkpoint_dir",
+)
 TASK_SUITE_MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object": 280,
@@ -512,7 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-samples-per-task",
         type=int,
-        default=512,
+        default=None,
         help="Maximum replan samples to collect for each task. Defaults to --max-samples.",
     )
     parser.add_argument("--max-steps", type=int, default=None, help="Rollout step cap after settling.")
@@ -523,6 +554,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--points-per-link", type=int, default=128)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--per-task-output-dir",
+        type=Path,
+        default=None,
+        help="Directory for per-task .npz shards. Defaults to <output stem>_tasks next to --output.",
+    )
+    parser.add_argument(
+        "--overwrite-task-shards",
+        action="store_true",
+        help="Recollect tasks even when their per-task shard already exists.",
+    )
+    parser.add_argument(
+        "--merge-task-shards-only",
+        action="store_true",
+        help="Do not collect rollouts; only merge existing per-task shards into --output.",
+    )
+    parser.add_argument(
+        "--merge-after-collection",
+        action="store_true",
+        help="Also merge task shards into --output after collection. By default this script only collects shards.",
+    )
+    parser.add_argument(
+        "--isolate-task-processes",
+        dest="isolate_task_processes",
+        action="store_true",
+        default=True,
+        help=(
+            "Run each task in a short-lived subprocess when collecting multiple tasks. "
+            "This releases MuJoCo/JAX/NumPy native memory between tasks."
+        ),
+    )
+    parser.add_argument(
+        "--no-isolate-task-processes",
+        dest="isolate_task_processes",
+        action="store_false",
+        help="Collect all tasks in the current process. Lower overhead but can retain native memory between tasks.",
+    )
+    parser.add_argument("--task-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--skip-final-merge", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mujoco-gl", choices=["egl", "osmesa", "glfw"], default="egl")
     parser.add_argument("--pytorch-device", default=None, help="Device for PyTorch OpenPI checkpoints.")
     parser.add_argument(
@@ -531,6 +601,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional websocket policy server host. If set, actions and prefix_tokens are read from the server.",
     )
     parser.add_argument("--policy-server-port", type=int, default=8000)
+    parser.add_argument(
+        "--scene-obstacle",
+        choices=["none", "wine_bottle"],
+        default="none",
+        help="Optionally insert a physical obstacle into the LIBERO scene before collection.",
+    )
+    parser.add_argument(
+        "--scene-obstacle-xy",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("X", "Y"),
+        help="Optional x y placement for --scene-obstacle. Defaults to the table center.",
+    )
     return parser.parse_args()
 
 
@@ -564,6 +648,29 @@ def load_repo_script_module(module_name: str):
     sys.modules[qualified_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _is_missing_jaxlib_error(exc: BaseException) -> bool:
+    cursor: BaseException | None = exc
+    while cursor is not None:
+        message = str(cursor).lower()
+        if "jaxlib" in message and ("no module named" in message or "requires jaxlib" in message):
+            return True
+        cursor = cursor.__cause__ or cursor.__context__
+    return False
+
+
+def _raise_openpi_local_policy_dependency_error(exc: BaseException) -> None:
+    raise RuntimeError(
+        "OpenPI local policy loading failed because jaxlib is missing. "
+        "The local OpenPI policy runtime requires the OpenPI environment with Python >=3.11 and JAX/JAXLIB "
+        "(see openpi/pyproject.toml). The LIBERO example environment is Python 3.8 and is not a good place "
+        "to load the OpenPI policy in-process. Start the PI05 prefix policy server from an OpenPI environment, "
+        "then run this collector with --policy-server-host 127.0.0.1 --policy-server-port 8000. "
+        "Example server command from the repository root: "
+        "uv run --project openpi scripts/serve_pi05_prefix_policy.py --policy-config pi05_libero "
+        "--checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero --port 8000"
+    ) from exc
 
 
 def quat2axisangle(quat: np.ndarray) -> np.ndarray:
@@ -615,8 +722,13 @@ def load_openpi_policy(
     pytorch_device: str | None,
 ):
     ensure_third_party_paths()
-    from openpi.policies import policy_config as _policy_config
-    from openpi.training import config as _config
+    try:
+        from openpi.policies import policy_config as _policy_config
+        from openpi.training import config as _config
+    except ModuleNotFoundError as exc:
+        if _is_missing_jaxlib_error(exc):
+            _raise_openpi_local_policy_dependency_error(exc)
+        raise
 
     return _policy_config.create_trained_policy(
         _config.get_config(policy_config),
@@ -636,9 +748,14 @@ def load_remote_policy(*, host: str, port: int):
 def extract_policy_prefix_tokens(policy, element: dict) -> np.ndarray:
     """Run only the PI05 prefix encoder and return one sample of prefix embeddings."""
     ensure_third_party_paths()
-    import jax
-    import jax.numpy as jnp
-    from openpi.models import model as _model
+    try:
+        import jax
+        import jax.numpy as jnp
+        from openpi.models import model as _model
+    except ModuleNotFoundError as exc:
+        if _is_missing_jaxlib_error(exc):
+            _raise_openpi_local_policy_dependency_error(exc)
+        raise
 
     inputs = jax.tree.map(lambda x: x, element)
     inputs = policy._input_transform(inputs)
@@ -933,6 +1050,93 @@ def save_collected_dataset(
     )
 
 
+def resolve_task_shard_dir(*, output: Path, per_task_output_dir: Path | None) -> Path:
+    if per_task_output_dir is not None:
+        return Path(per_task_output_dir)
+    return Path(output).parent / f"{Path(output).stem}_tasks"
+
+
+def task_shard_output_path(*, shard_dir: Path, task_suite: str, task_id: int) -> Path:
+    return Path(shard_dir) / f"{task_suite}_task{int(task_id):03d}.npz"
+
+
+def task_shard_paths(*, shard_dir: Path, task_suite: str, task_ids: list[int]) -> list[Path]:
+    return [task_shard_output_path(shard_dir=shard_dir, task_suite=task_suite, task_id=task_id) for task_id in task_ids]
+
+
+def is_valid_dataset_shard(path: Path) -> bool:
+    if not Path(path).exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            for key in DATASET_SAMPLE_KEYS + DATASET_REQUIRED_METADATA_KEYS:
+                if key not in data:
+                    return False
+            return int(np.asarray(data["prefix_tokens"]).shape[0]) > 0
+    except Exception:
+        return False
+
+
+def collectable_task_ids(
+    task_ids: list[int],
+    *,
+    shard_dir: Path,
+    task_suite: str,
+    overwrite_task_shards: bool,
+) -> list[int]:
+    if overwrite_task_shards:
+        return list(task_ids)
+    return [
+        int(task_id)
+        for task_id in task_ids
+        if not is_valid_dataset_shard(task_shard_output_path(shard_dir=shard_dir, task_suite=task_suite, task_id=task_id))
+    ]
+
+
+def _metadata_value_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    left_arr = np.asarray(left)
+    right_arr = np.asarray(right)
+    if left_arr.shape != right_arr.shape:
+        return False
+    return bool(np.array_equal(left_arr, right_arr))
+
+
+def merge_dataset_shards(output: Path, shard_paths: list[Path]) -> int:
+    if not shard_paths:
+        raise ValueError("No task shards were provided for merging")
+
+    missing = [str(path) for path in shard_paths if not Path(path).exists()]
+    if missing:
+        raise FileNotFoundError(f"Cannot merge missing task shard(s): {', '.join(missing)}")
+
+    payload: dict[str, np.ndarray] = {}
+    metadata: dict[str, np.ndarray] = {}
+    arrays_by_key: dict[str, list[np.ndarray]] = {key: [] for key in DATASET_SAMPLE_KEYS}
+
+    for shard_path in shard_paths:
+        with np.load(shard_path, allow_pickle=False) as data:
+            for key in DATASET_SAMPLE_KEYS:
+                if key not in data:
+                    raise KeyError(f"{shard_path} is missing dataset array {key!r}")
+                arrays_by_key[key].append(np.asarray(data[key]))
+
+            for key in DATASET_REQUIRED_METADATA_KEYS:
+                if key not in data:
+                    raise KeyError(f"{shard_path} is missing dataset metadata {key!r}")
+                value = np.asarray(data[key])
+                if key in metadata and not _metadata_value_equal(metadata[key], value):
+                    raise ValueError(f"Task shard metadata mismatch for {key!r} in {shard_path}")
+                metadata.setdefault(key, value)
+
+    for key, arrays in arrays_by_key.items():
+        payload[key] = np.concatenate(arrays, axis=0)
+    payload.update(metadata)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output, **payload)
+    return int(payload["prefix_tokens"].shape[0])
+
+
 def compute_fk_target_preserving_sim_state(env, target_builder: Callable[[], tuple[np.ndarray, np.ndarray]]):
     qpos = np.asarray(env.sim.data.qpos).copy()
     qvel = np.asarray(env.sim.data.qvel).copy()
@@ -1113,6 +1317,81 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--replan-steps must be > 0")
     if args.points_per_link < 2:
         raise ValueError("--points-per-link must be >= 2")
+    if args.scene_obstacle == "none" and args.scene_obstacle_xy is not None:
+        raise ValueError("--scene-obstacle-xy requires --scene-obstacle wine_bottle")
+
+
+def should_isolate_task_processes(args: argparse.Namespace, task_ids_to_collect: list[int]) -> bool:
+    return (
+        bool(getattr(args, "isolate_task_processes", False))
+        and not bool(getattr(args, "task_worker", False))
+        and not bool(getattr(args, "merge_task_shards_only", False))
+        and len(task_ids_to_collect) > 1
+    )
+
+
+def _append_arg(command: list[str], name: str, value: object | None) -> None:
+    if value is not None:
+        command.extend([name, str(value)])
+
+
+def build_task_worker_command(args: argparse.Namespace, *, task_id: int) -> list[str]:
+    script_path = Path(__file__).resolve()
+    command = [sys.executable, str(script_path)]
+    _append_arg(command, "--policy-config", args.policy_config)
+    _append_arg(command, "--checkpoint-dir", args.checkpoint_dir)
+    _append_arg(command, "--task-suite", args.task_suite)
+    _append_arg(command, "--task-id", int(task_id))
+    _append_arg(command, "--num-rollouts", args.num_rollouts)
+    _append_arg(command, "--max-samples", args.max_samples)
+    _append_arg(command, "--max-samples-per-task", args.max_samples_per_task)
+    _append_arg(command, "--max-steps", args.max_steps)
+    _append_arg(command, "--num-steps-wait", args.num_steps_wait)
+    _append_arg(command, "--replan-steps", args.replan_steps)
+    _append_arg(command, "--resize-size", args.resize_size)
+    _append_arg(command, "--env-resolution", args.env_resolution)
+    _append_arg(command, "--points-per-link", args.points_per_link)
+    _append_arg(command, "--seed", args.seed)
+    _append_arg(command, "--output", args.output)
+    _append_arg(command, "--per-task-output-dir", args.per_task_output_dir)
+    _append_arg(command, "--mujoco-gl", args.mujoco_gl)
+    _append_arg(command, "--pytorch-device", args.pytorch_device)
+    _append_arg(command, "--policy-server-host", args.policy_server_host)
+    _append_arg(command, "--policy-server-port", args.policy_server_port)
+    _append_arg(command, "--scene-obstacle", args.scene_obstacle)
+    if args.scene_obstacle_xy is not None:
+        command.extend(["--scene-obstacle-xy", str(args.scene_obstacle_xy[0]), str(args.scene_obstacle_xy[1])])
+    if args.overwrite_task_shards:
+        command.append("--overwrite-task-shards")
+    command.extend(["--task-worker", "--skip-final-merge", "--no-isolate-task-processes"])
+    return command
+
+
+def run_task_worker_subprocesses(args: argparse.Namespace, task_ids_to_collect: list[int]) -> None:
+    for task_id in task_ids_to_collect:
+        command = build_task_worker_command(args, task_id=task_id)
+        print(f"[worker] collecting task_id={task_id} in isolated subprocess")
+        subprocess.run(command, check=True)
+
+
+def cleanup_task_resources(env=None) -> None:
+    if env is not None:
+        try:
+            env.close()
+        except Exception as exc:
+            print(f"[warn] env.close() failed during cleanup: {exc}")
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        cuda = getattr(torch_module, "cuda", None)
+        if cuda is not None and getattr(cuda, "is_available", lambda: False)():
+            empty_cache = getattr(cuda, "empty_cache", None)
+            if empty_cache is not None:
+                empty_cache()
+    jax_module = sys.modules.get("jax")
+    clear_caches = getattr(jax_module, "clear_caches", None) if jax_module is not None else None
+    if clear_caches is not None:
+        clear_caches()
+    gc.collect()
 
 
 def main() -> None:
@@ -1122,12 +1401,6 @@ def main() -> None:
     if args.mujoco_gl is not None:
         os.environ["MUJOCO_GL"] = args.mujoco_gl
 
-    dataset_builder = load_repo_script_module("build_pi05_safety_decoder_dataset")
-
-    swept = dataset_builder.import_script_module("libero_joint_swept_pointcloud")
-    libero_pc = dataset_builder.import_script_module("libero_reconstruct_pointcloud")
-    swept.load_runtime_dependencies()
-
     np.random.seed(args.seed)
     task_suite = create_libero_task_suite(args.task_suite)
     task_ids = resolve_task_ids(task_id=args.task_id, task_ids=args.task_ids, n_tasks=task_suite.n_tasks)
@@ -1136,25 +1409,77 @@ def main() -> None:
         max_samples_per_task=args.max_samples_per_task,
     )
     max_steps = args.max_steps if args.max_steps is not None else default_max_steps(args.task_suite)
-    remote_prefix_tokens = args.policy_server_host is not None
-    if remote_prefix_tokens:
-        policy = load_remote_policy(host=args.policy_server_host, port=args.policy_server_port)
-    else:
-        policy = load_openpi_policy(
-            policy_config=args.policy_config,
-            checkpoint_dir=args.checkpoint_dir,
-            default_prompt=None,
-            pytorch_device=args.pytorch_device,
-        )
+    shard_dir = resolve_task_shard_dir(output=args.output, per_task_output_dir=args.per_task_output_dir)
+    shard_paths = task_shard_paths(shard_dir=shard_dir, task_suite=args.task_suite, task_ids=task_ids)
 
-    buffer = CollectedSampleBuffer()
-    link_names = np.asarray([])
-    for task_id in task_ids:
-        task_start_sample_count = len(buffer)
-        task_sample_limit = task_start_sample_count + max_samples_per_task
+    if args.merge_task_shards_only:
+        merged_count = merge_dataset_shards(args.output, shard_paths)
+        print(f"[done] merged {merged_count} samples from {len(shard_paths)} task shards to {args.output}")
+        return
+
+    task_ids_to_collect = collectable_task_ids(
+        task_ids,
+        shard_dir=shard_dir,
+        task_suite=args.task_suite,
+        overwrite_task_shards=args.overwrite_task_shards,
+    )
+    task_ids_to_collect_set = set(task_ids_to_collect)
+    for skipped_task_id in [task_id for task_id in task_ids if task_id not in task_ids_to_collect_set]:
+        shard_path = task_shard_output_path(shard_dir=shard_dir, task_suite=args.task_suite, task_id=skipped_task_id)
+        print(f"[resume] skipping existing task shard task_id={skipped_task_id}: {shard_path}")
+
+    if should_isolate_task_processes(args, task_ids_to_collect):
+        run_task_worker_subprocesses(args, task_ids_to_collect)
+        if args.merge_after_collection:
+            merged_count = merge_dataset_shards(args.output, shard_paths)
+            print(f"[done] merged {merged_count} samples from {len(shard_paths)} task shards to {args.output}")
+        else:
+            print(f"[done] collected {len(task_ids_to_collect)} task shard(s) in {shard_dir}")
+        return
+
+    obstacle_xy = (
+        (float(args.scene_obstacle_xy[0]), float(args.scene_obstacle_xy[1]))
+        if args.scene_obstacle_xy is not None
+        else None
+    )
+    scene_obstacle = SceneObstacleSpec(kind=args.scene_obstacle, xy=obstacle_xy)
+
+    dataset_builder = None
+    swept = None
+    libero_pc = None
+    policy = None
+    remote_prefix_tokens = args.policy_server_host is not None
+    if task_ids_to_collect:
+        dataset_builder = load_repo_script_module("build_pi05_safety_decoder_dataset")
+
+        swept = dataset_builder.import_script_module("libero_joint_swept_pointcloud")
+        libero_pc = dataset_builder.import_script_module("libero_reconstruct_pointcloud")
+        swept.load_runtime_dependencies()
+
+        if remote_prefix_tokens:
+            policy = load_remote_policy(host=args.policy_server_host, port=args.policy_server_port)
+        else:
+            policy = load_openpi_policy(
+                policy_config=args.policy_config,
+                checkpoint_dir=args.checkpoint_dir,
+                default_prompt=None,
+                pytorch_device=args.pytorch_device,
+            )
+
+    for task_id in task_ids_to_collect:
+        if dataset_builder is None or swept is None or libero_pc is None or policy is None:
+            raise RuntimeError("collector dependencies were not initialized")
+        task_buffer = CollectedSampleBuffer()
+        task_sample_limit = max_samples_per_task
+        link_names = np.asarray([])
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
-        env, task_description = create_libero_env(task, resolution=args.env_resolution, seed=args.seed)
+        env, task_description = create_libero_env(
+            task,
+            resolution=args.env_resolution,
+            seed=args.seed,
+            scene_obstacle=scene_obstacle,
+        )
         print(
             f"[task] collecting task_id={task_id} "
             f"target_samples={max_samples_per_task} prompt={task_description!r}"
@@ -1181,7 +1506,7 @@ def main() -> None:
                 )
 
             for rollout_id in range(args.num_rollouts):
-                if len(buffer) >= task_sample_limit:
+                if len(task_buffer) >= task_sample_limit:
                     break
                 env.reset()
                 init_state = initial_states[rollout_id % len(initial_states)]
@@ -1223,7 +1548,7 @@ def main() -> None:
                         control_action_chunk = action_chunk
                         control_action_offset = 0
                         control_replan_offset = 0
-                    elif len(buffer) + len(rollout_records) < task_sample_limit:
+                    elif len(task_buffer) + len(rollout_records) < task_sample_limit:
                         action_chunk, prefix_tokens = query_policy_action_and_prefix(
                             policy,
                             element,
@@ -1234,7 +1559,7 @@ def main() -> None:
                         prefix_tokens = None
                     start_joint_vector = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float32)
 
-                    if prefix_tokens is not None and len(buffer) + len(rollout_records) < task_sample_limit:
+                    if prefix_tokens is not None and len(task_buffer) + len(rollout_records) < task_sample_limit:
                         rollout_records.append(
                             ReplanSampleRecord(
                                 prefix_tokens=prefix_tokens,
@@ -1260,29 +1585,36 @@ def main() -> None:
                 link_names = surface_link_names
                 if surface_frames:
                     append_surface_trajectory_samples(
-                        buffer,
+                        task_buffer,
                         records=rollout_records,
                         surface_frames=np.stack(surface_frames).astype(np.float32),
                         link_names=link_names,
                         max_samples=task_sample_limit,
                     )
-            print(f"[task] task_id={task_id} saved_samples={len(buffer) - task_start_sample_count}")
+            shard_path = task_shard_output_path(shard_dir=shard_dir, task_suite=args.task_suite, task_id=task_id)
+            save_collected_dataset(
+                shard_path,
+                buffer=task_buffer,
+                link_names=link_names,
+                task_suite=args.task_suite,
+                points_per_link=args.points_per_link,
+                samples_per_action=1,
+                policy_config=args.policy_config,
+                checkpoint_dir=args.checkpoint_dir,
+                skeleton_source="surface",
+                target_source="rollout_surface",
+            )
+            print(f"[task] task_id={task_id} saved_samples={len(task_buffer)} shard={shard_path}")
         finally:
-            env.close()
+            cleanup_task_resources(env)
 
-    save_collected_dataset(
-        args.output,
-        buffer=buffer,
-        link_names=link_names,
-        task_suite=args.task_suite,
-        points_per_link=args.points_per_link,
-        samples_per_action=1,
-        policy_config=args.policy_config,
-        checkpoint_dir=args.checkpoint_dir,
-        skeleton_source="surface",
-        target_source="rollout_surface",
-    )
-    print(f"[done] saved {len(buffer)} samples from {len(task_ids)} tasks to {args.output}")
+    if args.skip_final_merge or not args.merge_after_collection:
+        print(f"[done] saved {len(task_ids_to_collect)} task shard(s); final merge skipped")
+        cleanup_task_resources()
+        return
+    merged_count = merge_dataset_shards(args.output, shard_paths)
+    cleanup_task_resources()
+    print(f"[done] merged {merged_count} samples from {len(shard_paths)} task shards to {args.output}")
 
 
 if __name__ == "__main__":

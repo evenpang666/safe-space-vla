@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.train_pi05_safety_decoder import load_dataset_tensors, save_checkpoint, train_one_epoch
+from scripts.train_pi05_safety_decoder import load_dataset_tensors, resolve_dataset_paths, save_checkpoint, train_one_epoch
 from safety_module.point_decoder import SafetyPointDecoder, SafetyPointDecoderConfig
 
 
@@ -42,6 +42,62 @@ def test_load_dataset_tensors_reads_prefix_and_targets(tmp_path: Path):
     assert prefix.shape == (3, 4, 5)
     assert targets.shape == (3, 2, 6, 3, 3)
     assert prefix.dtype == torch.float32
+
+
+def test_load_dataset_tensors_concatenates_multiple_dataset_files(tmp_path: Path):
+    first = tmp_path / "task000.npz"
+    second = tmp_path / "task001.npz"
+    np.savez_compressed(
+        first,
+        prefix_tokens=np.full((2, 4, 5), 1.0, dtype=np.float32),
+        target_link_points=np.full((2, 2, 6, 3, 3), 10.0, dtype=np.float32),
+    )
+    np.savez_compressed(
+        second,
+        prefix_tokens=np.full((3, 4, 5), 2.0, dtype=np.float32),
+        target_link_points=np.full((3, 2, 6, 3, 3), 20.0, dtype=np.float32),
+    )
+
+    prefix, targets = load_dataset_tensors([first, second])
+
+    assert prefix.shape == (5, 4, 5)
+    assert targets.shape == (5, 2, 6, 3, 3)
+    assert torch.all(prefix[:2] == 1.0)
+    assert torch.all(prefix[2:] == 2.0)
+    assert torch.all(targets[:2] == 10.0)
+    assert torch.all(targets[2:] == 20.0)
+
+
+def test_resolve_dataset_paths_expands_directory_in_sorted_order(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    (shard_dir / "libero_spatial_task001.npz").write_bytes(b"")
+    (shard_dir / "libero_spatial_task000.npz").write_bytes(b"")
+
+    paths = resolve_dataset_paths([shard_dir])
+
+    assert paths == [
+        shard_dir / "libero_spatial_task000.npz",
+        shard_dir / "libero_spatial_task001.npz",
+    ]
+
+
+def test_load_dataset_tensors_rejects_multiple_datasets_with_mismatched_shapes(tmp_path: Path):
+    first = tmp_path / "task000.npz"
+    second = tmp_path / "task001.npz"
+    np.savez_compressed(
+        first,
+        prefix_tokens=np.zeros((2, 4, 5), dtype=np.float32),
+        target_link_points=np.zeros((2, 2, 6, 3, 3), dtype=np.float32),
+    )
+    np.savez_compressed(
+        second,
+        prefix_tokens=np.zeros((2, 5, 5), dtype=np.float32),
+        target_link_points=np.zeros((2, 2, 6, 3, 3), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="non-sample dimensions"):
+        load_dataset_tensors([first, second])
 
 
 def test_load_dataset_tensors_rejects_empty_samples(tmp_path: Path):

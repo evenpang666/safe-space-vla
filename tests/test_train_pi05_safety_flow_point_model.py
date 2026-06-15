@@ -16,6 +16,7 @@ from scripts.train_pi05_safety_flow_point_model import (
     save_loss_history,
     periodic_checkpoint_path,
     load_dataset_tensors,
+    resolve_dataset_paths,
     save_checkpoint,
     should_save_periodic_checkpoint,
     should_update_loss_plot,
@@ -57,6 +58,69 @@ def test_load_dataset_tensors_reads_flow_fields(tmp_path: Path):
     assert arm_points.shape == (3, 6, 3)
     assert offsets.shape == (3, 2, 6, 3)
     assert prefix.dtype == torch.float32
+
+
+def test_load_dataset_tensors_concatenates_multiple_flow_dataset_files(tmp_path: Path):
+    first = tmp_path / "task000.npz"
+    second = tmp_path / "task001.npz"
+    np.savez_compressed(
+        first,
+        prefix_tokens=np.full((2, 4, 5), 1.0, dtype=np.float32),
+        arm_points=np.full((2, 6, 3), 10.0, dtype=np.float32),
+        target_point_offsets=np.full((2, 2, 6, 3), 100.0, dtype=np.float32),
+    )
+    np.savez_compressed(
+        second,
+        prefix_tokens=np.full((3, 4, 5), 2.0, dtype=np.float32),
+        arm_points=np.full((3, 6, 3), 20.0, dtype=np.float32),
+        target_point_offsets=np.full((3, 2, 6, 3), 200.0, dtype=np.float32),
+    )
+
+    prefix, arm_points, offsets = load_dataset_tensors([first, second])
+
+    assert prefix.shape == (5, 4, 5)
+    assert arm_points.shape == (5, 6, 3)
+    assert offsets.shape == (5, 2, 6, 3)
+    assert torch.all(prefix[:2] == 1.0)
+    assert torch.all(prefix[2:] == 2.0)
+    assert torch.all(arm_points[:2] == 10.0)
+    assert torch.all(arm_points[2:] == 20.0)
+    assert torch.all(offsets[:2] == 100.0)
+    assert torch.all(offsets[2:] == 200.0)
+
+
+def test_resolve_dataset_paths_expands_flow_directory_in_sorted_order(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    (shard_dir / "libero_spatial_task001.npz").write_bytes(b"")
+    (shard_dir / "libero_spatial_task000.npz").write_bytes(b"")
+
+    paths = resolve_dataset_paths([shard_dir])
+
+    assert paths == [
+        shard_dir / "libero_spatial_task000.npz",
+        shard_dir / "libero_spatial_task001.npz",
+    ]
+
+
+def test_load_dataset_tensors_rejects_multiple_flow_datasets_with_mismatched_shapes(tmp_path: Path):
+    first = tmp_path / "task000.npz"
+    second = tmp_path / "task001.npz"
+    np.savez_compressed(
+        first,
+        prefix_tokens=np.zeros((2, 4, 5), dtype=np.float32),
+        arm_points=np.zeros((2, 6, 3), dtype=np.float32),
+        target_point_offsets=np.zeros((2, 2, 6, 3), dtype=np.float32),
+    )
+    np.savez_compressed(
+        second,
+        prefix_tokens=np.zeros((2, 4, 5), dtype=np.float32),
+        arm_points=np.zeros((2, 7, 3), dtype=np.float32),
+        target_point_offsets=np.zeros((2, 2, 7, 3), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="non-sample dimensions"):
+        load_dataset_tensors([first, second])
 
 
 def test_load_dataset_tensors_rejects_mismatched_point_count(tmp_path: Path):

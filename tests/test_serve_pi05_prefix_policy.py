@@ -1,6 +1,9 @@
+import argparse
+
 import numpy as np
 import torch
 
+from scripts import serve_pi05_prefix_policy as server
 from scripts.serve_pi05_prefix_policy import PrefixTokenPolicy, resolve_torch_device
 
 
@@ -64,3 +67,33 @@ def test_resolve_torch_device_auto_uses_cpu_when_cuda_unavailable(monkeypatch):
 
     assert resolve_torch_device("auto") == torch.device("cpu")
     assert resolve_torch_device("gpu") == torch.device("cuda")
+
+
+def test_create_policy_rewrites_missing_jaxlib_error(monkeypatch):
+    def fake_import(name, *args, **kwargs):
+        if name == "openpi.policies":
+            cause = ModuleNotFoundError("No module named 'jaxlib'")
+            raise ModuleNotFoundError("jax requires jaxlib to be installed") from cause
+        return original_import(name, *args, **kwargs)
+
+    original_import = __import__
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    args = argparse.Namespace(
+        policy_config="pi05_libero",
+        checkpoint_dir="gs://openpi-assets/checkpoints/pi05_libero",
+        default_prompt=None,
+        pytorch_device=None,
+        safety_checkpoint=None,
+        safety_device="auto",
+        safety_prediction_steps=10,
+    )
+    try:
+        server.create_policy(args)
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "jaxlib is missing" in message
+        assert "uv run --project openpi" in message
+        assert "Python >=3.11" in message
+    else:
+        raise AssertionError("missing jaxlib error was not rewritten")

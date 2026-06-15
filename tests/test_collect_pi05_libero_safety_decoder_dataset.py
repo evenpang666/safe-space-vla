@@ -8,14 +8,23 @@ from scripts.collect_pi05_libero_safety_decoder_dataset import (
     CollectedSampleBuffer,
     ReplanSampleRecord,
     append_surface_trajectory_samples,
+    build_task_worker_command,
     build_libero_policy_input,
+    collectable_task_ids,
     compute_fk_target_preserving_sim_state,
     compute_rollout_surface_target_preserving_sim_state,
     collect_rollout_surface_target,
+    is_valid_dataset_shard,
+    load_openpi_policy,
+    merge_dataset_shards,
     resolve_max_samples_per_task,
+    resolve_task_shard_dir,
     resolve_task_ids,
     robot_geom_ids_array,
+    run_task_worker_subprocesses,
     save_collected_dataset,
+    should_isolate_task_processes,
+    task_shard_output_path,
     surface_trajectory_target,
 )
 
@@ -28,6 +37,10 @@ def test_parse_args_defaults_to_dense_link_points(monkeypatch):
     assert args.points_per_link == 128
     assert args.task_ids is None
     assert args.max_samples_per_task is None
+    assert args.isolate_task_processes
+    assert not args.merge_after_collection
+    assert not args.task_worker
+    assert not args.skip_final_merge
     assert not hasattr(args, "skeleton_source")
     assert not hasattr(args, "target_source")
 
@@ -49,6 +62,149 @@ def test_parse_args_accepts_all_task_ids_and_per_task_limit(monkeypatch):
 
     assert args.task_ids == ["all"]
     assert args.max_samples_per_task == 32
+
+
+def test_parse_args_accepts_resume_and_merge_shard_options(monkeypatch, tmp_path: Path):
+    shard_dir = tmp_path / "task_shards"
+    monkeypatch.setattr(
+        collector.sys,
+        "argv",
+        [
+            "collect_pi05_libero_safety_decoder_dataset.py",
+            "--per-task-output-dir",
+            str(shard_dir),
+            "--overwrite-task-shards",
+            "--merge-task-shards-only",
+            "--merge-after-collection",
+        ],
+    )
+
+    args = collector.parse_args()
+
+    assert args.per_task_output_dir == shard_dir
+    assert args.overwrite_task_shards
+    assert args.merge_task_shards_only
+    assert args.merge_after_collection
+
+
+def test_parse_args_accepts_disabling_task_process_isolation(monkeypatch):
+    monkeypatch.setattr(
+        collector.sys,
+        "argv",
+        [
+            "collect_pi05_libero_safety_decoder_dataset.py",
+            "--no-isolate-task-processes",
+        ],
+    )
+
+    args = collector.parse_args()
+
+    assert not args.isolate_task_processes
+
+
+def test_should_isolate_task_processes_only_for_parent_multi_task_collection(monkeypatch):
+    monkeypatch.setattr(collector.sys, "argv", ["collect_pi05_libero_safety_decoder_dataset.py"])
+    args = collector.parse_args()
+
+    assert should_isolate_task_processes(args, [0, 1])
+    assert not should_isolate_task_processes(args, [0])
+
+    args.merge_task_shards_only = True
+    assert not should_isolate_task_processes(args, [0, 1])
+
+    args.merge_task_shards_only = False
+    args.task_worker = True
+    assert not should_isolate_task_processes(args, [0, 1])
+
+    args.task_worker = False
+    args.isolate_task_processes = False
+    assert not should_isolate_task_processes(args, [0, 1])
+
+
+def test_build_task_worker_command_collects_one_task_without_recursive_isolation(monkeypatch, tmp_path: Path):
+    output = tmp_path / "merged.npz"
+    shard_dir = tmp_path / "shards"
+    monkeypatch.setattr(
+        collector.sys,
+        "argv",
+        [
+            "collect_pi05_libero_safety_decoder_dataset.py",
+            "--policy-config",
+            "pi05_libero",
+            "--checkpoint-dir",
+            "checkpoint",
+            "--task-suite",
+            "libero_spatial",
+            "--task-ids",
+            "all",
+            "--num-rollouts",
+            "2",
+            "--max-samples",
+            "99",
+            "--max-samples-per-task",
+            "32",
+            "--max-steps",
+            "12",
+            "--num-steps-wait",
+            "3",
+            "--replan-steps",
+            "4",
+            "--resize-size",
+            "128",
+            "--env-resolution",
+            "64",
+            "--points-per-link",
+            "16",
+            "--seed",
+            "11",
+            "--output",
+            str(output),
+            "--per-task-output-dir",
+            str(shard_dir),
+            "--mujoco-gl",
+            "osmesa",
+            "--policy-server-host",
+            "127.0.0.1",
+            "--policy-server-port",
+            "9000",
+            "--scene-obstacle",
+            "wine_bottle",
+            "--scene-obstacle-xy",
+            "0.1",
+            "0.2",
+        ],
+    )
+    args = collector.parse_args()
+
+    command = build_task_worker_command(args, task_id=3)
+
+    assert command[0] == collector.sys.executable
+    assert command[1] == str(collector.Path(collector.__file__).resolve())
+    assert "--task-id" in command
+    assert command[command.index("--task-id") + 1] == "3"
+    assert "--task-ids" not in command
+    assert "--task-worker" in command
+    assert "--skip-final-merge" in command
+    assert "--no-isolate-task-processes" in command
+    assert "--policy-server-host" in command
+    assert command[command.index("--policy-server-host") + 1] == "127.0.0.1"
+    assert "--scene-obstacle-xy" in command
+
+
+def test_run_task_worker_subprocesses_runs_each_worker_with_check(monkeypatch):
+    monkeypatch.setattr(collector.sys, "argv", ["collect_pi05_libero_safety_decoder_dataset.py"])
+    args = collector.parse_args()
+    calls = []
+
+    def fake_run(command, *, check):
+        calls.append((command, check))
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+
+    run_task_worker_subprocesses(args, [2, 4])
+
+    assert [call[0][call[0].index("--task-id") + 1] for call in calls] == ["2", "4"]
+    assert [call[1] for call in calls] == [True, True]
 
 
 def test_resolve_task_ids_expands_all_and_validates_bounds():
@@ -81,6 +237,70 @@ def test_resolve_max_samples_per_task_prefers_explicit_per_task_limit():
         assert "--max-samples-per-task must be > 0" in str(exc)
     else:
         raise AssertionError("non-positive per-task sample limit was accepted")
+
+
+def test_task_shard_output_path_uses_stable_task_file_names(tmp_path: Path):
+    output = tmp_path / "pi05_libero_decoder_dataset.npz"
+    shard_dir = resolve_task_shard_dir(output=output, per_task_output_dir=None)
+
+    assert shard_dir == tmp_path / "pi05_libero_decoder_dataset_tasks"
+    assert task_shard_output_path(shard_dir=shard_dir, task_suite="libero_spatial", task_id=3) == (
+        shard_dir / "libero_spatial_task003.npz"
+    )
+
+
+def test_collectable_task_ids_skips_existing_task_shards_unless_overwriting(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    buffer = CollectedSampleBuffer()
+    buffer.append(
+        prefix_tokens=np.ones((5, 8), dtype=np.float32),
+        action_chunk=np.ones((10, 7), dtype=np.float32),
+        start_joint_vector=np.zeros((7,), dtype=np.float32),
+        target_link_points=np.zeros((11, 3, 4, 3), dtype=np.float32),
+        task_id=1,
+        rollout_id=0,
+        step_id=0,
+    )
+    task_1_shard = task_shard_output_path(shard_dir=shard_dir, task_suite="libero_spatial", task_id=1)
+    save_collected_dataset(
+        task_1_shard,
+        buffer=buffer,
+        link_names=np.asarray(["link0", "link1", "link2"]),
+        task_suite="libero_spatial",
+        points_per_link=4,
+        samples_per_action=1,
+        policy_config="pi05_libero",
+        checkpoint_dir="checkpoint",
+    )
+
+    assert collectable_task_ids(
+        [0, 1, 2],
+        shard_dir=shard_dir,
+        task_suite="libero_spatial",
+        overwrite_task_shards=False,
+    ) == [0, 2]
+    assert collectable_task_ids(
+        [0, 1, 2],
+        shard_dir=shard_dir,
+        task_suite="libero_spatial",
+        overwrite_task_shards=True,
+    ) == [0, 1, 2]
+
+
+def test_collectable_task_ids_recollects_corrupt_task_shards(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    corrupt_shard = task_shard_output_path(shard_dir=shard_dir, task_suite="libero_spatial", task_id=1)
+    corrupt_shard.write_bytes(b"partial")
+
+    assert not is_valid_dataset_shard(corrupt_shard)
+    assert collectable_task_ids(
+        [1],
+        shard_dir=shard_dir,
+        task_suite="libero_spatial",
+        overwrite_task_shards=False,
+    ) == [1]
 
 
 def test_parse_args_rejects_removed_collection_modes(monkeypatch):
@@ -173,6 +393,33 @@ def test_load_repo_script_module_ignores_openpi_scripts_package(monkeypatch):
         Path(__file__).resolve().parents[1] / "scripts" / "build_pi05_safety_decoder_dataset.py"
     ).resolve()
     assert hasattr(module, "fk_target_link_points")
+
+
+def test_load_openpi_policy_rewrites_missing_jaxlib_error(monkeypatch):
+    def fake_import(name, *args, **kwargs):
+        if name == "openpi.policies":
+            cause = ModuleNotFoundError("No module named 'jaxlib'")
+            raise ModuleNotFoundError("jax requires jaxlib to be installed") from cause
+        return original_import(name, *args, **kwargs)
+
+    original_import = __import__
+    monkeypatch.setattr(collector, "ensure_third_party_paths", lambda: None)
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    try:
+        load_openpi_policy(
+            policy_config="pi05_libero",
+            checkpoint_dir="gs://openpi-assets/checkpoints/pi05_libero",
+            default_prompt=None,
+            pytorch_device=None,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "jaxlib is missing" in message
+        assert "--policy-server-host 127.0.0.1" in message
+        assert "Python >=3.11" in message
+    else:
+        raise AssertionError("missing jaxlib error was not rewritten")
 
 
 class _FakeRemotePolicy:
@@ -278,6 +525,48 @@ def test_collected_sample_buffer_stacks_consistent_decoder_dataset_arrays(tmp_pa
         assert str(data["arm_points_frame"]) == "mujoco_world"
         assert str(data["target_point_offsets_frame"]) == "mujoco_world_delta"
         assert str(data["policy_config"]) == "pi05_libero"
+
+
+def test_merge_dataset_shards_concatenates_samples_and_preserves_metadata(tmp_path: Path):
+    shard_paths = []
+    for task_id in [0, 1]:
+        buffer = CollectedSampleBuffer()
+        prefix = np.full((5, 8), task_id, dtype=np.float32)
+        action_chunk = np.full((10, 7), task_id + 0.1, dtype=np.float32)
+        start_joints = np.full((7,), task_id + 0.2, dtype=np.float32)
+        target = np.full((11, 3, 4, 3), task_id + 0.3, dtype=np.float32)
+        buffer.append(
+            prefix_tokens=prefix,
+            action_chunk=action_chunk,
+            start_joint_vector=start_joints,
+            target_link_points=target,
+            task_id=task_id,
+            rollout_id=0,
+            step_id=task_id * 10,
+        )
+        shard_path = tmp_path / f"task{task_id}.npz"
+        save_collected_dataset(
+            shard_path,
+            buffer=buffer,
+            link_names=np.asarray(["link0", "link1", "link2"]),
+            task_suite="libero_spatial",
+            points_per_link=4,
+            samples_per_action=1,
+            policy_config="pi05_libero",
+            checkpoint_dir="checkpoint",
+        )
+        shard_paths.append(shard_path)
+
+    output = tmp_path / "merged.npz"
+    merged_count = merge_dataset_shards(output, shard_paths)
+
+    assert merged_count == 2
+    with np.load(output, allow_pickle=False) as data:
+        assert data["prefix_tokens"].shape == (2, 5, 8)
+        assert data["task_ids"].tolist() == [0, 1]
+        assert data["step_ids"].tolist() == [0, 10]
+        assert data["link_names"].tolist() == ["link0", "link1", "link2"]
+        assert str(data["task_suite"]) == "libero_spatial"
 
 
 def test_collected_sample_buffer_rejects_shape_changes():

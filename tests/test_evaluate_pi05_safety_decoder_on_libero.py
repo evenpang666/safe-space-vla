@@ -79,9 +79,16 @@ def test_evaluate_script_help_runs_when_invoked_by_path():
     assert "--safe-space" in result.stdout
     assert "--realtime-obbs" in result.stdout
     assert "--no-realtime-obbs" in result.stdout
+    assert "--obb-component-connectivity" in result.stdout
+    assert "--obb-target-geom-name-patterns" in result.stdout
     assert "--skeleton-source" in result.stdout
     assert "--scene-obstacle" in result.stdout
     assert "--scene-obstacle-xy" in result.stdout
+    assert "--cbf-action-space" in result.stdout
+    assert "cartesian_action" in result.stdout
+    assert "--cbf-cartesian-damping" in result.stdout
+    assert "--cbf-correction-target" in result.stdout
+    assert "projected" in result.stdout
 
 
 def test_patch_bddl_with_scene_obstacle_inserts_default_center_wine_bottle():
@@ -395,7 +402,212 @@ def test_point_flow_obb_cbf_constraints_selects_future_obb_intrusion():
     assert constraint.point_id == 0
     assert constraint.obb_id == 0
     np.testing.assert_allclose(constraint.normal, [1.0, 0.0, 0.0])
-    assert constraint.h == pytest.approx(0.7)
+    assert constraint.h == pytest.approx(-0.3)
+
+
+def test_point_flow_obb_cbf_constraints_can_filter_to_specific_future_times():
+    current = np.asarray([[[0.3, 0.0, 0.0]]], dtype=np.float32)
+    pred = np.zeros((3, 1, 1, 3), dtype=np.float32)
+    pred[0, 0, 0] = [0.0, 0.0, 0.0]
+    pred[1, 0, 0] = [0.4, 0.0, 0.0]
+    pred[2, 0, 0] = [0.0, 0.0, 0.0]
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+    }
+
+    constraints = point_flow_obb_cbf_constraints(
+        pred,
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.0,
+        max_constraints=8,
+        allowed_time_indices={2},
+    )
+
+    assert [item.time_index for item in constraints] == [2]
+
+
+def test_predicted_frame_action_cbf_constraints_default_excludes_current_points_at_time_zero():
+    current = np.asarray(
+        [
+            [
+                [0.12, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+            ]
+        ],
+        dtype=np.float32,
+    )
+    pred = np.asarray(
+        [
+            [
+                [
+                    [0.5, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ],
+            [
+                [
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                ]
+            ],
+        ],
+        dtype=np.float32,
+    )
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+    }
+
+    constraints = evaluator.predicted_frame_action_cbf_constraints(
+        pred,
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.03,
+        max_constraints=8,
+    )
+
+    assert [item.time_index for item in constraints] == [0]
+    assert evaluator.cbf_action_indices_from_constraints(
+        constraints,
+        current_action_offset=3,
+        action_count=5,
+    ) == [3]
+    predicted_points = [tuple(np.round(item.predicted_point, 4)) for item in constraints]
+    assert (0.12, 0.0, 0.0) not in predicted_points
+    assert (0.0, 0.0, 0.0) in predicted_points
+
+
+def test_predicted_frame_action_cbf_constraints_can_include_current_points_explicitly():
+    current = np.asarray([[[0.12, 0.0, 0.0]]], dtype=np.float32)
+    pred = np.asarray([[[[0.5, 0.0, 0.0]]]], dtype=np.float32)
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+    }
+
+    constraints = evaluator.predicted_frame_action_cbf_constraints(
+        pred,
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.03,
+        max_constraints=8,
+        include_current_points=True,
+    )
+
+    assert [item.time_index for item in constraints] == [0]
+    np.testing.assert_allclose(constraints[0].predicted_point, [0.12, 0.0, 0.0])
+
+
+def test_predicted_frame_action_cbf_constraints_respect_allowed_time_indices_for_current_points():
+    current = np.asarray([[[0.12, 0.0, 0.0]]], dtype=np.float32)
+    pred = np.asarray(
+        [
+            [[[0.5, 0.0, 0.0]]],
+            [[[0.0, 0.0, 0.0]]],
+        ],
+        dtype=np.float32,
+    )
+    safe_space = {
+        "obstacle_box_centers": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        "obstacle_box_axes": np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+        "obstacle_box_half_sizes": np.asarray([[0.1, 0.1, 0.1]], dtype=np.float32),
+    }
+
+    constraints = evaluator.predicted_frame_action_cbf_constraints(
+        pred,
+        current,
+        safe_space,
+        collision_margin=0.0,
+        trigger_margin=0.03,
+        max_constraints=8,
+        allowed_time_indices={1},
+    )
+
+    assert [item.time_index for item in constraints] == [1]
+    np.testing.assert_allclose(constraints[0].predicted_point, [0.0, 0.0, 0.0])
+
+
+def test_cbf_action_indices_from_constraints_maps_future_times_to_active_chunk_indices():
+    constraints = [
+        evaluator.PointFlowCbfConstraint(
+            time_index=0,
+            link_id=0,
+            point_id=0,
+            obb_id=0,
+            face_axis=0,
+            normal=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            h=-0.1,
+            current_point=np.zeros((3,), dtype=np.float32),
+            predicted_point=np.zeros((3,), dtype=np.float32),
+        ),
+        evaluator.PointFlowCbfConstraint(
+            time_index=2,
+            link_id=0,
+            point_id=1,
+            obb_id=0,
+            face_axis=0,
+            normal=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            h=-0.2,
+            current_point=np.zeros((3,), dtype=np.float32),
+            predicted_point=np.zeros((3,), dtype=np.float32),
+        ),
+    ]
+
+    indices = evaluator.cbf_action_indices_from_constraints(
+        constraints,
+        current_action_offset=1,
+        action_count=4,
+    )
+
+    assert indices == [1, 3]
+
+
+def test_apply_frame_indexed_cbf_corrections_only_changes_matching_future_actions():
+    constraints = [
+        evaluator.PointFlowCbfConstraint(
+            time_index=2,
+            link_id=0,
+            point_id=0,
+            obb_id=0,
+            face_axis=0,
+            normal=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            h=-0.1,
+            current_point=np.zeros((3,), dtype=np.float32),
+            predicted_point=np.zeros((3,), dtype=np.float32),
+        )
+    ]
+    chunk = np.asarray(
+        [
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    corrected, info = evaluator.apply_frame_indexed_cbf_corrections(
+        chunk,
+        constraints,
+        current_action_offset=0,
+        correct_action_fn=lambda index, action, selected: (
+            action + np.asarray([10.0 + index, 0.0], dtype=np.float64),
+            {"triggered": bool(selected), "success": True, "max_violation": 0.0},
+        ),
+    )
+
+    np.testing.assert_allclose(corrected[0], [1.0, 0.0])
+    np.testing.assert_allclose(corrected[1], [2.0, 0.0])
+    np.testing.assert_allclose(corrected[2], [15.0, 0.0])
+    assert info["corrected_action_indices"] == [2]
+    assert info["constraint_count"] == 1
 
 
 def test_current_point_obb_cbf_constraints_selects_current_near_obstacle_points():
@@ -465,6 +677,144 @@ def test_solve_cbf_qp_projection_removes_inward_component_and_keeps_tangent():
 
     assert result.success is True
     np.testing.assert_allclose(result.action, [0.0, 0.25], atol=1e-8)
+
+
+def test_cbf_qp_projected_fallback_keeps_best_effort_projection_tangent():
+    projection = evaluator.CbfQpProjectionResult(
+        action=np.asarray([0.0, 0.25], dtype=np.float64),
+        success=False,
+        max_violation=1e-3,
+        iterations=1,
+    )
+
+    safe = evaluator.cbf_qp_action_from_projection(
+        projection,
+        qp_to_action=lambda action: np.asarray(action, dtype=np.float64),
+        qp_nominal=np.asarray([-0.4, 0.25], dtype=np.float64),
+        nominal=np.asarray([-0.4, 0.25], dtype=np.float64),
+        fallback="projected",
+    )
+
+    np.testing.assert_allclose(safe, [0.0, 0.25], atol=1e-8)
+
+
+def test_resolve_cbf_action_space_auto_uses_cartesian_for_libero_osc_position_env():
+    assert evaluator.resolve_cbf_action_space("auto", action_dim=4, arm_dim=7) == "cartesian_action"
+    assert evaluator.resolve_cbf_action_space("auto", action_dim=7, arm_dim=7) == "cartesian_action"
+    assert evaluator.resolve_cbf_action_space("auto", action_dim=8, arm_dim=7) == "joint_delta"
+    assert evaluator.resolve_cbf_action_space("joint_delta", action_dim=4, arm_dim=7) == "joint_delta"
+
+
+def test_cartesian_action_adapter_optimizes_executable_xyz_directly():
+    nominal = np.asarray([0.2, -0.1, 0.0, 0.75], dtype=np.float64)
+
+    action_xyz, to_action = evaluator.cartesian_action_to_qp_action(nominal, action_dim=4)
+    safe_action = to_action(np.asarray([0.0, -0.2, 0.3], dtype=np.float64))
+
+    np.testing.assert_allclose(action_xyz, [0.2, -0.1, 0.0])
+    np.testing.assert_allclose(safe_action, [0.0, -0.2, 0.3, 0.75])
+
+
+def test_cartesian_delta_action_adapter_round_trips_through_joint_delta_space():
+    nominal = np.asarray([0.2, -0.1, 0.0, 0.75], dtype=np.float64)
+    eef_jacobian = np.asarray(
+        [
+            [2.0, 0.0],
+            [0.0, 4.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    joint_delta, to_action = evaluator.cartesian_delta_action_to_joint_delta(nominal, eef_jacobian, arm_dim=2)
+    safe_action = to_action(np.asarray([0.0, -0.05], dtype=np.float64))
+
+    np.testing.assert_allclose(joint_delta, [0.1, -0.025], atol=1e-8)
+    np.testing.assert_allclose(safe_action, [0.0, -0.2, 0.0, 0.75], atol=1e-8)
+
+
+def test_executable_libero_action_keeps_xyz_and_last_gripper_for_cartesian_env():
+    action = np.asarray([0.1, 0.2, 0.3, 9.0, 8.0, 7.0, -1.0], dtype=np.float64)
+
+    executable = evaluator.executable_libero_action(action, action_dim=4)
+
+    np.testing.assert_allclose(executable, [0.1, 0.2, 0.3, -1.0])
+
+
+def test_finite_difference_action_point_jacobians_differentiates_executable_action_space():
+    def action_position_fn(action_xyz):
+        action_xyz = np.asarray(action_xyz, dtype=np.float64)
+        return np.asarray([[[action_xyz[0], 2.0 * action_xyz[1], -action_xyz[2]]]], dtype=np.float64)
+
+    jacobians = evaluator.finite_difference_action_point_jacobians(
+        action_position_fn,
+        np.asarray([0.1, -0.2, 0.3], dtype=np.float64),
+        [(0, 0)],
+        eps=1e-5,
+    )
+
+    np.testing.assert_allclose(jacobians[(0, 0)], np.diag([1.0, 2.0, -1.0]), atol=1e-8)
+
+
+def test_env_runtime_state_snapshot_restores_common_step_counters():
+    env = types.SimpleNamespace(timestep=3, cur_time=0.25, _elapsed_steps=4)
+
+    snapshot = evaluator.snapshot_env_runtime_state(env)
+    env.timestep = 30
+    env.cur_time = 2.5
+    env._elapsed_steps = 40
+    evaluator.restore_env_runtime_state(env, snapshot)
+
+    assert env.timestep == 3
+    assert env.cur_time == 0.25
+    assert env._elapsed_steps == 4
+
+
+def test_cbf_action_delta_norms_measure_executed_change():
+    nominal = np.asarray([[1.0, 2.0, 3.0], [0.5, 0.5, 0.5]], dtype=np.float32)
+    executed = np.asarray([[1.0, 0.0, 3.0], [0.5, 0.5, 0.5]], dtype=np.float32)
+
+    norms = evaluator.cbf_action_delta_norms(nominal, executed)
+
+    np.testing.assert_allclose(norms, [2.0, 0.0])
+
+
+def test_save_evaluation_writes_cbf_action_diagnostics(tmp_path: Path):
+    output = tmp_path / "eval.npz"
+
+    evaluator.save_evaluation(
+        output,
+        pred_link_points=np.zeros((1, 1, 1, 1, 3), dtype=np.float32),
+        target_link_points=np.zeros((1, 1, 1, 1, 3), dtype=np.float32),
+        prefix_tokens_shape=np.asarray([[1, 2]], dtype=np.int64),
+        action_chunks=np.zeros((1, 1, 3), dtype=np.float32),
+        metrics={
+            "sample_mse": np.zeros((1,), dtype=np.float32),
+            "sample_mean_l2": np.zeros((1,), dtype=np.float32),
+            "sample_max_l2": np.zeros((1,), dtype=np.float32),
+            "mean_mse": np.asarray(0.0, dtype=np.float32),
+            "mean_l2": np.asarray(0.0, dtype=np.float32),
+            "max_l2": np.asarray(0.0, dtype=np.float32),
+        },
+        rollout_ids=np.zeros((1,), dtype=np.int64),
+        step_ids=np.zeros((1,), dtype=np.int64),
+        link_names=np.asarray(["link"]),
+        coordinate_frame="mujoco_world",
+        real_collision_flags=np.asarray([True], dtype=bool),
+        real_collision_contact_counts=np.asarray([2], dtype=np.int64),
+        nominal_actions=np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        executed_actions=np.asarray([[1.0, 0.0, 3.0]], dtype=np.float32),
+        cbf_action_delta_norms=np.asarray([2.0], dtype=np.float32),
+        cbf_corrected_action_masks=np.asarray([[False, True, False]], dtype=bool),
+    )
+
+    with np.load(output, allow_pickle=False) as data:
+        np.testing.assert_allclose(data["nominal_actions"], [[1.0, 2.0, 3.0]])
+        np.testing.assert_allclose(data["executed_actions"], [[1.0, 0.0, 3.0]])
+        np.testing.assert_allclose(data["cbf_action_delta_norms"], [2.0])
+        np.testing.assert_array_equal(data["cbf_corrected_action_masks"], [[False, True, False]])
+        np.testing.assert_array_equal(data["real_collision_flags"], [True])
+        np.testing.assert_array_equal(data["real_collision_contact_counts"], [2])
 
 
 def test_infer_flow_points_per_link_uses_surface_checkpoint_topology():
@@ -730,6 +1080,7 @@ def test_build_realtime_safe_space_from_env_reconstructs_and_fits_obbs():
         table_obstacle_min_height=0.03,
         table_obstacle_max_height=0.3,
         component_voxel_size=0.02,
+        component_connectivity=6,
         min_component_points=2,
         box_margin=0.01,
         box_shape="cuboid",
@@ -743,6 +1094,159 @@ def test_build_realtime_safe_space_from_env_reconstructs_and_fits_obbs():
     assert safe_space["obstacle_box_half_sizes"].shape == (1, 3)
     assert safe_space["obstacle_box_corners"].shape == (1, 8, 3)
     assert safe_space["obstacle_box_point_counts"].tolist() == [4]
+
+
+def test_build_realtime_safe_space_from_env_can_keep_only_named_obstacle_geoms():
+    class _FakeModel:
+        ngeom = 2
+        geom_bodyid = np.asarray([0, 1], dtype=np.int32)
+
+        def geom_id2name(self, geom_id):
+            return ["eval_scene_obstacle_1_collision", "akita_black_bowl_1_collision"][int(geom_id)]
+
+        def body_id2name(self, body_id):
+            return ["eval_scene_obstacle_1", "akita_black_bowl_1"][int(body_id)]
+
+    class _FakeLiberoPc:
+        def __init__(self):
+            self.keep_mask = None
+
+        def render_rgbd(self, _sim, _camera_name, width, height):
+            return np.zeros((height, width, 3), dtype=np.uint8), np.ones((height, width), dtype=np.float32)
+
+        def render_segmentation(self, _sim, _camera_name, width, height):
+            segmentation = np.zeros((height, width, 2), dtype=np.int32)
+            segmentation[..., 0] = 7
+            segmentation[:, : width // 2, 1] = 0
+            segmentation[:, width // 2 :, 1] = 1
+            return segmentation
+
+        def mujoco_geom_objtype(self):
+            return 7
+
+        def robot_pixel_mask(self, **_kwargs):
+            raise AssertionError("targeted OBB should use target geom segmentation instead of robot masking")
+
+        def depth_to_world_points(self, **kwargs):
+            self.keep_mask = np.asarray(kwargs["keep_mask"], dtype=bool)
+            pixel_points = np.asarray(
+                [
+                    [0.2, 0.0, 0.12],
+                    [0.22, 0.0, 0.13],
+                    [0.7, 0.0, 0.12],
+                    [0.72, 0.0, 0.13],
+                    [0.21, 0.02, 0.12],
+                    [0.23, 0.02, 0.13],
+                    [0.71, 0.02, 0.12],
+                    [0.73, 0.02, 0.13],
+                ],
+                dtype=np.float32,
+            )
+            selected = self.keep_mask.reshape(-1)
+            return (
+                pixel_points[selected],
+                np.zeros((int(selected.sum()), 3), dtype=np.uint8),
+            )
+
+        def crop_workspace(self, points, colors, bounds):
+            return points, colors
+
+    class _FakeSafeBuilder:
+        def __init__(self):
+            self.tabletop_points = None
+
+        def estimate_table_z(self, _points, _voxel_size):
+            return 0.0
+
+        def estimate_table_workspace_bounds(self, **_kwargs):
+            return np.asarray([-0.5, 0.5, -0.5, 0.5, 0.0, 0.5], dtype=np.float32), 3
+
+        def tabletop_obstacle_points(self, points, **_kwargs):
+            self.tabletop_points = np.asarray(points, dtype=np.float32)
+            return self.tabletop_points
+
+        def component_boxes_from_tabletop_points(self, points, **_kwargs):
+            return (
+                np.min(points, axis=0, keepdims=True),
+                np.max(points, axis=0, keepdims=True),
+                np.mean(points, axis=0, keepdims=True),
+                np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+                np.ptp(points, axis=0, keepdims=True) / 2.0,
+                np.zeros((1, 8, 3), dtype=np.float32),
+                np.asarray([len(points)], dtype=np.int64),
+            )
+
+    fake_pc = _FakeLiberoPc()
+    fake_builder = _FakeSafeBuilder()
+
+    safe_space = build_realtime_safe_space_from_env(
+        env=types.SimpleNamespace(sim=types.SimpleNamespace(model=_FakeModel())),
+        libero_pc=fake_pc,
+        safe_space_builder=fake_builder,
+        camera_names=("frontview",),
+        width=4,
+        height=2,
+        stride=1,
+        max_depth=4.0,
+        robot_geom_ids=np.asarray([], dtype=np.int64),
+        robot_mask_dilation=2,
+        workspace_bounds=None,
+        workspace_mode="table",
+        workspace_margin=0.02,
+        table_z=None,
+        table_slab_height=0.02,
+        table_obstacle_min_height=0.03,
+        table_obstacle_max_height=0.3,
+        component_voxel_size=0.02,
+        component_connectivity=6,
+        min_component_points=1,
+        box_margin=0.01,
+        box_shape="cuboid",
+        box_orientation="xy_oriented",
+        voxel_size=0.04,
+        target_geom_name_patterns=("eval_scene_obstacle", "wine_bottle", "winebottle"),
+    )
+
+    assert fake_pc.keep_mask.tolist() == [[True, True, False, False], [True, True, False, False]]
+    np.testing.assert_allclose(fake_builder.tabletop_points[:, 0], [0.2, 0.22, 0.21, 0.23])
+    assert safe_space["obstacle_box_point_counts"].tolist() == [4]
+
+
+def test_real_robot_obstacle_collision_detects_robot_target_contact_only():
+    class _FakeModel:
+        ngeom = 3
+        geom_bodyid = np.asarray([0, 1, 2], dtype=np.int32)
+
+        def geom_id2name(self, geom_id):
+            return ["robot0_link0_collision", "eval_scene_obstacle_1_collision", "akita_black_bowl_1_collision"][
+                int(geom_id)
+            ]
+
+        def body_id2name(self, body_id):
+            return ["robot0_link0", "eval_scene_obstacle_1", "akita_black_bowl_1"][int(body_id)]
+
+    class _Contact:
+        def __init__(self, geom1, geom2):
+            self.geom1 = geom1
+            self.geom2 = geom2
+
+    model = _FakeModel()
+    env = types.SimpleNamespace(
+        sim=types.SimpleNamespace(
+            model=model,
+            data=types.SimpleNamespace(ncon=2, contact=[_Contact(0, 2), _Contact(1, 0)]),
+        )
+    )
+
+    result = evaluator.real_robot_obstacle_collision(
+        env,
+        robot_geom_ids=np.asarray([0], dtype=np.int64),
+        target_geom_name_patterns=("eval_scene_obstacle", "wine_bottle", "winebottle"),
+    )
+
+    assert result["collision"] is True
+    assert result["contact_count"] == 1
+    assert result["contact_geom_pairs"].tolist() == [[1, 0]]
 
 
 def test_build_realtime_safe_space_from_env_skips_missing_cameras(capsys):
@@ -810,6 +1314,7 @@ def test_build_realtime_safe_space_from_env_skips_missing_cameras(capsys):
         table_obstacle_min_height=0.03,
         table_obstacle_max_height=0.3,
         component_voxel_size=0.02,
+        component_connectivity=6,
         min_component_points=2,
         box_margin=0.01,
         box_shape="cuboid",
@@ -929,6 +1434,36 @@ def test_annotate_video_frame_draws_collision_status_bar():
     bottom_band = annotated[-24:, :, :]
     red_status_pixels = (bottom_band[:, :, 0] >= 180) & (bottom_band[:, :, 1] < 80)
     assert int(red_status_pixels.sum()) > 0
+
+
+def test_annotate_video_frame_draws_real_collision_status_bar():
+    frame = np.zeros((64, 180, 3), dtype=np.uint8)
+
+    annotated = annotate_video_frame(
+        frame,
+        rollout_id=0,
+        step_id=3,
+        sample_id=1,
+        collision_result={
+            "collision": True,
+            "collision_point_count": 4,
+            "collision_point_indices": np.asarray([0, 1, 2, 3], dtype=np.int64),
+        },
+        real_collision_result={
+            "collision": True,
+            "contact_count": 2,
+            "contact_geom_pairs": np.asarray([[0, 1], [2, 1]], dtype=np.int64),
+        },
+    )
+
+    real_collision_band = annotated[-44:-20, :, :]
+    orange_pixels = (
+        (real_collision_band[:, :, 0] >= 200)
+        & (real_collision_band[:, :, 1] >= 80)
+        & (real_collision_band[:, :, 1] <= 150)
+        & (real_collision_band[:, :, 2] < 40)
+    )
+    assert int(orange_pixels.sum()) > 0
 
 
 def test_save_evaluation_writes_predictions_targets_and_metrics(tmp_path: Path):
