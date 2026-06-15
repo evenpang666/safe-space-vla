@@ -770,6 +770,21 @@ def test_env_runtime_state_snapshot_restores_common_step_counters():
     assert env._elapsed_steps == 4
 
 
+def test_env_runtime_state_snapshot_restores_nested_done_flag():
+    inner = types.SimpleNamespace(timestep=9, cur_time=0.45, done=False)
+    env = types.SimpleNamespace(env=inner)
+
+    snapshot = evaluator.snapshot_env_runtime_state(env)
+    inner.timestep = 10
+    inner.cur_time = 0.5
+    inner.done = True
+    evaluator.restore_env_runtime_state(env, snapshot)
+
+    assert inner.timestep == 9
+    assert inner.cur_time == 0.45
+    assert inner.done is False
+
+
 def test_cbf_action_delta_norms_measure_executed_change():
     nominal = np.asarray([[1.0, 2.0, 3.0], [0.5, 0.5, 0.5]], dtype=np.float32)
     executed = np.asarray([[1.0, 0.0, 3.0], [0.5, 0.5, 0.5]], dtype=np.float32)
@@ -1110,6 +1125,7 @@ def test_build_realtime_safe_space_from_env_can_keep_only_named_obstacle_geoms()
     class _FakeLiberoPc:
         def __init__(self):
             self.keep_mask = None
+            self.keep_masks = []
 
         def render_rgbd(self, _sim, _camera_name, width, height):
             return np.zeros((height, width, 3), dtype=np.uint8), np.ones((height, width), dtype=np.float32)
@@ -1124,11 +1140,12 @@ def test_build_realtime_safe_space_from_env_can_keep_only_named_obstacle_geoms()
         def mujoco_geom_objtype(self):
             return 7
 
-        def robot_pixel_mask(self, **_kwargs):
-            raise AssertionError("targeted OBB should use target geom segmentation instead of robot masking")
+        def robot_pixel_mask(self, **kwargs):
+            return np.zeros((kwargs["height"], kwargs["width"]), dtype=bool)
 
         def depth_to_world_points(self, **kwargs):
             self.keep_mask = np.asarray(kwargs["keep_mask"], dtype=bool)
+            self.keep_masks.append(self.keep_mask.copy())
             pixel_points = np.asarray(
                 [
                     [0.2, 0.0, 0.12],
@@ -1207,8 +1224,132 @@ def test_build_realtime_safe_space_from_env_can_keep_only_named_obstacle_geoms()
         target_geom_name_patterns=("eval_scene_obstacle", "wine_bottle", "winebottle"),
     )
 
-    assert fake_pc.keep_mask.tolist() == [[True, True, False, False], [True, True, False, False]]
+    assert len(fake_pc.keep_masks) == 2
+    assert fake_pc.keep_masks[0].all()
+    assert fake_pc.keep_masks[1].tolist() == [[True, True, False, False], [True, True, False, False]]
     np.testing.assert_allclose(fake_builder.tabletop_points[:, 0], [0.2, 0.22, 0.21, 0.23])
+    assert safe_space["obstacle_box_point_counts"].tolist() == [4]
+
+
+def test_build_realtime_safe_space_from_env_estimates_table_from_scene_when_target_filtered():
+    class _FakeModel:
+        ngeom = 2
+        geom_bodyid = np.asarray([0, 1], dtype=np.int32)
+
+        def geom_id2name(self, geom_id):
+            return ["eval_scene_obstacle_1_collision", "main_table_collision"][int(geom_id)]
+
+        def body_id2name(self, body_id):
+            return ["eval_scene_obstacle_1", "main_table"][int(body_id)]
+
+    class _FakeLiberoPc:
+        def __init__(self):
+            self.keep_masks = []
+
+        def render_rgbd(self, _sim, _camera_name, width, height):
+            return np.zeros((height, width, 3), dtype=np.uint8), np.ones((height, width), dtype=np.float32)
+
+        def render_segmentation(self, _sim, _camera_name, width, height):
+            segmentation = np.zeros((height, width, 2), dtype=np.int32)
+            segmentation[..., 0] = 7
+            segmentation[:, : width // 2, 1] = 0
+            segmentation[:, width // 2 :, 1] = 1
+            return segmentation
+
+        def mujoco_geom_objtype(self):
+            return 7
+
+        def robot_pixel_mask(self, **kwargs):
+            return np.zeros((kwargs["height"], kwargs["width"]), dtype=bool)
+
+        def depth_to_world_points(self, **kwargs):
+            keep_mask = np.asarray(kwargs["keep_mask"], dtype=bool)
+            self.keep_masks.append(keep_mask.copy())
+            pixel_points = np.asarray(
+                [
+                    [0.20, 0.00, 0.04],
+                    [0.20, 0.02, 0.22],
+                    [0.00, 0.00, 0.00],
+                    [0.10, 0.00, 0.00],
+                    [0.22, 0.00, 0.05],
+                    [0.22, 0.02, 0.20],
+                    [0.00, 0.10, 0.00],
+                    [0.10, 0.10, 0.00],
+                ],
+                dtype=np.float32,
+            )
+            selected = keep_mask.reshape(-1)
+            return pixel_points[selected], np.zeros((int(selected.sum()), 3), dtype=np.uint8)
+
+        def crop_workspace(self, points, colors, bounds):
+            return points, colors
+
+    class _FakeSafeBuilder:
+        def __init__(self):
+            self.tabletop_points = None
+
+        def estimate_table_z(self, points, _voxel_size):
+            assert float(points[:, 2].min()) == pytest.approx(0.0)
+            return 0.0
+
+        def estimate_table_workspace_bounds(self, **kwargs):
+            assert float(kwargs["points"][:, 2].min()) == pytest.approx(0.0)
+            return np.asarray([-0.5, 0.5, -0.5, 0.5, 0.0, 0.5], dtype=np.float32), 4
+
+        def tabletop_obstacle_points(self, points, **kwargs):
+            self.tabletop_points = np.asarray(points, dtype=np.float32)
+            table_z = float(kwargs["table_z"])
+            min_height = float(kwargs["min_height"])
+            max_height = float(kwargs["max_height"])
+            keep = (points[:, 2] >= table_z + min_height) & (points[:, 2] <= table_z + max_height)
+            return points[keep]
+
+        def component_boxes_from_tabletop_points(self, points, **_kwargs):
+            return (
+                np.min(points, axis=0, keepdims=True),
+                np.max(points, axis=0, keepdims=True),
+                np.mean(points, axis=0, keepdims=True),
+                np.eye(3, dtype=np.float32).reshape(1, 3, 3),
+                np.ptp(points, axis=0, keepdims=True) / 2.0,
+                np.zeros((1, 8, 3), dtype=np.float32),
+                np.asarray([len(points)], dtype=np.int64),
+            )
+
+    fake_pc = _FakeLiberoPc()
+    fake_builder = _FakeSafeBuilder()
+
+    safe_space = build_realtime_safe_space_from_env(
+        env=types.SimpleNamespace(sim=types.SimpleNamespace(model=_FakeModel())),
+        libero_pc=fake_pc,
+        safe_space_builder=fake_builder,
+        camera_names=("frontview",),
+        width=4,
+        height=2,
+        stride=1,
+        max_depth=4.0,
+        robot_geom_ids=np.asarray([], dtype=np.int64),
+        robot_mask_dilation=2,
+        workspace_bounds=None,
+        workspace_mode="table",
+        workspace_margin=0.02,
+        table_z=None,
+        table_slab_height=0.02,
+        table_obstacle_min_height=0.02,
+        table_obstacle_max_height=0.3,
+        component_voxel_size=0.02,
+        component_connectivity=6,
+        min_component_points=1,
+        box_margin=0.01,
+        box_shape="cuboid",
+        box_orientation="xy_oriented",
+        voxel_size=0.04,
+        target_geom_name_patterns=("eval_scene_obstacle",),
+    )
+
+    assert len(fake_pc.keep_masks) == 2
+    assert fake_pc.keep_masks[0].all()
+    assert fake_pc.keep_masks[1].tolist() == [[True, True, False, False], [True, True, False, False]]
+    assert fake_builder.tabletop_points.shape == (4, 3)
     assert safe_space["obstacle_box_point_counts"].tolist() == [4]
 
 

@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cbf-trigger-margin",
         type=float,
-        default=0.02,
+        default=0.0,
         help="Extra OBB margin used only to trigger CBF-QP from predicted future point flow.",
     )
     parser.add_argument("--cbf-max-constraints", type=int, default=32)
@@ -664,8 +664,10 @@ def build_realtime_safe_space_from_env(
     Returns the same OBB fields as ``build_safe_space_from_pointcloud.py`` so
     video drawing and point-flow collision checks can share one geometry path.
     """
-    all_points: list[np.ndarray] = []
-    all_colors: list[np.ndarray] = []
+    scene_points_by_camera: list[np.ndarray] = []
+    scene_colors_by_camera: list[np.ndarray] = []
+    obstacle_points_by_camera: list[np.ndarray] = []
+    obstacle_colors_by_camera: list[np.ndarray] = []
     robot_geom_set = set(int(x) for x in np.asarray(list(robot_geom_ids), dtype=np.int64).reshape(-1))
     target_patterns = normalize_obb_target_geom_name_patterns(target_geom_name_patterns)
     target_geom_set = realtime_obb_target_geom_ids(env.sim.model, target_patterns) if target_patterns else None
@@ -675,18 +677,19 @@ def build_realtime_safe_space_from_env(
     for camera_name in camera_names:
         try:
             rgb, depth_m = libero_pc.render_rgbd(env.sim, camera_name, int(width), int(height))
+            robot_mask = libero_pc.robot_pixel_mask(
+                sim=env.sim,
+                camera_name=camera_name,
+                width=int(width),
+                height=int(height),
+                robot_geom_ids=robot_geom_set,
+                dilation=int(robot_mask_dilation),
+            )
+            scene_keep_mask = ~robot_mask
             if target_geom_set is None:
-                robot_mask = libero_pc.robot_pixel_mask(
-                    sim=env.sim,
-                    camera_name=camera_name,
-                    width=int(width),
-                    height=int(height),
-                    robot_geom_ids=robot_geom_set,
-                    dilation=int(robot_mask_dilation),
-                )
-                keep_mask = ~robot_mask
+                obstacle_keep_mask = scene_keep_mask
             else:
-                keep_mask = geom_pixel_mask_from_segmentation(
+                obstacle_keep_mask = geom_pixel_mask_from_segmentation(
                     libero_pc=libero_pc,
                     sim=env.sim,
                     camera_name=camera_name,
@@ -694,40 +697,64 @@ def build_realtime_safe_space_from_env(
                     height=int(height),
                     geom_ids=target_geom_set,
                 )
+                obstacle_keep_mask &= scene_keep_mask
         except Exception as exc:
             print(f"[warn] skipped realtime OBB camera {camera_name!r}: {exc}")
             continue
-        points, colors = libero_pc.depth_to_world_points(
+        scene_points, scene_colors = libero_pc.depth_to_world_points(
             sim=env.sim,
             camera_name=camera_name,
             rgb=rgb,
             depth_m=depth_m,
             stride=max(int(stride), 1),
             max_depth=float(max_depth),
-            keep_mask=keep_mask,
+            keep_mask=scene_keep_mask,
         )
-        if len(points) > 0:
-            all_points.append(np.asarray(points, dtype=np.float32))
-            all_colors.append(np.asarray(colors, dtype=np.uint8))
+        if len(scene_points) > 0:
+            scene_points_by_camera.append(np.asarray(scene_points, dtype=np.float32))
+            scene_colors_by_camera.append(np.asarray(scene_colors, dtype=np.uint8))
+        if target_geom_set is None:
+            obstacle_points = scene_points
+            obstacle_colors = scene_colors
+        else:
+            obstacle_points, obstacle_colors = libero_pc.depth_to_world_points(
+                sim=env.sim,
+                camera_name=camera_name,
+                rgb=rgb,
+                depth_m=depth_m,
+                stride=max(int(stride), 1),
+                max_depth=float(max_depth),
+                keep_mask=obstacle_keep_mask,
+            )
+        if len(obstacle_points) > 0:
+            obstacle_points_by_camera.append(np.asarray(obstacle_points, dtype=np.float32))
+            obstacle_colors_by_camera.append(np.asarray(obstacle_colors, dtype=np.uint8))
 
-    if not all_points:
+    if not scene_points_by_camera or not obstacle_points_by_camera:
         return empty_obstacle_safe_space()
 
-    points = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
-    colors = np.concatenate(all_colors, axis=0).astype(np.uint8, copy=False)
+    scene_points = np.concatenate(scene_points_by_camera, axis=0).astype(np.float32, copy=False)
+    scene_colors = np.concatenate(scene_colors_by_camera, axis=0).astype(np.uint8, copy=False)
+    obstacle_points = np.concatenate(obstacle_points_by_camera, axis=0).astype(np.float32, copy=False)
+    obstacle_colors = np.concatenate(obstacle_colors_by_camera, axis=0).astype(np.uint8, copy=False)
     if workspace_bounds is not None:
-        points, _colors = libero_pc.crop_workspace(points, colors, list(workspace_bounds))
-    if len(points) == 0:
+        scene_points, _scene_colors = libero_pc.crop_workspace(scene_points, scene_colors, list(workspace_bounds))
+        obstacle_points, _obstacle_colors = libero_pc.crop_workspace(
+            obstacle_points,
+            obstacle_colors,
+            list(workspace_bounds),
+        )
+    if len(scene_points) == 0 or len(obstacle_points) == 0:
         return empty_obstacle_safe_space()
 
     resolved_table_z = float(table_z) if table_z is not None else float(
-        safe_space_builder.estimate_table_z(points, float(voxel_size))
+        safe_space_builder.estimate_table_z(scene_points, float(voxel_size))
     )
     if workspace_bounds is not None:
         bounds = np.asarray(workspace_bounds, dtype=np.float32)
     elif workspace_mode == "table":
         bounds, _table_slab_points = safe_space_builder.estimate_table_workspace_bounds(
-            points=points,
+            points=scene_points,
             margin=float(workspace_margin),
             table_z=resolved_table_z,
             slab_height=float(table_slab_height),
@@ -735,7 +762,7 @@ def build_realtime_safe_space_from_env(
         )
     else:
         bounds = safe_space_builder.estimate_pointcloud_workspace_bounds(
-            points=points,
+            points=scene_points,
             margin=float(workspace_margin),
             make_cube=False,
         )
@@ -743,7 +770,7 @@ def build_realtime_safe_space_from_env(
     bounds[4] = max(float(bounds[4]), resolved_table_z)
 
     tabletop_points = safe_space_builder.tabletop_obstacle_points(
-        points=points,
+        points=obstacle_points,
         bounds=bounds,
         table_z=resolved_table_z,
         min_height=float(table_obstacle_min_height),
@@ -1299,15 +1326,38 @@ def finite_difference_action_point_jacobians(
     return jacobians
 
 
+def _iter_env_runtime_objects(env):
+    seen: set[int] = set()
+    current = env
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = getattr(current, "env", None)
+
+
 def snapshot_env_runtime_state(env) -> dict[str, object]:
     snapshot: dict[str, object] = {}
-    for name in ("timestep", "cur_time", "_elapsed_steps"):
-        if hasattr(env, name):
-            snapshot[name] = getattr(env, name)
+    object_snapshots = []
+    for obj in _iter_env_runtime_objects(env):
+        attrs = {}
+        for name in ("timestep", "cur_time", "_elapsed_steps", "done"):
+            if hasattr(obj, name):
+                attrs[name] = getattr(obj, name)
+        if attrs:
+            object_snapshots.append((obj, attrs))
+    snapshot["_runtime_objects"] = object_snapshots
+    if object_snapshots:
+        snapshot.update(object_snapshots[0][1])
     return snapshot
 
 
 def restore_env_runtime_state(env, snapshot: dict[str, object]) -> None:
+    object_snapshots = snapshot.get("_runtime_objects")
+    if object_snapshots is not None:
+        for obj, attrs in object_snapshots:
+            for name, value in attrs.items():
+                setattr(obj, name, value)
+        return
     for name, value in snapshot.items():
         setattr(env, name, value)
 
