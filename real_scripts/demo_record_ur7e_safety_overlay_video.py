@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Record a passive UR SafetyModule overlay demo video.
+"""Record a UR SafetyModule overlay demo image or video.
 
-Run this while another process controls the UR arm. This script only reads the
-robot state and RGB-D cameras, then writes the front camera view overlaid with
-UR link surface points, tabletop obstacle points, and obstacle OBBs.
+The script reads robot state and RGB-D cameras, then writes the front camera
+view overlaid with UR link surface points, tabletop obstacle points, and
+obstacle OBBs. Image mode captures one still frame without moving the robot.
+Video mode can send small random end-effector delta actions while recording.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import inspect
 import importlib
+import json
 from pathlib import Path
 import sys
 import time
@@ -34,6 +37,8 @@ from real_scripts.real_robot_adapter import (  # noqa: E402
 
 
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "real_ur_safety_overlay_demo.mp4"
+DEFAULT_IMAGE_OUTPUT = REPO_ROOT / "outputs" / "real_ur_safety_overlay_demo.png"
+DEFAULT_DEMO_CAMERA_NAMES = ("front", "wrist")
 ROBOT_COLOR = np.asarray([0, 220, 255], dtype=np.uint8)
 OBSTACLE_COLOR = np.asarray([255, 80, 20], dtype=np.uint8)
 OBB_COLOR = np.asarray([40, 255, 90], dtype=np.uint8)
@@ -51,10 +56,22 @@ class UprightOBB:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output-mode",
+        choices=("video", "image"),
+        default="video",
+        help="Write an overlay video or one front-view overlay image. Image mode does not move the robot.",
+    )
     parser.add_argument("--camera-calibration", type=Path, required=True)
     parser.add_argument("--adapter", default=None, help="Import path 'module:factory' returning a RealRobotAdapter.")
     parser.add_argument("--replay-jsonl", type=Path, default=None, help="Offline replay source for smoke tests.")
     parser.add_argument("--front-camera-name", default="front")
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        default=list(DEFAULT_DEMO_CAMERA_NAMES),
+        help="RGB-D cameras used by this demo. Defaults to front wrist.",
+    )
     parser.add_argument("--max-frames", type=int, default=300)
     parser.add_argument("--duration-sec", type=float, default=None)
     parser.add_argument("--fps", type=float, default=20.0)
@@ -71,19 +88,96 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cluster-points", type=int, default=32)
     parser.add_argument("--point-radius", type=int, default=2)
     parser.add_argument("--debug-npz", type=Path, default=None)
+    parser.add_argument(
+        "--debug-image-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for intermediate overlay and point-cloud evidence images.",
+    )
+    parser.add_argument(
+        "--demo-action",
+        action="append",
+        nargs=7,
+        type=float,
+        default=None,
+        metavar=("DX_MM", "DY_MM", "DZ_MM", "DROLL", "DPITCH", "DYAW", "GRIPPER"),
+        help=(
+            "7D EE delta action to execute during hardware recording. "
+            "Can be provided multiple times. Overrides random video actions."
+        ),
+    )
+    parser.add_argument(
+        "--demo-action-interval-sec",
+        type=float,
+        default=1.0,
+        help="Minimum delay between demo actions in hardware mode.",
+    )
+    parser.add_argument("--no-demo-actions", action="store_true", help="Disable hardware demo actions and record passively.")
+    parser.add_argument("--random-action-count", type=int, default=8, help="Number of random hardware actions for video mode.")
+    parser.add_argument(
+        "--random-xyz-mm",
+        type=float,
+        default=10.0,
+        help="Absolute xyz bound in millimeters for generated random video actions.",
+    )
+    parser.add_argument(
+        "--random-rot",
+        type=float,
+        default=0.03,
+        help="Absolute roll/pitch/yaw bound in radians for generated random video actions.",
+    )
+    parser.add_argument("--random-seed", type=int, default=0, help="Seed for deterministic random video actions.")
     return parser.parse_args()
 
 
 def load_adapter(args: argparse.Namespace):
+    camera_names = tuple(str(name) for name in getattr(args, "camera_names", DEFAULT_DEMO_CAMERA_NAMES))
     if args.replay_jsonl is not None:
-        return ReplayJsonlAdapter(args.replay_jsonl)
+        return ReplayJsonlAdapter(args.replay_jsonl, camera_names=camera_names)
     if args.adapter is None:
         raise ValueError("Provide --adapter module:factory for hardware, or --replay-jsonl for offline replay.")
     module_name, sep, factory_name = str(args.adapter).partition(":")
     if not sep:
         raise ValueError("--adapter must have form module:factory")
     module = importlib.import_module(module_name)
-    return getattr(module, factory_name)()
+    factory = getattr(module, factory_name)
+    signature = inspect.signature(factory)
+    if "camera_names" in signature.parameters:
+        return factory(camera_names=camera_names)
+    return factory()
+
+
+def resolve_output_path(args: argparse.Namespace) -> Path:
+    output_path = Path(args.output)
+    if str(getattr(args, "output_mode", "video")) == "image" and output_path == DEFAULT_OUTPUT:
+        return DEFAULT_IMAGE_OUTPUT
+    return output_path
+
+
+def resolve_demo_actions(args: argparse.Namespace) -> np.ndarray:
+    output_mode = str(getattr(args, "output_mode", "video"))
+    if output_mode == "image" or args.replay_jsonl is not None or bool(getattr(args, "no_demo_actions", False)):
+        return np.zeros((0, 7), dtype=np.float32)
+    configured_actions = getattr(args, "demo_action", None)
+    if configured_actions is not None:
+        actions = np.asarray(configured_actions, dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 7:
+            raise ValueError(f"--demo-action must produce an Nx7 action sequence, got shape {actions.shape}")
+        return actions
+
+    action_count = max(0, int(getattr(args, "random_action_count", 8)))
+    rng = np.random.default_rng(getattr(args, "random_seed", 0))
+    actions = np.zeros((action_count, 7), dtype=np.float32)
+    if action_count == 0:
+        return actions
+    xyz_bound = abs(float(getattr(args, "random_xyz_mm", 10.0)))
+    rot_bound = abs(float(getattr(args, "random_rot", 0.03)))
+    actions[:, :3] = rng.uniform(-xyz_bound, xyz_bound, size=(action_count, 3)).astype(np.float32)
+    actions[:, 3:6] = rng.uniform(-rot_bound, rot_bound, size=(action_count, 3)).astype(np.float32)
+    actions[:, 6] = 0.5
+    if actions.ndim != 2 or actions.shape[1] != 7:
+        raise ValueError(f"--demo-action must produce an Nx7 action sequence, got shape {actions.shape}")
+    return actions
 
 
 def project_world_points_to_pixels(
@@ -269,7 +363,7 @@ def render_overlay_frame(
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
-    image = Image.fromarray(np.asarray(front_rgb, dtype=np.uint8), mode="RGB")
+    image = Image.fromarray(np.asarray(front_rgb, dtype=np.uint8))
     draw = ImageDraw.Draw(image)
     height, width = np.asarray(front_rgb).shape[:2]
 
@@ -326,6 +420,153 @@ def _open_video_writer(path: Path, *, fps: float):
     return imageio.get_writer(path, fps=float(fps), codec="libx264", quality=8)
 
 
+def _save_rgb_image(path: Path, image: np.ndarray) -> None:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.asarray(image, dtype=np.uint8)).save(path)
+
+
+def _render_topdown_points(
+    points: np.ndarray,
+    colors: np.ndarray | None = None,
+    *,
+    bounds: Iterable[float] | None = None,
+    image_size: int = 640,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    image = Image.new("RGB", (int(image_size), int(image_size)), (8, 10, 12))
+    draw = ImageDraw.Draw(image)
+    if points.shape[0] == 0:
+        return np.asarray(image, dtype=np.uint8)
+
+    if bounds is None:
+        xy_min = points[:, :2].min(axis=0)
+        xy_max = points[:, :2].max(axis=0)
+        pad = np.maximum((xy_max - xy_min) * 0.08, 0.05)
+        xmin, ymin = (xy_min - pad).tolist()
+        xmax, ymax = (xy_max + pad).tolist()
+    else:
+        xmin, xmax, ymin, ymax, *_ = [float(value) for value in bounds]
+    if abs(xmax - xmin) <= 1e-9:
+        xmin -= 0.5
+        xmax += 0.5
+    if abs(ymax - ymin) <= 1e-9:
+        ymin -= 0.5
+        ymax += 0.5
+
+    color_array = None if colors is None else np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    scale_x = (image_size - 1) / (xmax - xmin)
+    scale_y = (image_size - 1) / (ymax - ymin)
+    for idx, point in enumerate(points):
+        x = int(round((float(point[0]) - xmin) * scale_x))
+        y = int(round((ymax - float(point[1])) * scale_y))
+        if x < 0 or x >= image_size or y < 0 or y >= image_size:
+            continue
+        if color_array is not None and idx < color_array.shape[0]:
+            fill = tuple(int(value) for value in color_array[idx])
+        else:
+            fill = (230, 230, 230)
+        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=fill)
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _projection_valid_count(points: np.ndarray, calibration: CameraCalibration, *, width: int, height: int) -> int:
+    _, _, valid = project_world_points_to_pixels(points, calibration, width=width, height=height)
+    return int(valid.sum())
+
+
+def _save_debug_evidence_images(
+    debug_dir: Path,
+    *,
+    front_rgb: np.ndarray,
+    front_calibration: CameraCalibration,
+    robot_link_points: np.ndarray,
+    scene_points: np.ndarray,
+    scene_colors: np.ndarray,
+    obstacle_points: np.ndarray,
+    obstacle_colors: np.ndarray,
+    obstacle_obbs: list[UprightOBB],
+    overlay: np.ndarray,
+    point_radius: int,
+    workspace_bounds: Iterable[float] | None,
+) -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    empty_points = np.zeros((0, 3), dtype=np.float32)
+    height, width = np.asarray(front_rgb).shape[:2]
+
+    _save_rgb_image(debug_dir / "front_rgb.png", front_rgb)
+    _save_rgb_image(debug_dir / "overlay_full.png", overlay)
+    _save_rgb_image(
+        debug_dir / "overlay_robot_only.png",
+        render_overlay_frame(
+            front_rgb,
+            front_calibration=front_calibration,
+            robot_link_points=robot_link_points,
+            obstacle_points=empty_points,
+            obstacle_obbs=[],
+            point_radius=point_radius,
+        ),
+    )
+    _save_rgb_image(
+        debug_dir / "overlay_obstacles_only.png",
+        render_overlay_frame(
+            front_rgb,
+            front_calibration=front_calibration,
+            robot_link_points=empty_points,
+            obstacle_points=obstacle_points,
+            obstacle_obbs=[],
+            point_radius=point_radius,
+        ),
+    )
+    _save_rgb_image(
+        debug_dir / "overlay_obbs_only.png",
+        render_overlay_frame(
+            front_rgb,
+            front_calibration=front_calibration,
+            robot_link_points=empty_points,
+            obstacle_points=empty_points,
+            obstacle_obbs=obstacle_obbs,
+            point_radius=point_radius,
+        ),
+    )
+    _save_rgb_image(
+        debug_dir / "topdown_scene_points.png",
+        _render_topdown_points(scene_points, scene_colors, bounds=workspace_bounds),
+    )
+    _save_rgb_image(
+        debug_dir / "topdown_robot_points.png",
+        _render_topdown_points(
+            np.asarray(robot_link_points, dtype=np.float32).reshape(-1, 3),
+            np.tile(ROBOT_COLOR[None, :], (np.asarray(robot_link_points).reshape(-1, 3).shape[0], 1)),
+            bounds=workspace_bounds,
+        ),
+    )
+    _save_rgb_image(
+        debug_dir / "topdown_obstacle_points.png",
+        _render_topdown_points(
+            obstacle_points,
+            obstacle_colors if np.asarray(obstacle_colors).size else None,
+            bounds=workspace_bounds,
+        ),
+    )
+
+    obb_corners = np.concatenate([obb.corners for obb in obstacle_obbs], axis=0) if obstacle_obbs else empty_points
+    summary = {
+        "front_rgb_shape": list(np.asarray(front_rgb).shape),
+        "scene_point_count": int(np.asarray(scene_points).reshape(-1, 3).shape[0]),
+        "robot_point_count": int(np.asarray(robot_link_points).reshape(-1, 3).shape[0]),
+        "obstacle_point_count": int(np.asarray(obstacle_points).reshape(-1, 3).shape[0]),
+        "obb_count": int(len(obstacle_obbs)),
+        "projected_robot_point_count": _projection_valid_count(robot_link_points, front_calibration, width=width, height=height),
+        "projected_obstacle_point_count": _projection_valid_count(obstacle_points, front_calibration, width=width, height=height),
+        "projected_obb_corner_count": _projection_valid_count(obb_corners, front_calibration, width=width, height=height),
+    }
+    (debug_dir / "debug_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
 def _save_debug_npz(
     path: Path | None,
     *,
@@ -347,6 +588,9 @@ def _save_debug_npz(
 
 
 def run_demo(args: argparse.Namespace) -> int:
+    output_mode = str(getattr(args, "output_mode", "video"))
+    if output_mode not in {"video", "image"}:
+        raise ValueError("--output-mode must be 'video' or 'image'")
     if args.max_frames <= 0:
         raise ValueError("--max-frames must be > 0")
     if args.fps <= 0.0:
@@ -355,25 +599,36 @@ def run_demo(args: argparse.Namespace) -> int:
     calibrations = load_camera_calibrations(args.camera_calibration)
     if args.front_camera_name not in calibrations:
         raise KeyError(f"Missing front camera calibration {args.front_camera_name!r}")
+    camera_names = tuple(str(name) for name in getattr(args, "camera_names", DEFAULT_DEMO_CAMERA_NAMES))
+    missing_calibrations = [name for name in camera_names if name not in calibrations]
+    if missing_calibrations:
+        raise KeyError(f"Missing camera calibrations for {missing_calibrations}")
     front_calibration = calibrations[args.front_camera_name]
     sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
     adapter = load_adapter(args)
+    demo_actions = resolve_demo_actions(args)
+    demo_action_interval_sec = max(0.0, float(getattr(args, "demo_action_interval_sec", 1.0)))
 
-    writer = _open_video_writer(args.output, fps=args.fps)
+    output_path = resolve_output_path(args)
+    writer = _open_video_writer(output_path, fps=args.fps) if output_mode == "video" else None
     robot_frames: list[np.ndarray] = []
     obstacle_frames: list[np.ndarray] = []
     obb_frames: list[list[UprightOBB]] = []
     start_time = time.monotonic()
+    next_demo_action_time = start_time
+    demo_action_index = 0
     frame_count = 0
 
     adapter.reset()
     try:
-        while frame_count < int(args.max_frames):
-            if args.duration_sec is not None and time.monotonic() - start_time >= float(args.duration_sec):
+        target_frames = 1 if output_mode == "image" else int(args.max_frames)
+        while frame_count < target_frames:
+            if output_mode == "video" and args.duration_sec is not None and time.monotonic() - start_time >= float(args.duration_sec):
                 break
 
             observation = adapter.get_observation()
             frames = adapter.get_rgbd_frames()
+            frames = [frame for frame in frames if frame.camera_name in camera_names]
             front_frames = [frame for frame in frames if frame.camera_name == args.front_camera_name]
             if not front_frames:
                 raise KeyError(f"Adapter did not return RGB-D frame {args.front_camera_name!r}")
@@ -409,15 +664,43 @@ def run_demo(args: argparse.Namespace) -> int:
                 obstacle_obbs=obbs,
                 point_radius=args.point_radius,
             )
-            writer.append_data(overlay)
+            debug_image_dir = getattr(args, "debug_image_dir", None)
+            if debug_image_dir is not None:
+                frame_debug_dir = Path(debug_image_dir)
+                if output_mode == "video":
+                    frame_debug_dir = frame_debug_dir / f"frame_{frame_count:06d}"
+                _save_debug_evidence_images(
+                    frame_debug_dir,
+                    front_rgb=front_frames[0].rgb,
+                    front_calibration=front_calibration,
+                    robot_link_points=robot_link_points,
+                    scene_points=cloud.scene_points,
+                    scene_colors=cloud.scene_colors,
+                    obstacle_points=obstacle_points,
+                    obstacle_colors=obstacle_colors,
+                    obstacle_obbs=obbs,
+                    overlay=overlay,
+                    point_radius=args.point_radius,
+                    workspace_bounds=args.workspace_bounds,
+                )
+            if output_mode == "image":
+                _save_rgb_image(output_path, overlay)
+            else:
+                writer.append_data(overlay)
 
             robot_frames.append(robot_link_points)
             obstacle_frames.append(obstacle_points)
             obb_frames.append(obbs)
             frame_count += 1
 
+            if output_mode == "image":
+                break
             if args.replay_jsonl is not None:
                 adapter.execute_action(np.zeros((0,), dtype=np.float32))
+            elif demo_action_index < demo_actions.shape[0] and time.monotonic() >= next_demo_action_time:
+                adapter.execute_action(demo_actions[demo_action_index])
+                demo_action_index += 1
+                next_demo_action_time = time.monotonic() + demo_action_interval_sec
             elif adapter.is_done():
                 break
             else:
@@ -426,7 +709,8 @@ def run_demo(args: argparse.Namespace) -> int:
                 if sleep_sec > 0.0:
                     time.sleep(sleep_sec)
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         adapter.close()
 
     _save_debug_npz(args.debug_npz, robot_frames=robot_frames, obstacle_frames=obstacle_frames, obb_frames=obb_frames)
@@ -436,7 +720,8 @@ def run_demo(args: argparse.Namespace) -> int:
 def main() -> None:
     args = parse_args()
     count = run_demo(args)
-    print(f"[done] wrote {count} frames to {args.output}")
+    unit = "frame" if count == 1 else "frames"
+    print(f"[done] wrote {count} {unit} to {resolve_output_path(args)}")
     if args.debug_npz is not None:
         print(f"[done] wrote debug point clouds to {args.debug_npz}")
 

@@ -58,6 +58,8 @@ class RealSenseD435iSource:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        wait_timeout_ms: int = 5000,
+        read_retries: int = 3,
     ) -> None:
         self.cameras = tuple(cameras)
         if not self.cameras:
@@ -65,6 +67,8 @@ class RealSenseD435iSource:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
+        self.wait_timeout_ms = int(wait_timeout_ms)
+        self.read_retries = max(int(read_retries), 1)
         self._rs = None
         self._pipelines = []
         self._aligns = []
@@ -100,7 +104,22 @@ class RealSenseD435iSource:
             raise RuntimeError("RealSenseD435iSource is not started")
         frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for (name, pipeline), align in zip(self._pipelines, self._aligns):
-            aligned = align.process(pipeline.wait_for_frames())
+            aligned = None
+            last_error: Exception | None = None
+            for attempt in range(1, self.read_retries + 1):
+                try:
+                    aligned = align.process(pipeline.wait_for_frames(self.wait_timeout_ms))
+                    break
+                except RuntimeError as exc:
+                    last_error = exc
+                    if attempt >= self.read_retries:
+                        raise RuntimeError(
+                            f"Timed out reading RealSense camera {name!r} after "
+                            f"{self.read_retries} attempt(s) with wait_timeout_ms={self.wait_timeout_ms}. "
+                            "Check USB bandwidth/power, camera serial env vars, and whether another process is using the camera."
+                        ) from exc
+            if aligned is None:
+                raise RuntimeError(f"Failed to read RealSense camera {name!r}") from last_error
             color_frame = aligned.get_color_frame()
             depth_frame = aligned.get_depth_frame()
             if not color_frame or not depth_frame:
@@ -120,12 +139,16 @@ class UR7eRealSenseAdapter:
         *,
         controller: UR7eControllerLike,
         camera_source: RGBDSource,
+        camera_names: Sequence[str] = DEFAULT_D435I_CAMERA_NAMES,
         acceleration: float = 0.18,
         velocity: float = 0.04,
         wait_after_arm_s: float = 0.2,
     ) -> None:
+        if not camera_names:
+            raise ValueError("At least one camera name is required")
         self.controller = controller
         self.camera_source = camera_source
+        self.camera_names = tuple(str(name) for name in camera_names)
         self.acceleration = float(acceleration)
         self.velocity = float(velocity)
         self.wait_after_arm_s = float(wait_after_arm_s)
@@ -153,7 +176,7 @@ class UR7eRealSenseAdapter:
             "qpos": qpos,
             "gripper": gripper,
         }
-        for name in DEFAULT_D435I_CAMERA_NAMES:
+        for name in self.camera_names:
             if name not in frames:
                 raise KeyError(f"Missing D435i camera frame {name!r}")
             observation[f"{name}_rgb"] = np.ascontiguousarray(frames[name][0].astype(np.uint8))
@@ -162,7 +185,7 @@ class UR7eRealSenseAdapter:
     def get_rgbd_frames(self) -> list[RGBDFrame]:
         frames = self._read_frames()
         rgbd_frames = []
-        for name in DEFAULT_D435I_CAMERA_NAMES:
+        for name in self.camera_names:
             if name not in frames:
                 raise KeyError(f"Missing D435i camera frame {name!r}")
             rgb, depth_m = frames[name]
@@ -202,10 +225,19 @@ def _serials_from_env() -> dict[str, str | None]:
     }
 
 
-def create_adapter() -> UR7eRealSenseAdapter:
+def create_adapter(camera_names: Sequence[str] | None = None) -> UR7eRealSenseAdapter:
     """Factory for --adapter real_scripts.ur7e_realsense_adapter:create_adapter."""
+    selected_camera_names = tuple(DEFAULT_D435I_CAMERA_NAMES if camera_names is None else camera_names)
     serials = _serials_from_env()
-    cameras = [D435iCameraConfig(name=name, serial=serials.get(name)) for name in DEFAULT_D435I_CAMERA_NAMES]
+    missing_serial_envs = [
+        f"REAL_SENSE_{name.upper()}_SERIAL"
+        for name in selected_camera_names
+        if serials.get(name) is None
+    ]
+    if len(selected_camera_names) > 1 and missing_serial_envs:
+        missing = ", ".join(missing_serial_envs)
+        raise ValueError(f"Multiple RealSense cameras require explicit serials. Set: {missing}")
+    cameras = [D435iCameraConfig(name=name, serial=serials.get(name)) for name in selected_camera_names]
     controller = UR7eVectorController(
         robot_ip=os.environ.get("UR_ROBOT_IP", ROBOT_IP),
         strict_gripper_connection=os.environ.get("UR_STRICT_GRIPPER", "1") not in {"0", "false", "False"},
@@ -216,10 +248,13 @@ def create_adapter() -> UR7eRealSenseAdapter:
         width=int(os.environ.get("REAL_SENSE_WIDTH", "640")),
         height=int(os.environ.get("REAL_SENSE_HEIGHT", "480")),
         fps=int(os.environ.get("REAL_SENSE_FPS", "30")),
+        wait_timeout_ms=int(os.environ.get("REAL_SENSE_WAIT_TIMEOUT_MS", "5000")),
+        read_retries=int(os.environ.get("REAL_SENSE_READ_RETRIES", "3")),
     )
     return UR7eRealSenseAdapter(
         controller=controller,
         camera_source=camera_source,
+        camera_names=selected_camera_names,
         acceleration=float(os.environ.get("UR_ACTION_ACCELERATION", "0.18")),
         velocity=float(os.environ.get("UR_ACTION_VELOCITY", "0.04")),
         wait_after_arm_s=float(os.environ.get("UR_WAIT_AFTER_ARM_S", "0.2")),

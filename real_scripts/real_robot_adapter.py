@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Iterable, Protocol, Sequence
 
 import numpy as np
 
@@ -327,8 +327,11 @@ class ReplayJsonlAdapter:
     RealRobotAdapter against the robot and camera SDKs directly.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, camera_names: Sequence[str] = DEFAULT_RGBD_CAMERA_NAMES):
+        if not camera_names:
+            raise ValueError("At least one replay camera name is required")
         self.path = Path(path)
+        self.camera_names = tuple(str(name) for name in camera_names)
         self.records = [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
         if not self.records:
             raise ValueError(f"Replay file has no records: {self.path}")
@@ -341,27 +344,40 @@ class ReplayJsonlAdapter:
 
     def get_observation(self) -> dict:
         record = self.records[min(self.index, len(self.records) - 1)]
-        wrist_rgb = record.get("wrist_rgb", record["front_rgb"])
-        return {
-            "front_rgb": np.asarray(record["front_rgb"], dtype=np.uint8),
-            "side_rgb": np.asarray(record["side_rgb"], dtype=np.uint8),
-            "wrist_rgb": np.asarray(wrist_rgb, dtype=np.uint8),
+        observation = {
             "qpos": np.asarray(record["qpos"], dtype=np.float32),
             "gripper": np.asarray(record.get("gripper", [0.0]), dtype=np.float32),
         }
+        for name in self.camera_names:
+            rgb_key = f"{name}_rgb"
+            if rgb_key in record:
+                rgb = record[rgb_key]
+            elif name == "wrist":
+                rgb = record["front_rgb"]
+            else:
+                raise KeyError(f"Missing replay RGB field {rgb_key!r}")
+            observation[rgb_key] = np.asarray(rgb, dtype=np.uint8)
+        return observation
 
     def get_rgbd_frames(self) -> list[RGBDFrame]:
         record = self.records[min(self.index, len(self.records) - 1)]
-        frames = [
-            RGBDFrame("front", np.asarray(record["front_rgb"], dtype=np.uint8), np.asarray(record["front_depth_m"], dtype=np.float32)),
-            RGBDFrame("side", np.asarray(record["side_rgb"], dtype=np.uint8), np.asarray(record["side_depth_m"], dtype=np.float32)),
-        ]
-        if "wrist_depth_m" in record:
+        frames = []
+        for name in self.camera_names:
+            depth_key = f"{name}_depth_m"
+            if depth_key not in record:
+                raise KeyError(f"Missing replay depth field {depth_key!r}")
+            rgb_key = f"{name}_rgb"
+            if rgb_key in record:
+                rgb = record[rgb_key]
+            elif name == "wrist":
+                rgb = record["front_rgb"]
+            else:
+                raise KeyError(f"Missing replay RGB field {rgb_key!r}")
             frames.append(
                 RGBDFrame(
-                    "wrist",
-                    np.asarray(record.get("wrist_rgb", record["front_rgb"]), dtype=np.uint8),
-                    np.asarray(record["wrist_depth_m"], dtype=np.float32),
+                    name,
+                    np.asarray(rgb, dtype=np.uint8),
+                    np.asarray(record[depth_key], dtype=np.float32),
                 )
             )
         return frames
