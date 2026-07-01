@@ -815,7 +815,7 @@ function draw() {{
   const projection = perspective(Math.PI / 4, aspect, Math.max(0.001, radius * 0.01), Math.max(10.0, radius * 30.0));
   const mvp = multiply(projection, viewMatrix());
   gl.uniformMatrix4fv(uMvp, false, mvp);
-  gl.uniform1f(uPointSize, Math.max(1.5, Math.min(4.0, window.devicePixelRatio || 1)));
+  gl.uniform1f(uPointSize, Math.max(3.2, Math.min(4.0, window.devicePixelRatio || 1)));
   bindBuffer('aPosition', positions);
   bindBuffer('aColor', colors);
   gl.drawArrays(gl.POINTS, 0, n);
@@ -916,9 +916,9 @@ def _save_tabletop_outputs(
     save_obbs_json(outputs["tabletop_obbs_json"], obbs, plane=plane)
     save_interactive_pointcloud_html(
         outputs["tabletop_obbs_html"],
-        obstacle_points,
-        obstacle_colors,
-        title=f"{prefix} tabletop obstacle OBBs",
+        tabletop_points,
+        tabletop_colors,
+        title=f"{prefix} tabletop point cloud with obstacle OBBs",
         max_points=viewer_max_points,
         obbs=obbs,
     )
