@@ -1,0 +1,9 @@
+numpy
+pandas
+pyarrow
+pyyaml
+opencv-python
+pyrealsense2
+pynput
+pyserial
+ur_rtde

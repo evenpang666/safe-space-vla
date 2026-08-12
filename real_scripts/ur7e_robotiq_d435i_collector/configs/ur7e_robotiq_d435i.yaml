@@ -1,0 +1,77 @@
+robot:
+  host: ""
+  frequency: 500.0
+
+pika_sense:
+  port: ""
+  tracker_device: "T20"
+  tracker_config: null
+  tracker_lh_config: null
+
+robotiq_gripper:
+  port: 63352
+  force: 150
+  speed_min: 80
+  speed_max: 255
+  max_norm_speed_per_s: 2.0
+
+gripper_mapping:
+  type: "robotiq"
+  pika_closed_rad: 0.0
+  pika_open_rad: 1.7
+  robotiq_closed_pos: 1.0
+  robotiq_open_pos: 0.0
+  deadband: 0.01
+
+cameras:
+  front:
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+    align_depth_to_color: true
+  wrist:
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+    align_depth_to_color: true
+
+controls:
+  teleop_toggle_key: "f2"
+  record_toggle_key: "f3"
+  save_on_teleop_stop: true
+
+collection:
+  fps: 30
+  output_dir: "datasets"
+  dataset_name: "ur7e_robotiq_rgbd"
+  task: ""
+
+teleoperation:
+  position_scale: 1.0
+  max_delta_m: 99.0
+  servo_hz: 50
+  ik_mode: "ur_native_servol"
+  pika_to_arm: [0.0, 0.0, 0.0, 1.703151, 1.539109, 1.728148]
+  smoothing:
+    pose_alpha: 0.15
+    gripper_alpha: 0.9
+  max_lin_vel_m_s: 0.30
+  max_ang_vel_rad_s: 1.50
+  max_joint_vel_rad_s: 1.50
+  servo_lookahead_s: 0.20
+  servo_gain: 100.0
+  safety:
+    workspace:
+      x: null
+      y: null
+      z: null
+    joint_limits:
+      - null
+      - null
+      - null
+      - null
+      - null
+      - null
+    max_tilt_from_down_deg: null
