@@ -29,6 +29,7 @@ UR7E_DH_PARAMETERS = (
     (0.0, 0.0, 0.0996),
 )
 DEFAULT_RGBD_CAMERA_NAMES = ("front", "side", "wrist")
+DEFAULT_SCENE_RGBD_CAMERA_NAMES = ("front", "side")
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,57 @@ def depth_to_world_points(
     return world_points.astype(np.float32), colors.astype(np.uint8)
 
 
+def robot_depth_keep_mask(
+    measured_depth_m: np.ndarray,
+    rendered_robot_depth_m: np.ndarray,
+    *,
+    absolute_tolerance_m: float = 0.008,
+    relative_tolerance: float = 0.01,
+    dilation_pixels: int = 1,
+) -> np.ndarray:
+    """Return pixels not explained by a rendered robot surface.
+
+    ``rendered_robot_depth_m`` is a z-buffer render of *only* the UR7e and its
+    mounted tool in the same colour-camera frame as ``measured_depth_m``.  A
+    pixel is removed only when its sensor depth agrees with the visible robot
+    surface.  In particular, an object closer to the camera than the robot is
+    retained instead of being erased by a silhouette-only mask.
+
+    Rendered depth is dilated conservatively using the closest neighbouring
+    robot surface.  This absorbs small mesh/extrinsic errors without treating
+    every pixel behind the robot as robot geometry.
+    """
+    measured = np.asarray(measured_depth_m, dtype=np.float32)
+    rendered = np.asarray(rendered_robot_depth_m, dtype=np.float32)
+    if measured.shape != rendered.shape:
+        raise ValueError(
+            "measured_depth_m and rendered_robot_depth_m must have the same shape, "
+            f"got {measured.shape} and {rendered.shape}"
+        )
+    if measured.ndim != 2:
+        raise ValueError(f"depth inputs must be HxW, got {measured.shape}")
+    if float(absolute_tolerance_m) < 0.0 or float(relative_tolerance) < 0.0:
+        raise ValueError("depth tolerances must be non-negative")
+    if int(dilation_pixels) < 0:
+        raise ValueError("dilation_pixels must be non-negative")
+
+    expanded = np.where(np.isfinite(rendered) & (rendered > 0.0), rendered, np.inf)
+    for _ in range(int(dilation_pixels)):
+        padded = np.pad(expanded, 1, mode="constant", constant_values=np.inf)
+        neighbours = [
+            padded[row_offset : row_offset + expanded.shape[0], col_offset : col_offset + expanded.shape[1]]
+            for row_offset in range(3)
+            for col_offset in range(3)
+        ]
+        expanded = np.minimum.reduce(neighbours)
+
+    robot_visible = np.isfinite(expanded)
+    measured_valid = np.isfinite(measured) & (measured > 0.0)
+    tolerance = float(absolute_tolerance_m) + float(relative_tolerance) * expanded
+    matches_robot_surface = robot_visible & measured_valid & (np.abs(measured - expanded) <= tolerance)
+    return ~matches_robot_surface
+
+
 def crop_workspace(
     points: np.ndarray,
     colors: np.ndarray,
@@ -263,26 +315,126 @@ def filter_robot_points(
     return keep
 
 
+def filter_robot_capsules(
+    scene_points: np.ndarray,
+    robot_link_segments: np.ndarray,
+    *,
+    radii: float | Iterable[float],
+    margin: float = 0.0,
+    chunk_size: int = 16384,
+) -> np.ndarray:
+    """Keep points outside the union of robot-link capsules.
+
+    This is a continuous distance-to-segment test, unlike sampling sparse link
+    centerline points.  It is therefore suitable as the dependency-free online
+    fallback when a URDF mesh/SDF renderer is unavailable.  ``radii`` must be
+    measured/tuned for the actual arm, gripper, and mounted tooling.
+    """
+    points = np.asarray(scene_points, dtype=np.float32).reshape(-1, 3)
+    segments = np.asarray(robot_link_segments, dtype=np.float32).reshape(-1, 2, 3)
+    if points.shape[0] == 0:
+        return np.zeros((0,), dtype=bool)
+    if segments.shape[0] == 0:
+        return np.ones((points.shape[0],), dtype=bool)
+    radius_array = np.asarray(radii, dtype=np.float32).reshape(-1)
+    if radius_array.size == 1:
+        radius_array = np.full((segments.shape[0],), float(radius_array[0]), dtype=np.float32)
+    if radius_array.shape != (segments.shape[0],):
+        raise ValueError(f"radii must contain 1 or {segments.shape[0]} values, got {radius_array.shape}")
+    if np.any(radius_array < 0.0) or float(margin) < 0.0:
+        raise ValueError("capsule radii and margin must be non-negative")
+
+    start = segments[:, 0, :]
+    direction = segments[:, 1, :] - start
+    direction_norm_sq = np.sum(direction * direction, axis=1)
+    effective_radius_sq = (radius_array + float(margin)) ** 2
+    keep = np.ones((points.shape[0],), dtype=bool)
+    for offset in range(0, points.shape[0], int(chunk_size)):
+        stop = min(offset + int(chunk_size), points.shape[0])
+        delta = points[offset:stop, None, :] - start[None, :, :]
+        projection = np.sum(delta * direction[None, :, :], axis=-1)
+        t = np.divide(projection, direction_norm_sq[None, :], out=np.zeros_like(projection), where=direction_norm_sq[None, :] > 1e-12)
+        t = np.clip(t, 0.0, 1.0)
+        closest = start[None, :, :] + t[..., None] * direction[None, :, :]
+        distance_sq = np.sum((points[offset:stop, None, :] - closest) ** 2, axis=-1)
+        keep[offset:stop] = ~np.any(distance_sq <= effective_radius_sq[None, :], axis=1)
+    return keep
+
+
+def voxel_downsample_points(
+    points: np.ndarray,
+    colors: np.ndarray,
+    *,
+    voxel_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average duplicate/overlapping multi-view points into metric voxels."""
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    if points.shape[0] != colors.shape[0]:
+        raise ValueError("points and colors must contain the same number of rows")
+    if points.shape[0] == 0 or float(voxel_size) <= 0.0:
+        return points, colors
+    grid = np.floor(points / float(voxel_size)).astype(np.int64)
+    _, inverse = np.unique(grid, axis=0, return_inverse=True)
+    count = int(inverse.max()) + 1
+    point_sums = np.zeros((count, 3), dtype=np.float64)
+    color_sums = np.zeros((count, 3), dtype=np.float64)
+    point_counts = np.bincount(inverse, minlength=count).astype(np.float64)
+    np.add.at(point_sums, inverse, points)
+    np.add.at(color_sums, inverse, colors)
+    return (point_sums / point_counts[:, None]).astype(np.float32), np.rint(color_sums / point_counts[:, None]).clip(0, 255).astype(np.uint8)
+
+
 def fuse_rgbd_frames(
     frames: list[RGBDFrame],
     calibrations: dict[str, CameraCalibration],
     *,
     robot_link_points: np.ndarray,
+    robot_link_segments: np.ndarray | None = None,
+    robot_link_radii: float | Iterable[float] | None = None,
+    robot_filter_margin: float = 0.0,
+    camera_names: Iterable[str] | None = None,
     stride: int = 1,
     max_depth: float | None = None,
     robot_filter_radius: float = 0.04,
     workspace_bounds: Iterable[float] | None = None,
+    voxel_size: float = 0.0,
+    rendered_robot_depths: dict[str, np.ndarray] | None = None,
+    rendered_robot_absolute_tolerance_m: float = 0.008,
+    rendered_robot_relative_tolerance: float = 0.01,
+    rendered_robot_dilation_pixels: int = 1,
 ) -> FusedPointCloud:
     point_sets: list[np.ndarray] = []
     color_sets: list[np.ndarray] = []
-    for frame in frames:
+    requested_names = None if camera_names is None else tuple(str(name) for name in camera_names)
+    if requested_names is not None and len(requested_names) != len(set(requested_names)):
+        raise ValueError(f"camera_names must be unique, got {requested_names}")
+    frames_by_name = {frame.camera_name: frame for frame in frames}
+    if requested_names is not None:
+        missing = [name for name in requested_names if name not in frames_by_name]
+        if missing:
+            raise KeyError(f"Requested scene camera frames are missing: {missing}")
+        selected_frames = [frames_by_name[name] for name in requested_names]
+    else:
+        selected_frames = frames
+    for frame in selected_frames:
         if frame.camera_name not in calibrations:
             raise KeyError(f"Missing calibration for camera {frame.camera_name!r}")
+        keep_mask = None
+        if rendered_robot_depths is not None and frame.camera_name in rendered_robot_depths:
+            keep_mask = robot_depth_keep_mask(
+                frame.depth_m,
+                rendered_robot_depths[frame.camera_name],
+                absolute_tolerance_m=rendered_robot_absolute_tolerance_m,
+                relative_tolerance=rendered_robot_relative_tolerance,
+                dilation_pixels=rendered_robot_dilation_pixels,
+            )
         points, colors = depth_to_world_points(
             frame,
             calibrations[frame.camera_name],
             stride=stride,
             max_depth=max_depth,
+            keep_mask=keep_mask,
         )
         if len(points) > 0:
             point_sets.append(points)
@@ -296,7 +448,16 @@ def fuse_rgbd_frames(
     scene_points = np.concatenate(point_sets, axis=0).astype(np.float32)
     scene_colors = np.concatenate(color_sets, axis=0).astype(np.uint8)
     scene_points, scene_colors = crop_workspace(scene_points, scene_colors, workspace_bounds)
-    keep = filter_robot_points(scene_points, robot_link_points, radius=robot_filter_radius)
+    scene_points, scene_colors = voxel_downsample_points(scene_points, scene_colors, voxel_size=voxel_size)
+    if robot_link_segments is not None and robot_link_radii is not None:
+        keep = filter_robot_capsules(
+            scene_points,
+            robot_link_segments,
+            radii=robot_link_radii,
+            margin=robot_filter_margin,
+        )
+    else:
+        keep = filter_robot_points(scene_points, robot_link_points, radius=robot_filter_radius)
     return FusedPointCloud(
         scene_points=scene_points,
         scene_colors=scene_colors,

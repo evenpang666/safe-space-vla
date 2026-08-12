@@ -1,5 +1,12 @@
-.agents/
-.codex/
 __pycache__/
 outputs/
-.superpower/
+docs/
+*.pyc
+*.egg-info
+*.egg
+__pycache__
+.idea
+.vscode
+workspace*/
+result*/
+ckpt/

@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--
+  UR7e + PiKA collision-description wrapper.
+
+  This file deliberately has no nominal PiKA mounting transform: set
+  pika_mount_xyz/rpy from the measured flange-to-PiKA STEP-frame calibration.
+  The source STEP coordinates are millimetres, hence the mesh scale 0.001.
+-->
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="$(arg name)">
+  <xacro:arg name="name" default="ur7e_pika"/>
+  <xacro:arg name="tf_prefix" default=""/>
+  <xacro:arg name="pika_mount_xyz" default="0 0 0"/>
+  <xacro:arg name="pika_mount_rpy" default="0 0 0"/>
+  <xacro:arg name="pika_collision_mesh_file" default="file:///REPLACE_WITH_ABSOLUTE_PATH/pika_gripper_full_collision.stl"/>
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+
+  <link name="world"/>
+  <xacro:ur_robot
+    name="$(arg name)"
+    tf_prefix="$(arg tf_prefix)"
+    parent="world"
+    joint_limits_parameters_file="$(find ur_description)/config/ur7e/joint_limits.yaml"
+    kinematics_parameters_file="$(find ur_description)/config/ur7e/default_kinematics.yaml"
+    physical_parameters_file="$(find ur_description)/config/ur7e/physical_parameters.yaml"
+    visual_parameters_file="$(find ur_description)/config/ur7e/visual_parameters.yaml">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:ur_robot>
+
+  <link name="$(arg tf_prefix)pika_step_frame"/>
+  <joint name="$(arg tf_prefix)flange_to_pika_step_frame" type="fixed">
+    <parent link="$(arg tf_prefix)flange"/>
+    <child link="$(arg tf_prefix)pika_step_frame"/>
+    <origin xyz="$(arg pika_mount_xyz)" rpy="$(arg pika_mount_rpy)"/>
+  </joint>
+  <link name="$(arg tf_prefix)pika_gripper_collision">
+    <collision>
+      <geometry>
+        <mesh filename="$(arg pika_collision_mesh_file)" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="$(arg tf_prefix)pika_step_frame_to_collision" type="fixed">
+    <parent link="$(arg tf_prefix)pika_step_frame"/>
+    <child link="$(arg tf_prefix)pika_gripper_collision"/>
+  </joint>
+</robot>

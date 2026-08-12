@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "ur_description_root": "../ur_description",
+  "ur_type": "ur7e",
+  "pika": {
+    "full_collision_mesh": "../pika_gripper/collision/pika_gripper_full_collision.stl",
+    "body_collision_mesh": "../pika_gripper/collision/pika_gripper_body_collision.stl",
+    "finger_mesh_candidates": [
+      "../pika_gripper/collision/finger_a_candidate.stl",
+      "../pika_gripper/collision/finger_b_candidate.stl"
+    ],
+    "mesh_unit": "mm",
+    "flange_to_pika_step_frame": null,
+    "opening_state": {
+      "source": "/gripper/joint_states",
+      "unit": "mm",
+      "max_opening_m": 0.095,
+      "max_timestamp_delta_ms": 20
+    },
+    "moving_finger_kinematics_verified": false
+  },
+  "camera_to_base_calibration": "REPLACE_WITH_CALIBRATION_JSON",
+  "robot_depth_comparison": {
+    "absolute_tolerance_m": 0.008,
+    "relative_tolerance": 0.01,
+    "dilation_pixels": 1
+  }
+}

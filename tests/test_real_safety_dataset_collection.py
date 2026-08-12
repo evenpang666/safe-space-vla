@@ -20,8 +20,10 @@ from real_scripts.real_robot_adapter import (
     UR7ELinkPointSampler,
     crop_workspace,
     depth_to_world_points,
+    filter_robot_capsules,
     filter_robot_points,
     fuse_rgbd_frames,
+    voxel_downsample_points,
 )
 
 
@@ -87,6 +89,26 @@ def test_filter_robot_points_removes_points_near_ur7e_links():
     np.testing.assert_array_equal(keep, [False, False, True])
 
 
+def test_filter_robot_capsules_uses_continuous_segment_distance_not_sparse_samples():
+    scene_points = np.asarray([[0.5, 0.04, 0.0], [0.5, 0.06, 0.0], [0.5, 0.0, 0.2]], dtype=np.float32)
+    segments = np.asarray([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], dtype=np.float32)
+
+    keep = filter_robot_capsules(scene_points, segments, radii=0.05)
+
+    np.testing.assert_array_equal(keep, [False, True, True])
+
+
+def test_voxel_downsample_points_averages_overlapping_multiview_samples():
+    points = np.asarray([[0.001, 0.0, 1.0], [0.004, 0.0, 1.0], [0.020, 0.0, 1.0]], dtype=np.float32)
+    colors = np.asarray([[10, 20, 30], [30, 40, 50], [90, 100, 110]], dtype=np.uint8)
+
+    downsampled_points, downsampled_colors = voxel_downsample_points(points, colors, voxel_size=0.01)
+
+    assert downsampled_points.shape == (2, 3)
+    np.testing.assert_allclose(downsampled_points[0], [0.0025, 0.0, 1.0])
+    np.testing.assert_array_equal(downsampled_colors[0], [20, 30, 40])
+
+
 def test_fuse_rgbd_frames_filters_robot_and_workspace():
     calibration = CameraCalibration(
         name="front",
@@ -109,6 +131,24 @@ def test_fuse_rgbd_frames_filters_robot_and_workspace():
     assert cloud.scene_points.shape == (2, 3)
     assert cloud.environment_points.shape == (1, 3)
     np.testing.assert_allclose(cloud.environment_points[0], [2.0, 0.0, 2.0])
+
+
+def test_fuse_rgbd_frames_can_select_only_fixed_scene_cameras():
+    calibration = CameraCalibration("front", np.eye(3), np.eye(4))
+    frames = [
+        RGBDFrame("front", np.zeros((1, 1, 3), dtype=np.uint8), np.asarray([[1.0]], dtype=np.float32)),
+        RGBDFrame("wrist", np.zeros((1, 1, 3), dtype=np.uint8), np.asarray([[2.0]], dtype=np.float32)),
+    ]
+
+    cloud = fuse_rgbd_frames(
+        frames,
+        {"front": calibration, "wrist": CameraCalibration("wrist", np.eye(3), np.eye(4))},
+        robot_link_points=np.zeros((0, 3), dtype=np.float32),
+        camera_names=("front",),
+    )
+
+    assert cloud.scene_points.shape == (1, 3)
+    np.testing.assert_allclose(cloud.scene_points, [[0.0, 0.0, 1.0]])
 
 
 def test_crop_workspace_keeps_points_inside_bounds():

@@ -1,0 +1,194 @@
+{
+  "source_step": "assets/robot_models/pika_gripper/PiKA-Gripper-STEP.stp",
+  "source_unit": "mm",
+  "urdf_mesh_scale": [
+    0.001,
+    0.001,
+    0.001
+  ],
+  "linear_deflection_mm": 1.5,
+  "component_count": 16,
+  "finger_candidate_indices_zero_based": [
+    14,
+    15
+  ],
+  "components": [
+    {
+      "index_zero_based": 0,
+      "bounds_mm": [
+        -11.7004,
+        -42.7765,
+        127.0759,
+        -8.1871,
+        -39.2632,
+        132.0893
+      ]
+    },
+    {
+      "index_zero_based": 1,
+      "bounds_mm": [
+        -117.4675,
+        -10.6794,
+        160.7621,
+        97.58,
+        -3.6319,
+        165.6096
+      ]
+    },
+    {
+      "index_zero_based": 2,
+      "bounds_mm": [
+        -66.8809,
+        -15.6954,
+        162.246,
+        -36.0013,
+        1.3842,
+        168.8256
+      ]
+    },
+    {
+      "index_zero_based": 3,
+      "bounds_mm": [
+        16.1137,
+        -15.6954,
+        162.246,
+        46.9933,
+        1.3842,
+        168.8256
+      ]
+    },
+    {
+      "index_zero_based": 4,
+      "bounds_mm": [
+        -38.5522,
+        -35.7641,
+        97.6774,
+        18.6647,
+        21.4528,
+        137.3943
+      ]
+    },
+    {
+      "index_zero_based": 5,
+      "bounds_mm": [
+        -38.5929,
+        -35.8048,
+        91.1367,
+        18.7054,
+        21.4935,
+        97.935
+      ]
+    },
+    {
+      "index_zero_based": 6,
+      "bounds_mm": [
+        -39.7055,
+        -33.515,
+        137.1427,
+        19.8179,
+        19.2038,
+        156.3289
+      ]
+    },
+    {
+      "index_zero_based": 7,
+      "bounds_mm": [
+        -50.1621,
+        -47.3738,
+        85.9319,
+        30.2745,
+        98.4806,
+        129.4366
+      ]
+    },
+    {
+      "index_zero_based": 8,
+      "bounds_mm": [
+        -44.696,
+        -23.4675,
+        158.9792,
+        -41.1861,
+        -19.9576,
+        162.9925
+      ]
+    },
+    {
+      "index_zero_based": 9,
+      "bounds_mm": [
+        21.2986,
+        5.6464,
+        158.9792,
+        24.8085,
+        9.1563,
+        162.9925
+      ]
+    },
+    {
+      "index_zero_based": 10,
+      "bounds_mm": [
+        -48.0394,
+        -33.4707,
+        147.1787,
+        19.7736,
+        -16.6142,
+        159.093
+      ]
+    },
+    {
+      "index_zero_based": 11,
+      "bounds_mm": [
+        -39.6612,
+        2.303,
+        147.1787,
+        28.1519,
+        19.1595,
+        159.093
+      ]
+    },
+    {
+      "index_zero_based": 12,
+      "bounds_mm": [
+        -38.5594,
+        -35.7712,
+        80.6671,
+        18.6719,
+        21.46,
+        97.9045
+      ]
+    },
+    {
+      "index_zero_based": 13,
+      "bounds_mm": [
+        -79.5064,
+        -47.0921,
+        90.4817,
+        59.6188,
+        98.2248,
+        167.763
+      ]
+    },
+    {
+      "index_zero_based": 14,
+      "bounds_mm": [
+        -67.8425,
+        -27.114,
+        158.0844,
+        -8.0424,
+        12.8028,
+        272.0292
+      ]
+    },
+    {
+      "index_zero_based": 15,
+      "bounds_mm": [
+        -11.8452,
+        -27.114,
+        158.0844,
+        47.955,
+        12.8028,
+        272.0292
+      ]
+    }
+  ],
+  "warning": "Finger candidate identities and joint axes must be verified against the physical PiKA mechanism before enabling moving-finger masking."
+}

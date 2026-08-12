@@ -25,12 +25,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from real_scripts.real_robot_adapter import (  # noqa: E402
     CameraCalibration,
+    DEFAULT_SCENE_RGBD_CAMERA_NAMES,
     ReplayJsonlAdapter,
     UR7ELinkPointSampler,
     crop_workspace,
     fuse_rgbd_frames,
     load_camera_calibrations,
 )
+from real_scripts.lingbot_depth import add_lingbot_depth_cli_args  # noqa: E402
+from real_scripts.lingbot_depth import create_lingbot_depth_refiner_from_args  # noqa: E402
 
 
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "real_ur_safety_overlay_demo.mp4"
@@ -61,9 +64,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--points-per-link", type=int, default=128)
     parser.add_argument("--gripper-width", type=float, default=0.085)
     parser.add_argument("--pointcloud-stride", type=int, default=2)
+    parser.add_argument("--pointcloud-voxel-size", type=float, default=0.005, help="Fusion voxel size in metres; 0 disables deduplication.")
+    parser.add_argument(
+        "--scene-camera-names",
+        nargs="+",
+        default=DEFAULT_SCENE_RGBD_CAMERA_NAMES,
+        help="Static cameras contributing to the safety point cloud (default: front side).",
+    )
     parser.add_argument("--max-depth", type=float, default=3.0)
     parser.add_argument("--workspace-bounds", nargs=6, type=float, default=None)
     parser.add_argument("--robot-filter-radius", type=float, default=0.045)
+    parser.add_argument(
+        "--robot-filter-mode",
+        choices=("capsules", "points"),
+        default="capsules",
+        help="Capsules use continuous link geometry; points preserves the legacy sparse-point filter.",
+    )
+    parser.add_argument(
+        "--robot-link-radii",
+        nargs=7,
+        type=float,
+        default=(0.080, 0.075, 0.065, 0.055, 0.050, 0.045, 0.070),
+        metavar=("BASE", "SHOULDER", "UPPER", "FOREARM", "WRIST1", "WRIST2", "GRIPPER"),
+        help="Capsule radii in metres; measure/tune them for the installed arm and end effector.",
+    )
+    parser.add_argument("--robot-filter-margin", type=float, default=0.010, help="Extra capsule radius in metres for calibration/noise tolerance.")
     parser.add_argument("--table-z", type=float, default=0.0)
     parser.add_argument("--min-obstacle-height", type=float, default=0.03)
     parser.add_argument("--max-obstacle-height", type=float, default=0.50)
@@ -71,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cluster-points", type=int, default=32)
     parser.add_argument("--point-radius", type=int, default=2)
     parser.add_argument("--debug-npz", type=Path, default=None)
+    add_lingbot_depth_cli_args(parser)
     return parser.parse_args()
 
 
@@ -351,11 +377,20 @@ def run_demo(args: argparse.Namespace) -> int:
         raise ValueError("--max-frames must be > 0")
     if args.fps <= 0.0:
         raise ValueError("--fps must be > 0")
+    if args.pointcloud_voxel_size < 0.0:
+        raise ValueError("--pointcloud-voxel-size must be >= 0")
+    if args.robot_filter_margin < 0.0:
+        raise ValueError("--robot-filter-margin must be >= 0")
+    if args.front_camera_name not in args.scene_camera_names:
+        raise ValueError("--front-camera-name must be included in --scene-camera-names")
+    if args.lingbot_depth and tuple(args.scene_camera_names) != tuple(args.lingbot_camera_names):
+        raise ValueError("--scene-camera-names must match --lingbot-camera-names when --lingbot-depth is enabled")
 
     calibrations = load_camera_calibrations(args.camera_calibration)
     if args.front_camera_name not in calibrations:
         raise KeyError(f"Missing front camera calibration {args.front_camera_name!r}")
     front_calibration = calibrations[args.front_camera_name]
+    depth_refiner = create_lingbot_depth_refiner_from_args(args)
     sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
     adapter = load_adapter(args)
 
@@ -374,20 +409,28 @@ def run_demo(args: argparse.Namespace) -> int:
 
             observation = adapter.get_observation()
             frames = adapter.get_rgbd_frames()
+            if depth_refiner is not None:
+                frames = depth_refiner.refine(frames, calibrations)
             front_frames = [frame for frame in frames if frame.camera_name == args.front_camera_name]
             if not front_frames:
                 raise KeyError(f"Adapter did not return RGB-D frame {args.front_camera_name!r}")
 
             qpos = np.asarray(observation["qpos"], dtype=np.float32).reshape(-1)[:6]
             robot_link_points = sampler.link_points(qpos)
+            robot_link_segments = sampler.link_segments(qpos) if args.robot_filter_mode == "capsules" else None
             cloud = fuse_rgbd_frames(
                 frames,
                 calibrations,
                 robot_link_points=robot_link_points,
+                robot_link_segments=robot_link_segments,
+                robot_link_radii=args.robot_link_radii if robot_link_segments is not None else None,
+                robot_filter_margin=args.robot_filter_margin,
+                camera_names=args.scene_camera_names,
                 stride=args.pointcloud_stride,
                 max_depth=args.max_depth,
                 robot_filter_radius=args.robot_filter_radius,
                 workspace_bounds=args.workspace_bounds,
+                voxel_size=args.pointcloud_voxel_size,
             )
             obstacle_points, obstacle_colors = select_tabletop_obstacle_points(
                 cloud.environment_points,

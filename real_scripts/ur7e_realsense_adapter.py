@@ -68,6 +68,7 @@ class RealSenseD435iSource:
         self._rs = None
         self._pipelines = []
         self._aligns = []
+        self._color_calibrations: dict[str, dict[str, object]] = {}
 
     def start(self) -> None:
         try:
@@ -78,6 +79,7 @@ class RealSenseD435iSource:
         self._rs = rs
         self._pipelines = []
         self._aligns = []
+        self._color_calibrations = {}
         for camera in self.cameras:
             pipeline = rs.pipeline()
             config = rs.config()
@@ -85,7 +87,18 @@ class RealSenseD435iSource:
                 config.enable_device(str(camera.serial))
             config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
             config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-            pipeline.start(config)
+            profile = pipeline.start(config)
+            color_intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            self._color_calibrations[camera.name] = {
+                "intrinsics": [
+                    [float(color_intrinsics.fx), 0.0, float(color_intrinsics.ppx)],
+                    [0.0, float(color_intrinsics.fy), float(color_intrinsics.ppy)],
+                    [0.0, 0.0, 1.0],
+                ],
+                "distortion": [float(value) for value in color_intrinsics.coeffs],
+                "width": int(color_intrinsics.width),
+                "height": int(color_intrinsics.height),
+            }
             self._pipelines.append((camera.name, pipeline))
             self._aligns.append(rs.align(rs.stream.color))
 
@@ -94,6 +107,13 @@ class RealSenseD435iSource:
             pipeline.stop()
         self._pipelines = []
         self._aligns = []
+        self._color_calibrations = {}
+
+    def get_color_calibrations(self) -> dict[str, dict[str, object]]:
+        """Return SDK-reported colour intrinsics for the RGB-aligned depth stream."""
+        if not self._color_calibrations:
+            raise RuntimeError("RealSenseD435iSource is not started")
+        return {name: dict(item) for name, item in self._color_calibrations.items()}
 
     def read(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         if self._rs is None or not self._pipelines:

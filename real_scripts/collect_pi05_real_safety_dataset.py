@@ -19,11 +19,14 @@ for path in (REPO_ROOT, OPENPI_CLIENT_SRC):
         sys.path.insert(0, path_str)
 
 from real_scripts.real_robot_adapter import (  # noqa: E402
+    DEFAULT_SCENE_RGBD_CAMERA_NAMES,
     ReplayJsonlAdapter,
     UR7ELinkPointSampler,
     fuse_rgbd_frames,
     load_camera_calibrations,
 )
+from real_scripts.lingbot_depth import add_lingbot_depth_cli_args  # noqa: E402
+from real_scripts.lingbot_depth import create_lingbot_depth_refiner_from_args  # noqa: E402
 from scripts.collect_pi05_libero_safety_decoder_dataset import (  # noqa: E402
     CollectedSampleBuffer,
     ReplanSampleRecord,
@@ -59,9 +62,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-width", type=float, default=0.085)
     parser.add_argument("--robot-filter-radius", type=float, default=0.045)
     parser.add_argument("--pointcloud-stride", type=int, default=2)
+    parser.add_argument("--pointcloud-voxel-size", type=float, default=0.005)
+    parser.add_argument("--scene-camera-names", nargs="+", default=DEFAULT_SCENE_RGBD_CAMERA_NAMES)
     parser.add_argument("--max-depth", type=float, default=3.0)
     parser.add_argument("--workspace-bounds", nargs=6, type=float, default=None)
     parser.add_argument("--camera-calibration", type=Path, default=None)
+    parser.add_argument("--robot-filter-mode", choices=("capsules", "points"), default="capsules")
+    parser.add_argument(
+        "--robot-link-radii",
+        nargs=7,
+        type=float,
+        default=(0.080, 0.075, 0.065, 0.055, 0.050, 0.045, 0.070),
+        metavar=("BASE", "SHOULDER", "UPPER", "FOREARM", "WRIST1", "WRIST2", "GRIPPER"),
+    )
+    parser.add_argument("--robot-filter-margin", type=float, default=0.010)
     parser.add_argument("--debug-pointcloud-output", type=Path, default=None)
     parser.add_argument(
         "--adapter",
@@ -72,6 +86,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--replay-jsonl", type=Path, default=None)
+    add_lingbot_depth_cli_args(parser)
     return parser.parse_args()
 
 
@@ -191,9 +206,18 @@ def run_collection(args: argparse.Namespace) -> int:
         raise ValueError("--max-steps must be > 0")
     if args.max_samples <= 0:
         raise ValueError("--max-samples must be > 0")
+    if args.pointcloud_voxel_size < 0.0:
+        raise ValueError("--pointcloud-voxel-size must be >= 0")
+    if args.robot_filter_margin < 0.0:
+        raise ValueError("--robot-filter-margin must be >= 0")
 
     sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
     calibrations = load_camera_calibrations(args.camera_calibration) if args.camera_calibration is not None else None
+    if args.lingbot_depth and calibrations is None:
+        raise ValueError("--lingbot-depth requires --camera-calibration")
+    if args.lingbot_depth and tuple(args.scene_camera_names) != tuple(args.lingbot_camera_names):
+        raise ValueError("--scene-camera-names must match --lingbot-camera-names when --lingbot-depth is enabled")
+    depth_refiner = create_lingbot_depth_refiner_from_args(args)
     adapter = load_adapter(args)
     policy = load_policy_client(args.policy_server_host, args.policy_server_port)
 
@@ -213,15 +237,24 @@ def run_collection(args: argparse.Namespace) -> int:
             surface_frames.append(link_points)
 
             if calibrations is not None:
+                rgbd_frames = adapter.get_rgbd_frames()
+                if depth_refiner is not None:
+                    rgbd_frames = depth_refiner.refine(rgbd_frames, calibrations)
+                robot_link_segments = sampler.link_segments(qpos) if args.robot_filter_mode == "capsules" else None
                 debug_clouds.append(
                     fuse_rgbd_frames(
-                        adapter.get_rgbd_frames(),
+                        rgbd_frames,
                         calibrations,
                         robot_link_points=link_points,
+                        robot_link_segments=robot_link_segments,
+                        robot_link_radii=args.robot_link_radii if robot_link_segments is not None else None,
+                        robot_filter_margin=args.robot_filter_margin,
+                        camera_names=args.scene_camera_names,
                         stride=args.pointcloud_stride,
                         max_depth=args.max_depth,
                         robot_filter_radius=args.robot_filter_radius,
                         workspace_bounds=args.workspace_bounds,
+                        voxel_size=args.pointcloud_voxel_size,
                     )
                 )
 
