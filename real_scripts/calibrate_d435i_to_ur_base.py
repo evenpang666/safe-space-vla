@@ -98,15 +98,30 @@ def _charuco_pose(
         raise FileNotFoundError(f"Could not read image {image_path}")
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
     board = cv2.aruco.CharucoBoard((int(squares_x), int(squares_y)), float(square_length_m), float(marker_length_m), dictionary)
-    detector = cv2.aruco.CharucoDetector(board)
-    corners, ids, _, _ = detector.detectBoard(image)
+
+    # Fixed cameras may see a calibration board at only a few pixels per
+    # marker.  Upsampling the captured image and relaxing only the marker
+    # perimeter threshold preserves the original image measurements while
+    # allowing the ChArUco corner interpolation to succeed.
+    detection_scale = 2.0
+    detection_image = cv2.resize(image, None, fx=detection_scale, fy=detection_scale, interpolation=cv2.INTER_CUBIC)
+    detector_params = cv2.aruco.DetectorParameters()
+    detector_params.minMarkerPerimeterRate = 0.005
+    detector_params.adaptiveThreshWinSizeMin = 3
+    detector_params.adaptiveThreshWinSizeMax = 53
+    detector_params.adaptiveThreshWinSizeStep = 4
+    detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector = cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), detector_params)
+    corners, ids, _, _ = detector.detectBoard(detection_image)
     if ids is None or len(ids) < 6:
         raise RuntimeError(f"Detected fewer than 6 ChArUco corners in {image_path}; improve board visibility")
     object_points, image_points = board.matchImagePoints(corners, ids)
-    success, rvec, tvec = cv2.solvePnP(object_points, image_points, intrinsics, distortion, flags=cv2.SOLVEPNP_ITERATIVE)
+    scaled_intrinsics = np.asarray(intrinsics, dtype=np.float64).copy()
+    scaled_intrinsics[:2, :] *= detection_scale
+    success, rvec, tvec = cv2.solvePnP(object_points, image_points, scaled_intrinsics, distortion, flags=cv2.SOLVEPNP_ITERATIVE)
     if not success:
         raise RuntimeError(f"solvePnP failed for {image_path}")
-    reprojection, _ = cv2.projectPoints(object_points, rvec, tvec, intrinsics, distortion)
+    reprojection, _ = cv2.projectPoints(object_points, rvec, tvec, scaled_intrinsics, distortion)
     rms_px = float(np.sqrt(np.mean(np.sum((reprojection.reshape(-1, 2) - image_points.reshape(-1, 2)) ** 2, axis=1))))
     rotation, _ = cv2.Rodrigues(rvec)
     board_to_camera = np.eye(4, dtype=np.float64)

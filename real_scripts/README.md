@@ -227,6 +227,70 @@ silhouette-only mask.
    tolerance only from measured residuals; do not delete every pixel behind a
    robot silhouette.
 
+### 3.3 Current UR7e dual-D435i fusion and filled-volume mask
+
+The current fixed-camera setup uses these two colour-stream serial numbers:
+
+```text
+front = 405622074939
+side  = 348522070576
+UR RTDE IP = 169.254.175.10
+```
+
+Use the `safety` Conda environment. The live command below is receive-only for
+the robot: it reads `actual_q` through RTDE before and after capture, sends no
+motion/control command, runs LingBot-Depth on the two RGB-D frames, fuses them
+in `ur_base`, then removes UR7e points. Keep the robot stationary while the
+capture is made; the CPU LingBot pass takes about 40 seconds on this machine.
+
+```powershell
+conda run -n safety python real_scripts\capture_fuse_separate_ur7e_live.py `
+  --robot-ip 169.254.175.10 `
+  --front-serial 405622074939 `
+  --side-serial 348522070576 `
+  --calibration real_scripts\ur7e_d435i_camera_calibration.json `
+  --output-dir outputs\ur7e_d435i_live_lingbot_urdf
+```
+
+Its default robot removal is a two-part test: rendered mesh-depth agreement
+plus a **filled collision volume**. The official collision STLs have small
+openings, so each mesh is voxelized, filled, and expanded outwards by the
+default **15 mm**. This masks points inside the robot and tolerates small
+extrinsic/depth errors without deleting all pixels behind the silhouette.
+Defaults are `--volume-voxel-pitch-m 0.006` and
+`--volume-exterior-margin-m 0.015`. Increase the margin only after checking
+the saved `*_urdf_removed_overlay.png` images for accidental deletion of nearby
+objects.
+
+The output directory contains:
+
+```text
+lingbot_fused_scene_viewer.html          fused two-camera cloud
+ur7e_urdf_observed_viewer.html           points attributed to UR7e
+environment_without_ur7e_viewer.html     filtered environment cloud
+front_urdf_removed_overlay.png           magenta = removed robot points
+side_urdf_removed_overlay.png
+summary.json                             qpos, synchronization, and point counts
+```
+
+To re-filter a previously captured LingBot RGB-D pair with the current RTDE
+pose and the same 15 mm volume margin, run:
+
+```powershell
+conda run -n safety python real_scripts\filter_ur7e_urdf_mesh_depth.py `
+  --input-dir outputs\ur7e_d435i_live_lingbot_urdf `
+  --output-dir outputs\ur7e_d435i_live_lingbot_urdf\ur7e_body_filled_15mm `
+  --robot-ip 169.254.175.10 `
+  --absolute-tolerance-m 0.025 `
+  --relative-tolerance 0.03 `
+  --dilation-pixels 4
+```
+
+For PiKA, only add `--pika-mount-transform-json <measured-transform.json>`
+after measuring `^flange T_pika_step_frame`. The current
+`pika_mount_candidate_unverified.json` is a visual-fit diagnostic, not a
+production or safety calibration.
+
 ## 4. Passive real-time verification
 
 The following command only reads robot/camera state, repairs depth, fuses the
