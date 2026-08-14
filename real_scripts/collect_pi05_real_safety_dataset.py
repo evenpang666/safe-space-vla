@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import importlib
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from real_scripts.real_robot_adapter import (  # noqa: E402
 )
 from real_scripts.lingbot_depth import add_lingbot_depth_cli_args  # noqa: E402
 from real_scripts.lingbot_depth import create_lingbot_depth_refiner_from_args  # noqa: E402
+from real_scripts.ur7e_safety_episode_recorder import UR7eSafetyEpisodeRecorder  # noqa: E402
 from scripts.collect_pi05_libero_safety_decoder_dataset import (  # noqa: E402
     CollectedSampleBuffer,
     ReplanSampleRecord,
@@ -59,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=256)
     parser.add_argument("--replan-steps", type=int, default=4)
     parser.add_argument("--points-per-link", type=int, default=128)
+    parser.add_argument(
+        "--robot-point-source",
+        choices=("urdf_collision_surface", "legacy_centerline"),
+        default="urdf_collision_surface",
+        help="Training point topology. The URDF collision surface is the fixed-identity default; legacy centre lines are only for compatibility.",
+    )
     parser.add_argument("--gripper-width", type=float, default=0.085)
     parser.add_argument("--robot-filter-radius", type=float, default=0.045)
     parser.add_argument("--pointcloud-stride", type=int, default=2)
@@ -77,6 +85,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--robot-filter-margin", type=float, default=0.010)
     parser.add_argument("--debug-pointcloud-output", type=Path, default=None)
+    parser.add_argument(
+        "--episode-dir",
+        type=Path,
+        default=None,
+        help="Optional new directory for asynchronous raw RGB-D, robot-state, and VLA-query recording.",
+    )
+    parser.add_argument("--episode-queue-size", type=int, default=128)
+    parser.add_argument(
+        "--drop-episode-records-on-backpressure",
+        action="store_true",
+        help="Drop raw records rather than raising when the disk-writer queue is full. The episode manifest records every drop.",
+    )
     parser.add_argument(
         "--adapter",
         default=None,
@@ -112,8 +132,10 @@ def load_policy_client(host: str, port: int):
     return websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
 
 
-def query_policy_action_and_prefix(policy, payload: dict) -> tuple[np.ndarray, np.ndarray]:
+def query_policy_action_and_prefix(policy, payload: dict) -> tuple[np.ndarray, np.ndarray, int, int]:
+    request_timestamp_ns = time.monotonic_ns()
     result = policy.infer(payload)
+    response_timestamp_ns = time.monotonic_ns()
     if "actions" not in result:
         raise KeyError("Policy response must contain 'actions'")
     if "prefix_tokens" not in result:
@@ -121,7 +143,12 @@ def query_policy_action_and_prefix(policy, payload: dict) -> tuple[np.ndarray, n
             "Policy response must contain 'prefix_tokens'. Start scripts/serve_pi05_prefix_policy.py, "
             "not OpenPI's default serve_policy.py."
         )
-    return np.asarray(result["actions"], dtype=np.float32), np.asarray(result["prefix_tokens"], dtype=np.float32)
+    return (
+        np.asarray(result["actions"], dtype=np.float32),
+        np.asarray(result["prefix_tokens"], dtype=np.float32),
+        request_timestamp_ns,
+        response_timestamp_ns,
+    )
 
 
 def load_adapter(args: argparse.Namespace):
@@ -147,6 +174,10 @@ def append_real_trajectory_samples(
     policy_config: str,
     checkpoint_dir: str,
     points_per_link: int,
+    point_ids: np.ndarray | None = None,
+    local_link_points: np.ndarray | None = None,
+    point_identity_version: str | None = None,
+    surface_model_hash: str | None = None,
 ) -> int:
     buffer = CollectedSampleBuffer()
     libero_records = [
@@ -177,8 +208,12 @@ def append_real_trajectory_samples(
             samples_per_action=1,
             policy_config=policy_config,
             checkpoint_dir=checkpoint_dir,
-            skeleton_source="ur7e_fk_surface",
+            skeleton_source="ur7e_collision_mesh_surface" if point_identity_version is not None else "ur7e_fk_centerline_legacy",
             target_source="real_rollout_surface",
+            point_ids=point_ids,
+            local_link_points=local_link_points,
+            point_identity_version=point_identity_version,
+            surface_model_hash=surface_model_hash,
         )
     return appended
 
@@ -211,7 +246,13 @@ def run_collection(args: argparse.Namespace) -> int:
     if args.robot_filter_margin < 0.0:
         raise ValueError("--robot-filter-margin must be >= 0")
 
-    sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
+    if args.robot_point_source == "urdf_collision_surface":
+        from real_scripts.ur7e_collision_mesh import UR7eCollisionSurfacePointSampler
+
+        sampler = UR7eCollisionSurfacePointSampler(points_per_link=args.points_per_link)
+    else:
+        sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
+    capsule_sampler = UR7ELinkPointSampler(points_per_link=args.points_per_link, gripper_width=args.gripper_width)
     calibrations = load_camera_calibrations(args.camera_calibration) if args.camera_calibration is not None else None
     if args.lingbot_depth and calibrations is None:
         raise ValueError("--lingbot-depth requires --camera-calibration")
@@ -220,6 +261,21 @@ def run_collection(args: argparse.Namespace) -> int:
     depth_refiner = create_lingbot_depth_refiner_from_args(args)
     adapter = load_adapter(args)
     policy = load_policy_client(args.policy_server_host, args.policy_server_port)
+    recorder = None
+    if args.episode_dir is not None:
+        recorder = UR7eSafetyEpisodeRecorder(
+            args.episode_dir,
+            queue_size=args.episode_queue_size,
+            drop_on_backpressure=args.drop_episode_records_on_backpressure,
+            calibration_path=args.camera_calibration,
+            manifest={
+                "prompt": args.prompt,
+                "policy_config": args.policy_config,
+                "policy_server": f"{args.policy_server_host}:{args.policy_server_port}",
+                "scene_camera_names": list(args.scene_camera_names),
+                "lingbot_depth_enabled": bool(args.lingbot_depth),
+            },
+        )
 
     records: list[RealReplanSample] = []
     surface_frames: list[np.ndarray] = []
@@ -227,20 +283,25 @@ def run_collection(args: argparse.Namespace) -> int:
     action_chunk: np.ndarray | None = None
     action_offset = 0
     replan_offset = 0
+    active_policy_query_id: int | None = None
+    next_policy_query_id = 0
 
     adapter.reset()
     try:
         for step_id in range(int(args.max_steps)):
             observation = adapter.get_observation()
+            robot_state_timestamp_ns = time.monotonic_ns()
             qpos = np.asarray(observation["qpos"], dtype=np.float32).reshape(-1)[:6]
+            gripper_state = np.asarray(observation.get("gripper", [0.0]), dtype=np.float32).reshape(-1)
             link_points = sampler.link_points(qpos)
             surface_frames.append(link_points)
 
+            raw_rgbd_frames = adapter.get_rgbd_frames() if (calibrations is not None or recorder is not None) else []
             if calibrations is not None:
-                rgbd_frames = adapter.get_rgbd_frames()
+                rgbd_frames = raw_rgbd_frames
                 if depth_refiner is not None:
                     rgbd_frames = depth_refiner.refine(rgbd_frames, calibrations)
-                robot_link_segments = sampler.link_segments(qpos) if args.robot_filter_mode == "capsules" else None
+                robot_link_segments = capsule_sampler.link_segments(qpos) if args.robot_filter_mode == "capsules" else None
                 debug_clouds.append(
                     fuse_rgbd_frames(
                         rgbd_frames,
@@ -261,9 +322,19 @@ def run_collection(args: argparse.Namespace) -> int:
             need_query = action_chunk is None or action_offset >= len(action_chunk) or replan_offset >= args.replan_steps
             if need_query:
                 payload = build_ur7_policy_input(observation, prompt=args.prompt)
-                action_chunk, prefix_tokens = query_policy_action_and_prefix(policy, payload)
+                action_chunk, prefix_tokens, query_start_ns, query_end_ns = query_policy_action_and_prefix(policy, payload)
                 action_offset = 0
                 replan_offset = 0
+                active_policy_query_id = next_policy_query_id
+                next_policy_query_id += 1
+                if recorder is not None:
+                    recorder.record_policy_query(
+                        query_id=active_policy_query_id,
+                        request_timestamp_ns=query_start_ns,
+                        response_timestamp_ns=query_end_ns,
+                        prefix_tokens=prefix_tokens,
+                        action_chunk=action_chunk,
+                    )
                 if len(records) < int(args.max_samples):
                     records.append(
                         RealReplanSample(
@@ -276,6 +347,17 @@ def run_collection(args: argparse.Namespace) -> int:
                     )
 
             action = np.asarray(action_chunk[action_offset], dtype=np.float32)
+            if recorder is not None:
+                recorder.record_tick(
+                    tick_id=step_id,
+                    frames=raw_rgbd_frames,
+                    qpos=qpos,
+                    gripper_state=gripper_state,
+                    robot_state_timestamp_ns=robot_state_timestamp_ns,
+                    policy_query_id=active_policy_query_id,
+                    action_index=action_offset,
+                    commanded_action=action,
+                )
             adapter.execute_action(action)
             action_offset += 1
             replan_offset += 1
@@ -286,7 +368,11 @@ def run_collection(args: argparse.Namespace) -> int:
         final_qpos = np.asarray(final_observation["qpos"], dtype=np.float32).reshape(-1)[:6]
         surface_frames.append(sampler.link_points(final_qpos))
     finally:
-        adapter.close()
+        try:
+            adapter.close()
+        finally:
+            if recorder is not None:
+                recorder.close()
 
     surface_array = np.stack(surface_frames).astype(np.float32)
     appended = append_real_trajectory_samples(
@@ -298,6 +384,10 @@ def run_collection(args: argparse.Namespace) -> int:
         policy_config=args.policy_config,
         checkpoint_dir=args.checkpoint_dir,
         points_per_link=args.points_per_link,
+        point_ids=getattr(sampler, "point_ids", None),
+        local_link_points=getattr(sampler, "local_link_points", None),
+        point_identity_version=getattr(sampler, "point_identity_version", None),
+        surface_model_hash=getattr(sampler, "mesh_model_hash", None),
     )
     maybe_save_debug_pointcloud(args.debug_pointcloud_output, debug_clouds, link_points=surface_frames)
     return appended

@@ -161,7 +161,15 @@ class LingBotDepthRefiner:
             )
         refined_depth = refined_depth[0]
         refined_depth[~np.isfinite(refined_depth) | (refined_depth < self.minimum_depth_m)] = 0.0
-        return RGBDFrame(frame.camera_name, rgb, refined_depth.astype(np.float32))
+        return RGBDFrame(
+            frame.camera_name,
+            rgb,
+            refined_depth.astype(np.float32),
+            host_timestamp_ns=frame.host_timestamp_ns,
+            device_timestamp_ms=frame.device_timestamp_ms,
+            frame_number=frame.frame_number,
+            timestamp_domain=frame.timestamp_domain,
+        )
 
     def refine(
         self,

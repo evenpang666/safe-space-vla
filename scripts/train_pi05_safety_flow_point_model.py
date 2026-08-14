@@ -114,8 +114,30 @@ def _load_dataset_tensors_file(path: Path) -> tuple[torch.Tensor, torch.Tensor, 
     return prefix_tokens, arm_points, target_point_offsets
 
 
+def _dataset_signature(path: Path) -> dict[str, str]:
+    """Metadata that must agree before point-flow datasets may be concatenated."""
+    required = ("coordinate_frame", "skeleton_source", "policy_config")
+    optional = ("point_identity_version", "surface_model_hash", "action_mode")
+    with np.load(path, allow_pickle=False) as data:
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(f"{path} lacks required safety-dataset metadata: {missing}")
+        result = {key: str(np.asarray(data[key]).item()) for key in required}
+        result.update({key: str(np.asarray(data[key]).item()) if key in data else "<absent>" for key in optional})
+    return result
+
+
 def load_dataset_tensors(dataset: DatasetInput) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     paths = resolve_dataset_paths(dataset)
+    signatures = [_dataset_signature(path) for path in paths]
+    reference_signature = signatures[0]
+    for path, signature in zip(paths[1:], signatures[1:], strict=True):
+        if signature != reference_signature:
+            differing = {key: (reference_signature[key], signature[key]) for key in reference_signature if reference_signature[key] != signature[key]}
+            raise ValueError(
+                "Refusing to mix incompatible safety datasets. "
+                f"reference={paths[0]}, candidate={path}, differences={differing}"
+            )
     loaded = [_load_dataset_tensors_file(path) for path in paths]
     if len(loaded) == 1:
         return loaded[0]

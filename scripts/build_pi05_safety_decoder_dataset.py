@@ -48,13 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-action", type=int, default=1)
     parser.add_argument(
         "--skeleton-source",
-        choices=["surface", "anchors", "geom"],
+        choices=["surface"],
         default="surface",
-        help=(
-            "'surface' samples fixed surface points on robot0_link1..link7; "
-            "'anchors' samples clean robot0_link0..link7 arm skeleton; "
-            "'geom' samples all robot geom axes."
-        ),
+        help="Fixed surface points on robot0_link1..link7. Centre-line and geom-axis targets were retired.",
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--mujoco-gl", choices=["egl", "osmesa", "glfw"], default=None)
@@ -430,19 +426,9 @@ def fk_target_link_points(
 
     start, actions = normalize_fk_inputs(start_joint_vector, action_chunk, len(qpos_indices))
     joint_path = swept.integrate_joint_path(start, actions, low, high, samples_per_action)
-    if skeleton_source == "surface":
-        return fk_surface_link_points(env, qpos_indices, np.asarray(geom_ids, dtype=np.int64), joint_path, points_per_link)
-    if skeleton_source == "anchors":
-        return fk_anchor_link_points(env, qpos_indices, joint_path, points_per_link)
-    if skeleton_source != "geom":
-        raise ValueError(f"Unsupported skeleton_source: {skeleton_source}")
-    segment_path, _geom_kinds, _geom_names, _color_ids, link_names = swept.geom_skeleton_path(
-        env,
-        qpos_indices,
-        np.asarray(geom_ids, dtype=np.int64),
-        joint_path,
-    )
-    return link_targets.sample_link_points_from_segments(segment_path, points_per_link), link_names
+    if skeleton_source != "surface":
+        raise ValueError("Only fixed surface point flow is supported")
+    return fk_surface_link_points(env, qpos_indices, np.asarray(geom_ids, dtype=np.int64), joint_path, points_per_link)
 
 
 def main() -> None:

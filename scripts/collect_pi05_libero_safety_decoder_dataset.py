@@ -1015,11 +1015,24 @@ def save_collected_dataset(
     checkpoint_dir: str,
     skeleton_source: str = "surface",
     target_source: str = "rollout_surface",
+    point_ids: np.ndarray | None = None,
+    local_link_points: np.ndarray | None = None,
+    point_identity_version: str | None = None,
+    surface_model_hash: str | None = None,
 ) -> None:
     if len(buffer) == 0:
         raise ValueError("No samples were collected; refusing to write an empty dataset")
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    identity_metadata = {}
+    if point_ids is not None:
+        identity_metadata["point_ids"] = np.asarray(point_ids, dtype=np.int32)
+    if local_link_points is not None:
+        identity_metadata["local_link_points"] = np.asarray(local_link_points, dtype=np.float32)
+    if point_identity_version is not None:
+        identity_metadata["point_identity_version"] = np.asarray(str(point_identity_version))
+    if surface_model_hash is not None:
+        identity_metadata["surface_model_hash"] = np.asarray(str(surface_model_hash))
     np.savez_compressed(
         output,
         prefix_tokens=np.stack(buffer.prefix_tokens).astype(np.float32),
@@ -1047,6 +1060,7 @@ def save_collected_dataset(
         target_source=np.asarray(target_source),
         policy_config=np.asarray(policy_config),
         checkpoint_dir=np.asarray(checkpoint_dir),
+        **identity_metadata,
     )
 
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Generate LIBERO robot skeleton swept point clouds from FK samples.
+"""Generate diagnostic LIBERO robot-geometry swept point clouds from FK samples.
 
 This is the LIBERO counterpart of visualize_robosuite_joint_swept_surfaces.py:
 it integrates a joint-delta chunk, builds sparse skeleton segments at every FK
 sample, and samples the swept ruled surfaces made by those segments over time.
-By default, skeleton segments come from each robot geom's envelope center axis.
-The legacy joint-anchor line mode is still available with --skeleton-source
-anchors.
+This is a visualization/diagnostic utility; safety-model training uses fixed
+surface point flow from ``build_pi05_safety_decoder_dataset.py`` instead.
 """
 
 from __future__ import annotations
@@ -93,12 +92,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-width", type=float, default=0.08, help="Virtual gripper segment length in meters.")
     parser.add_argument(
         "--skeleton-source",
-        choices=["geom", "anchors"],
+        choices=["geom"],
         default="geom",
-        help=(
-            "Source for swept skeleton segments. 'geom' uses robot geom envelope center axes; "
-            "'anchors' keeps the legacy robot0_link0..link7 joint-anchor lines."
-        ),
+        help="Robot geom envelope center axes for diagnostic visualization only.",
     )
     parser.add_argument(
         "--swept-point-link-samples",

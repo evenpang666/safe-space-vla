@@ -54,6 +54,13 @@ class RGBDFrame:
     camera_name: str
     rgb: np.ndarray
     depth_m: np.ndarray
+    # These fields describe the acquisition, rather than the processing time.
+    # They are optional so existing offline callers can construct RGBDFrame from
+    # an image/depth pair, but real-hardware collection should populate them.
+    host_timestamp_ns: int | None = None
+    device_timestamp_ms: float | None = None
+    frame_number: int | None = None
+    timestamp_domain: str | None = None
 
     def __post_init__(self) -> None:
         rgb = np.asarray(self.rgb, dtype=np.uint8)
@@ -62,8 +69,30 @@ class RGBDFrame:
             raise ValueError(f"rgb must have shape (H, W, 3), got {rgb.shape}")
         if depth_m.shape != rgb.shape[:2]:
             raise ValueError(f"depth_m shape {depth_m.shape} must match rgb height/width {rgb.shape[:2]}")
+        if self.host_timestamp_ns is not None and int(self.host_timestamp_ns) < 0:
+            raise ValueError("host_timestamp_ns must be non-negative")
+        if self.device_timestamp_ms is not None and not np.isfinite(float(self.device_timestamp_ms)):
+            raise ValueError("device_timestamp_ms must be finite when supplied")
+        if self.frame_number is not None and int(self.frame_number) < 0:
+            raise ValueError("frame_number must be non-negative")
         object.__setattr__(self, "rgb", rgb)
         object.__setattr__(self, "depth_m", depth_m)
+        if self.host_timestamp_ns is not None:
+            object.__setattr__(self, "host_timestamp_ns", int(self.host_timestamp_ns))
+        if self.device_timestamp_ms is not None:
+            object.__setattr__(self, "device_timestamp_ms", float(self.device_timestamp_ms))
+        if self.frame_number is not None:
+            object.__setattr__(self, "frame_number", int(self.frame_number))
+        if self.timestamp_domain is not None:
+            object.__setattr__(self, "timestamp_domain", str(self.timestamp_domain))
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        """Compatibility with legacy ``source.read()[name][0/1]`` callers."""
+        if index == 0:
+            return self.rgb
+        if index == 1:
+            return self.depth_m
+        raise IndexError(index)
 
 
 @dataclass(frozen=True)

@@ -289,13 +289,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--points-per-link", type=int, default=24, help="Flow model FK samples per clean arm link.")
     parser.add_argument(
         "--skeleton-source",
-        choices=["surface", "anchors", "geom"],
+        choices=["surface"],
         default="surface",
-        help=(
-            "'surface' uses fixed surface points on robot0_link1..link7; "
-            "'anchors' uses the clean 7-link robot0_link0..link7 skeleton; "
-            "'geom' uses all robot geom axes."
-        ),
+        help="Fixed surface points on robot0_link1..link7; legacy centre-line variants are retired.",
     )
     parser.add_argument("--resize-size", type=int, default=224)
     parser.add_argument("--env-resolution", type=int, default=256)

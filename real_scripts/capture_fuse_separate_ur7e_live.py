@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=45)
+    parser.add_argument("--lingbot-device", default=None, help="Torch device for LingBot; defaults to CUDA when available.")
     parser.add_argument("--samples-per-face", type=int, default=16)
     parser.add_argument("--absolute-tolerance-m", type=float, default=0.012)
     parser.add_argument("--relative-tolerance", type=float, default=0.015)
@@ -107,9 +108,7 @@ def main() -> None:
         np.save(output_dir / f"{frame.camera_name}_raw_depth_m.npy", frame.depth_m)
         Image.fromarray(depth_to_vis(frame.depth_m, vis_max=2.5, with_colorbar=True)).save(output_dir / f"{frame.camera_name}_raw_depth.png")
 
-    # The local safety environment is CPU-only, so this deliberately chooses
-    # the tested PyTorch-SDPA compatibility path (no FP16 / no xFormers).
-    refiner = LingBotDepthRefiner(device="cpu", use_fp16=False)
+    refiner = LingBotDepthRefiner(device=args.lingbot_device, use_fp16=(args.lingbot_device is None or str(args.lingbot_device).lower().startswith("cuda")))
     refined = refiner.refine(frames, calibrations)
     occupied_volume, volume_pitch = occupied_collision_voxels(
         qpos,

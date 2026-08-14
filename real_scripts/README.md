@@ -273,6 +273,50 @@ side_urdf_removed_overlay.png
 summary.json                             qpos, synchronization, and point counts
 ```
 
+### 3.4 Live fused-cloud browser viewer
+
+`live_ur7e_scene_viewer.py` provides a local browser interface for the full
+live pipeline. Every displayed frame has gone through RGB-D capture,
+LingBot-Depth repair, UR-base fusion, UR7e/PiKA mesh removal, isolated-point
+cleanup, and tabletop-connected obstacle clustering. The display uses:
+
+- native-colour points: filtered environment cloud;
+- red points: points attributed to the UR7e and PiKA;
+- green wireframes: only 3-D clusters connected to the fitted tabletop plane.
+
+An OBB is created only from the following chain: points first classified as
+non-UR7e/non-PiKA → points at least 25 mm above the tabletop → isolated-point
+filter → 3-D connected component → component has a point within 50 mm of the
+tabletop. Bare tabletop points and floating components are excluded; red robot
+points are never an OBB input.
+
+It opens a browser at `http://127.0.0.1:8765` and uses RTDE receive only; it
+never sends robot motion or control commands.
+
+```powershell
+conda run -n safety python real_scripts\live_ur7e_scene_viewer.py `
+  --robot-ip 169.254.175.10 `
+  --front-serial 405622074939 `
+  --side-serial 348522070576
+```
+
+The default filled-mesh margin is 15 mm. Isolated tabletop points whose nearest
+distinct neighbour is farther than 20 mm are removed before clustering. A
+cluster must have at least one point within 50 mm of the fitted tabletop plane
+to receive an obstacle OBB; suspended clusters are excluded. Use Ctrl+C in the
+terminal to stop the viewer.
+
+The viewer defaults to CUDA LingBot-Depth. On the current RTX 5060 laptop the
+GPU repair takes about 1.6 seconds and the optimized full live update about
+2.6 seconds. The browser keeps the most recently completed frame visible until
+the next repaired and fused frame is ready.  UR7e/PiKA filled-mesh voxels are
+cached under `outputs/live_ur7e_mesh_voxel_cache/`; they retain the same 15 mm
+volume expansion while avoiding STL voxelization on every frame.
+
+For a faster but sparser display/fusion use `--point-stride 4`; the default
+`--point-stride 3` is the recommended balance. Use `--point-stride 2` only
+when inspecting small geometry, as it increases CPU point processing.
+
 To re-filter a previously captured LingBot RGB-D pair with the current RTDE
 pose and the same 15 mm volume margin, run:
 

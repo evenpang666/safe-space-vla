@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import time
 from typing import Protocol, Sequence
 
 import numpy as np
@@ -39,7 +40,7 @@ class RGBDSource(Protocol):
 
     def stop(self) -> None: ...
 
-    def read(self) -> dict[str, tuple[np.ndarray, np.ndarray]]: ...
+    def read(self) -> dict[str, RGBDFrame | tuple[np.ndarray, np.ndarray]]: ...
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ class D435iCameraConfig:
 
 
 class RealSenseD435iSource:
-    """Small pyrealsense2 wrapper returning RGB uint8 and depth in meters."""
+    """Small pyrealsense2 wrapper returning timestamped RGB-D frames."""
 
     def __init__(
         self,
@@ -119,10 +120,10 @@ class RealSenseD435iSource:
             raise RuntimeError("RealSenseD435iSource is not started")
         return {name: dict(item) for name, item in self._color_calibrations.items()}
 
-    def read(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def read(self) -> dict[str, RGBDFrame]:
         if self._rs is None or not self._pipelines:
             raise RuntimeError("RealSenseD435iSource is not started")
-        frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        frames: dict[str, RGBDFrame] = {}
         for (name, pipeline), align in zip(self._pipelines, self._aligns):
             aligned = None
             last_error: Exception | None = None
@@ -147,7 +148,19 @@ class RealSenseD435iSource:
             rgb = np.ascontiguousarray(np.asarray(color_frame.get_data(), dtype=np.uint8))
             depth_scale = float(depth_frame.get_units())
             depth_m = np.asarray(depth_frame.get_data(), dtype=np.float32) * depth_scale
-            frames[name] = (rgb, depth_m.astype(np.float32))
+            # The camera timestamp is retained even though two independent
+            # D435i devices may not share a clock.  host_timestamp_ns is the
+            # common-clock arrival marker used to calculate/validate skew.
+            timestamp_domain = str(depth_frame.get_frame_timestamp_domain())
+            frames[name] = RGBDFrame(
+                name,
+                rgb,
+                depth_m.astype(np.float32),
+                host_timestamp_ns=time.monotonic_ns(),
+                device_timestamp_ms=float(depth_frame.get_timestamp()),
+                frame_number=int(depth_frame.get_frame_number()),
+                timestamp_domain=timestamp_domain,
+            )
         return frames
 
 
@@ -173,7 +186,7 @@ class UR7eRealSenseAdapter:
         self.velocity = float(velocity)
         self.wait_after_arm_s = float(wait_after_arm_s)
         self._closed = False
-        self._latest_frames: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
+        self._latest_frames: dict[str, RGBDFrame] | None = None
 
     def reset(self) -> None:
         self.controller.connect()
@@ -181,9 +194,15 @@ class UR7eRealSenseAdapter:
         self._closed = False
         self._latest_frames = None
 
-    def _read_frames(self, *, refresh: bool = False) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _read_frames(self, *, refresh: bool = False) -> dict[str, RGBDFrame]:
         if refresh or self._latest_frames is None:
-            self._latest_frames = self.camera_source.read()
+            raw_frames = self.camera_source.read()
+            self._latest_frames = {
+                name: value
+                if isinstance(value, RGBDFrame)
+                else RGBDFrame(name, np.asarray(value[0], dtype=np.uint8), np.asarray(value[1], dtype=np.float32))
+                for name, value in raw_frames.items()
+            }
         return self._latest_frames
 
     def get_observation(self) -> dict:
@@ -199,7 +218,7 @@ class UR7eRealSenseAdapter:
         for name in self.camera_names:
             if name not in frames:
                 raise KeyError(f"Missing D435i camera frame {name!r}")
-            observation[f"{name}_rgb"] = np.ascontiguousarray(frames[name][0].astype(np.uint8))
+            observation[f"{name}_rgb"] = np.ascontiguousarray(frames[name].rgb)
         return observation
 
     def get_rgbd_frames(self) -> list[RGBDFrame]:
@@ -208,8 +227,7 @@ class UR7eRealSenseAdapter:
         for name in self.camera_names:
             if name not in frames:
                 raise KeyError(f"Missing D435i camera frame {name!r}")
-            rgb, depth_m = frames[name]
-            rgbd_frames.append(RGBDFrame(name, np.asarray(rgb, dtype=np.uint8), np.asarray(depth_m, dtype=np.float32)))
+            rgbd_frames.append(frames[name])
         return rgbd_frames
 
     def execute_action(self, action: np.ndarray) -> None:
