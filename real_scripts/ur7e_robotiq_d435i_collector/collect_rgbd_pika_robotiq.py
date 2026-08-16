@@ -40,7 +40,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_UR_ROBOT_IP = "169.254.26.10"
+DEFAULT_UR_ROBOT_IP = "169.254.175.10"
 
 STATE_NAMES = [
     "joint_0",

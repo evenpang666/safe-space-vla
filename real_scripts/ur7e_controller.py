@@ -32,7 +32,7 @@ import math
 import threading
 from typing import Any, Iterable, Sequence
 
-ROBOT_IP = "169.254.26.10"
+ROBOT_IP = "169.254.175.10"
 URSCRIPT_PORT = 30003
 URSCRIPT_SECONDARY_PORT = 30002
 RTDE_PORT = 30004

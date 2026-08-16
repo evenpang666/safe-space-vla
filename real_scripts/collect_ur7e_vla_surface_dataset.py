@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episode-dir", type=Path, required=True, help="New directory for raw real-hardware episode data.")
+    parser.add_argument("--camera-calibration", type=Path, required=True, help="Measured fixed-camera calibration copied into the raw episode for offline RGB-D preprocessing.")
     parser.add_argument("--inference-root", type=Path, default=DEFAULT_INFERENCE_ROOT)
     parser.add_argument("--inference-config", type=Path, required=True, help="ur7e_inference YAML config defining action semantics and limits.")
     parser.add_argument("--front-serial", default=None)
@@ -110,6 +111,7 @@ def run_collection(args: argparse.Namespace) -> int:
             "surface_model_hash": sampler.mesh_model_hash,
             "point_identity_version": sampler.point_identity_version,
         },
+        calibration_path=args.camera_calibration,
     )
     records: list[ReplanRecord] = []
     surface_frames: list[np.ndarray] = []

@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Iterable, Protocol, Sequence
+from typing import Any, Iterable, Protocol, Sequence
 
 import numpy as np
 
@@ -47,6 +47,17 @@ class CameraCalibration:
             raise ValueError(f"camera_to_world must have shape (4, 4), got {camera_to_world.shape}")
         object.__setattr__(self, "intrinsics", intrinsics)
         object.__setattr__(self, "camera_to_world", camera_to_world)
+
+
+@dataclass(frozen=True)
+class CameraCalibrationSession:
+    """Calibrations plus the point-cloud mode declared by their JSON file."""
+
+    calibrations: dict[str, CameraCalibration]
+    camera_names: tuple[str, ...]
+    fusion_enabled: bool
+    camera_serials: dict[str, str | None]
+    camera_streams: dict[str, tuple[int, int, int] | None]
 
 
 @dataclass(frozen=True)
@@ -507,6 +518,54 @@ def load_camera_calibrations(path: Path) -> dict[str, CameraCalibration]:
             camera_to_world=np.asarray(item["camera_to_world"], dtype=np.float64),
         )
     return calibrations
+
+
+def load_camera_calibration_session(path: Path) -> CameraCalibrationSession:
+    """Load calibration JSON and infer whether cloud fusion is required.
+
+    New integrated-calibration files carry ``fusion.enabled``.  Older files
+    have no such field, for which camera count is the backwards-compatible
+    declaration: one camera means direct point-cloud generation; multiple
+    calibrated cameras mean voxel fusion in their shared world frame.
+    """
+    with Path(path).open("r", encoding="utf-8") as f:
+        payload: Any = json.load(f)
+    if not isinstance(payload, dict) or "cameras" not in payload:
+        raise ValueError(f"Calibration file {path} must contain a top-level 'cameras' object")
+    calibrations = load_camera_calibrations(path)
+    camera_names = tuple(calibrations)
+    if not camera_names:
+        raise ValueError(f"Calibration file {path} contains no cameras")
+    fusion = payload.get("fusion")
+    if fusion is not None and not isinstance(fusion, dict):
+        raise ValueError("Calibration field 'fusion' must be an object when present")
+    declared = None if fusion is None else fusion.get("enabled")
+    if declared is not None and not isinstance(declared, bool):
+        raise ValueError("Calibration field 'fusion.enabled' must be boolean when present")
+    required = len(camera_names) > 1
+    if declared is not None and declared != required:
+        raise ValueError(
+            f"Calibration fusion.enabled={declared} conflicts with its {len(camera_names)} calibrated camera(s)"
+        )
+    camera_payloads = payload["cameras"]
+    serials = {
+        name: (str(camera_payloads[name]["serial"]) if camera_payloads[name].get("serial") not in (None, "") else None)
+        for name in camera_names
+    }
+    streams: dict[str, tuple[int, int, int] | None] = {}
+    for name in camera_names:
+        item = camera_payloads[name]
+        values = (item.get("width"), item.get("height"), item.get("fps"))
+        if all(value is None for value in values):
+            streams[name] = None
+            continue
+        if any(value is None for value in values):
+            raise ValueError(f"Camera {name!r} must record width, height, and fps together")
+        width, height, fps = (int(value) for value in values)
+        if width <= 0 or height <= 0 or fps <= 0:
+            raise ValueError(f"Camera {name!r} stream width, height, and fps must be positive")
+        streams[name] = (width, height, fps)
+    return CameraCalibrationSession(calibrations, camera_names, required, serials, streams)
 
 
 class ReplayJsonlAdapter:

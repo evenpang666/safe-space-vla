@@ -158,6 +158,50 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
+    def _run_joint_transformer(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        suffix_embs: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+        adarms_cond: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the shared PaliGemma/action-expert stack and return suffix states.
+
+        Kept separate so auxiliary PI05 heads can consume the same action-expert
+        tokens rather than a detached post-hoc VLM feature.
+        """
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
+        return suffix_out[:, -self.config.action_horizon :].to(dtype=torch.float32)
+
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
@@ -329,40 +373,15 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        suffix_out = self._run_joint_transformer(
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            suffix_embs,
+            suffix_pad_masks,
+            suffix_att_masks,
+            adarms_cond,
         )
-
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
 
         # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
@@ -459,3 +478,201 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+
+class PI05SafetyPytorch(PI0Pytorch):
+    """PI05 with an in-model robot-surface point-flow auxiliary head.
+
+    Robot points and measured joints are appended as non-causal prefix tokens,
+    so both the PI05 action expert and the point head use the same visual/text
+    context.  The point head predicts direct base-frame offsets for every
+    action-chunk step; its validity mask is applied only to the auxiliary loss.
+    """
+
+    def __init__(self, config):
+        if not config.pi05:
+            raise ValueError("PI05SafetyPytorch requires Pi0Config(pi05=True)")
+        super().__init__(config)
+        prefix_width = int(self.paligemma_with_expert.paligemma.config.text_config.hidden_size)
+        expert_width = int(self.action_in_proj.out_features)
+        self.surface_point_prefix_proj = nn.Sequential(
+            nn.Linear(3, prefix_width), nn.SiLU(), nn.Linear(prefix_width, prefix_width)
+        )
+        self.surface_joint_prefix_proj = nn.Sequential(
+            nn.Linear(6, prefix_width), nn.SiLU(), nn.Linear(prefix_width, prefix_width)
+        )
+        self.surface_point_query_proj = nn.Sequential(
+            nn.Linear(3, expert_width), nn.SiLU(), nn.Linear(expert_width, expert_width)
+        )
+        self.surface_joint_query_proj = nn.Sequential(
+            nn.Linear(6, expert_width), nn.SiLU(), nn.Linear(expert_width, expert_width)
+        )
+        self.surface_offset_head = nn.Sequential(
+            nn.Linear(expert_width, expert_width), nn.SiLU(), nn.Linear(expert_width, 3)
+        )
+        # Start at a stationary surface field; the pretrained action path stays
+        # unchanged until the auxiliary objective supplies a gradient.
+        nn.init.zeros_(self.surface_offset_head[-1].weight)
+        nn.init.zeros_(self.surface_offset_head[-1].bias)
+
+    @staticmethod
+    def _validate_surface_inputs(robot_points: Tensor, joint_positions: Tensor) -> None:
+        if robot_points.ndim != 3 or robot_points.shape[-1] != 3:
+            raise ValueError(f"robot_points must have shape [B, K, 3], got {tuple(robot_points.shape)}")
+        if joint_positions.ndim != 2 or joint_positions.shape[-1] != 6:
+            raise ValueError(f"joint_positions must have shape [B, 6], got {tuple(joint_positions.shape)}")
+        if robot_points.shape[0] != joint_positions.shape[0]:
+            raise ValueError("robot_points and joint_positions must have the same batch size")
+        if not torch.isfinite(robot_points).all() or not torch.isfinite(joint_positions).all():
+            raise ValueError("robot_points and joint_positions must be finite")
+
+    def embed_safety_prefix(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        robot_points: Tensor,
+        joint_positions: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        self._validate_surface_inputs(robot_points, joint_positions)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        points = robot_points.to(dtype=self.surface_point_prefix_proj[0].weight.dtype)
+        joints = joint_positions.to(dtype=self.surface_joint_prefix_proj[0].weight.dtype)
+        point_embs = self.surface_point_prefix_proj(points)
+        joint_emb = self.surface_joint_prefix_proj(joints)[:, None, :]
+        extra_embs = torch.cat((joint_emb, point_embs), dim=1).to(dtype=prefix_embs.dtype)
+        batch_size = robot_points.shape[0]
+        extra_masks = torch.ones(
+            batch_size, extra_embs.shape[1], dtype=torch.bool, device=prefix_pad_masks.device
+        )
+        extra_att_masks = torch.zeros(
+            batch_size, extra_embs.shape[1], dtype=prefix_att_masks.dtype, device=prefix_att_masks.device
+        )
+        return (
+            torch.cat((prefix_embs, extra_embs), dim=1),
+            torch.cat((prefix_pad_masks, extra_masks), dim=1),
+            torch.cat((prefix_att_masks, extra_att_masks), dim=1),
+        )
+
+    def _predict_surface_offsets(
+        self, suffix_out: Tensor, robot_points: Tensor, joint_positions: Tensor
+    ) -> Tensor:
+        self._validate_surface_inputs(robot_points, joint_positions)
+        if suffix_out.ndim != 3 or suffix_out.shape[0] != robot_points.shape[0]:
+            raise ValueError("suffix_out must have shape [B, H, D] with the same batch as robot_points")
+        point_features = self.surface_point_query_proj(
+            robot_points.to(dtype=self.surface_point_query_proj[0].weight.dtype)
+        )[:, None, :, :]
+        joint_features = self.surface_joint_query_proj(
+            joint_positions.to(dtype=self.surface_joint_query_proj[0].weight.dtype)
+        )[:, None, None, :]
+        features = suffix_out.to(dtype=point_features.dtype)[:, :, None, :] + point_features + joint_features
+        return self.surface_offset_head(features).to(dtype=torch.float32)
+
+    def compute_losses(
+        self,
+        observation,
+        actions: Tensor,
+        robot_points: Tensor,
+        joint_positions: Tensor,
+        target_point_offsets: Tensor,
+        target_point_mask: Tensor | None = None,
+        *,
+        point_loss_weight: float = 1.0,
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Return jointly differentiable action flow-matching and point-flow losses."""
+        if actions.ndim != 3 or actions.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                f"actions must have shape [B, H, {self.config.action_dim}], got {tuple(actions.shape)}"
+            )
+        if actions.shape[1] != self.config.action_horizon:
+            raise ValueError("actions horizon must match config.action_horizon")
+        expected_shape = (actions.shape[0], self.config.action_horizon, robot_points.shape[1], 3)
+        if tuple(target_point_offsets.shape) != expected_shape:
+            raise ValueError(f"target_point_offsets must have shape {expected_shape}, got {tuple(target_point_offsets.shape)}")
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1.0 - time_expanded) * actions
+        action_target = noise - actions
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_safety_prefix(
+            images, img_masks, lang_tokens, lang_masks, robot_points, joint_positions
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_out = self._run_joint_transformer(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond
+        )
+        action_velocity = self.action_out_proj(suffix_out)
+        point_offsets = self._predict_surface_offsets(suffix_out, robot_points, joint_positions)
+        action_loss = F.mse_loss(action_velocity, action_target)
+        point_error = (point_offsets - target_point_offsets.to(dtype=point_offsets.dtype)).square().mean(dim=-1)
+        if target_point_mask is None:
+            point_loss = point_error.mean()
+        else:
+            if tuple(target_point_mask.shape) != point_error.shape:
+                raise ValueError(f"target_point_mask must have shape {tuple(point_error.shape)}, got {tuple(target_point_mask.shape)}")
+            mask = target_point_mask.to(device=point_error.device, dtype=point_error.dtype)
+            point_loss = (point_error * mask).sum() / mask.sum().clamp_min(1.0)
+        total_loss = action_loss + float(point_loss_weight) * point_loss
+        return {
+            "loss": total_loss,
+            "action_loss": action_loss.detach(),
+            "point_loss": point_loss.detach(),
+            "action_velocity": action_velocity,
+            "point_offsets": point_offsets,
+        }
+
+    def forward(self, observation, actions, robot_points, joint_positions, target_point_offsets, target_point_mask=None, **kwargs):
+        return self.compute_losses(
+            observation,
+            actions,
+            robot_points,
+            joint_positions,
+            target_point_offsets,
+            target_point_mask,
+            **kwargs,
+        )
+
+    @torch.no_grad()
+    def sample_actions_and_point_offsets(
+        self, device, observation, robot_points: Tensor, joint_positions: Tensor, noise=None, num_steps=10
+    ) -> tuple[Tensor, Tensor]:
+        """Sample an action chunk and its corresponding point-cloud offsets."""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            noise = self.sample_noise((bsize, self.config.action_horizon, self.config.action_dim), device)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_safety_prefix(
+            images, img_masks, lang_tokens, lang_masks, robot_points, joint_positions
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=self._prepare_attention_masks_4d(prefix_att_2d_masks),
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            x_t = x_t + dt * self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, time.expand(bsize))
+            time += dt
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, torch.zeros(bsize, dtype=torch.float32, device=device)
+        )
+        suffix_out = self._run_joint_transformer(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond
+        )
+        return x_t, self._predict_surface_offsets(suffix_out, robot_points, joint_positions)

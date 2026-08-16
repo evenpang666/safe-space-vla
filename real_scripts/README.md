@@ -1,378 +1,201 @@
-# Real UR7e Safety Geometry Pipeline
+# UR7e 实机标定与点云流程
 
-This directory implements the real-hardware geometry chain used by the safety
-module:
+本目录用于固定 RealSense D435i、UR7e 和 ChArUco 板的标定、点云生成与机器人点剔除。
 
 ```text
-front / side D435i RGB-D
-  → (optional) LingBot-Depth metric depth repair
-  → back-project with colour-stream intrinsics
-  → transform each cloud into the UR base frame
-  → voxel fusion
-  → remove the UR7e/PiKA with mesh-depth consistency (or capsule fallback)
-  → workspace/tabletop filtering and obstacle OBBs
+RealSense RGB-D → 深度修正（可选）→ UR base 点云 → 多相机融合（可选）
+→ UR7e/PiKA 点剔除 → 环境点云 / OBB
 ```
 
-`front` and `side` are the two fixed scene cameras used for the safety point
-cloud. `wrist` remains available to PI05, but is intentionally not fused: its
-pose changes with the robot and needs a separate dynamic extrinsic pipeline.
+## 约定与安全
 
-## 0. Safety and coordinate convention
+- 所有长度、深度和位姿均使用米；`camera_to_world` 表示 `^base T_camera`。
+- 标定和采集时保持机器人静止，保留急停可达；实机结果必须复核后才能接入安全控制。
+- 深度已对齐到彩色图，因此标定和点云投影始终使用对应分辨率的彩色内参。
+- 多相机 USB 帧并非硬件同步；仅用于静态场景或低速场景。高速测量请使用硬件同步或时间戳筛选。
 
-- Keep the robot stopped or in reduced-speed/manual mode while collecting
-  calibration data. The passive demo never sends actions, but the collector
-  does.
-- All distances, depths, workspace limits, link radii, and transforms are in
-  **metres**.
-- `camera_to_world` in the calibration JSON means `^base T_camera`: it maps a
-  point in the RGB-aligned D435i colour-camera frame into the UR controller's
-  `base` frame. In this workflow, `world == ur_base`.
-- The depth stream is aligned to the colour stream in
-  `RealSenseD435iSource`; therefore both PnP and depth back-projection use the
-  **colour** intrinsics at the live stream resolution.
-- The two USB devices are read independently. The included fusion path is for
-  static obstacles and a robot pose sampled in the same control cycle. For
-  fast-moving obstacles or metrology, use D435i hardware synchronization (or
-  record and reject frames outside a measured timestamp skew) before fusion.
-
-Set the fixed-camera serials before using any live command:
+运行环境需要 `pyrealsense2`、`ur-rtde`、`opencv-contrib-python`（包含 `cv2.aruco`）、`trimesh`，以及可选的 LingBot-Depth 依赖。
 
 ```bash
-export UR_ROBOT_IP=169.254.26.10
-export REAL_SENSE_FRONT_SERIAL=front_camera_serial
-export REAL_SENSE_SIDE_SERIAL=right_camera_serial
-export REAL_SENSE_WRIST_SERIAL=wrist_camera_serial  # PI05 only
+cd /path/to/safety-module
+python -m pip install opencv-contrib-python ur-rtde trimesh
 ```
 
-## 1. Camera calibration: D435i colour frame to UR base
+## 快速开始
 
-The checked-in `ur7e_d435i_camera_calibration.example.json` is only a schema
-example. It has placeholder identities and must never be used for a safety
-decision.
+### 1. 一体化标定
 
-### 1.1 Prepare the calibration target
+先在 PolyScope 中完成实际探针的 TCP 工具偏置标定；本脚本用该已校准探针建立 ChArUco 板到 UR base 的变换，并不计算新的法兰到工具 TCP 偏置。
 
-Mount one rigid ChArUco board in the common workspace where both fixed cameras
-can see it. Record its exact parameters: OpenCV dictionary, `squares_x`,
-`squares_y`, square side length, and marker side length. The board must not move
-after its pose in the robot base has been measured.
-
-Determine `^base T_board` by either:
-
-1. Using a calibrated TCP probe to touch at least four non-collinear known
-   ChArUco board corners and recording their positions from the UR controller;
-   provide paired board-frame and base-frame coordinates below; or
-2. Providing a previously surveyed `board_to_base` 4×4 transform.
-
-For the probe route, create `outputs/calibration/board_base_points.json` using
-the same ChArUco board coordinate convention as OpenCV:
-
-```json
-{
-  "board_points_m": [[0.0, 0.0, 0.0], [0.04, 0.0, 0.0], [0.0, 0.04, 0.0], [0.04, 0.04, 0.0]],
-  "base_points_m": [[0.41, -0.17, 0.02], [0.41, -0.13, 0.02], [0.37, -0.17, 0.02], [0.37, -0.13, 0.02]]
-}
-```
-
-The numbers are illustrative. The script rejects a correspondence fit whose
-RMS exceeds 3 mm; remeasure rather than accepting it. Ensure the TCP's tool
-offset is calibrated before probing.
-
-### 1.2 Capture actual D435i intrinsics and board images
-
-This captures one settled RGB frame per camera and exports the RealSense SDK
-intrinsics and distortion coefficients for exactly that stream configuration:
+将 ChArUco 板固定在所有相机都可见的位置，记录其真实参数后运行：
 
 ```bash
-python real_scripts/capture_d435i_calibration_frame.py \
-  --output-dir outputs/calibration/d435i \
-  --width 640 --height 480 --fps 30
-```
+export UR_ROBOT_IP=169.254.175.10
 
-Check that `front_rgb.png` and `side_rgb.png` contain many sharp board corners.
-Retake them if there is blur, glare, or partial visibility.
-
-### 1.3 Solve and write the calibration JSON
-
-Install `opencv-contrib-python` (not just base OpenCV) because ChArUco needs
-`cv2.aruco`, then run with the physical board dimensions:
-
-```bash
-python real_scripts/calibrate_d435i_to_ur_base.py \
-  --input-dir outputs/calibration/d435i \
-  --board-base-correspondences-json outputs/calibration/board_base_points.json \
+python real_scripts/calibrate_ur7e_realsense_integrated.py \
+  --serials 123456789012 234567890123 \
+  --robot-ip "$UR_ROBOT_IP" \
+  --output-dir outputs/calibration/session_01 \
   --squares-x 7 --squares-y 5 \
-  --square-length-m 0.040 --marker-length-m 0.030 \
-  --output real_scripts/ur7e_d435i_camera_calibration.json
+  --square-length-m 0.040 \
+  --marker-length-m 0.030
 ```
 
-The script solves `^camera T_board` with PnP and writes:
+脚本依次执行：
+
+1. 读取所选 RealSense 彩色流内参与畸变参数；
+2. 启动全部相机，检查 ChArUco 可见性、四个指定内角点和重投影误差；
+3. 计算每台相机相对 ChArUco 板的外参；
+4. 提示操作者依次触碰四个内角点，回车后读取 TCP 的 UR base 坐标；
+5. 拟合 `^base T_board`。若四点误差超限，脚本会指出最可疑的角点并只要求重采该点；
+6. 写出最终标定文件。
+
+主要输出：
 
 ```text
-^base T_camera = ^base T_board · inverse(^camera T_board)
+outputs/calibration/session_01/
+├── camera_calibration.json            # 后续点云流程使用此文件
+├── realsense_color_intrinsics.json
+├── camera_extrinsics_charuco_board.json
+└── board_base_correspondences.json
 ```
 
-for both cameras. It rejects high ChArUco reprojection error by default. The
-output JSON can be passed directly to all commands below.
+`camera_calibration.json` 记录相机序列号、标定时的宽高/FPS、`^base T_camera` 和融合模式。不要使用仓库中的 `*.example.json` 做实机安全决策。
 
-### 1.4 Validate the extrinsics before enabling safety actions
-
-Run the passive overlay command in section 4 with a board or rigid object in
-both views. Its point clouds should overlap in the base frame. Also probe a few
-visible physical points with the TCP and compare their base coordinates to the
-reconstructed cloud. Increase `--robot-filter-margin` and all downstream safety
-margins by the measured residual; do not compensate with arbitrary transforms
-or ICP alone.
-
-## 2. Optional LingBot-Depth repair
-
-Install [LingBot-Depth](https://github.com/Robbyant/lingbot-depth) in the same
-runtime that executes the safety geometry process. The upstream project pins
-PyTorch/xFormers, so validate compatibility with the OpenPI CUDA environment
-before altering a production deployment.
+### 2. 生成点云
 
 ```bash
-git clone https://github.com/Robbyant/lingbot-depth /opt/lingbot-depth
-python -m pip install -e /opt/lingbot-depth
+python real_scripts/capture_fuse_separate_ur7e_live.py \
+  --robot-ip "$UR_ROBOT_IP" \
+  --calibration outputs/calibration/session_01/camera_calibration.json \
+  --output-dir outputs/ur7e_live_scene
 ```
 
-`--lingbot-depth` loads the recommended v0.5 model once, then for every frame:
+脚本会从标定文件自动读取相机序列号与标定流配置：
 
-1. sends RGB in `[0, 1]`, raw D435i depth in metres, and normalized colour
-   intrinsics to `MDMModel.infer`;
-2. removes non-finite/invalid output; and
-3. returns repaired `front` and `side` frames only for reconstruction.
+- 标定文件只有一台相机：直接生成该相机的 UR-base 点云，不融合。
+- 标定文件有多台相机：采集所有已标定相机，执行原有的体素融合。
 
-Default FP16 inference needs CUDA. For functional CPU diagnostics use
-`--lingbot-device cpu --no-lingbot-fp16`; it is not appropriate for a live
-control loop.
-
-## 3. Fusion and robot-point screening
-
-The online tools default to:
-
-- `--scene-camera-names front side`: fixed cameras only;
-- `--pointcloud-voxel-size 0.005`: average overlapping samples in 5 mm voxels;
-- `--robot-filter-mode capsules`: test each point against the continuous
-  distance to every FK link segment, avoiding the gaps in the old sparse-link
-  sampler; and
-- `--robot-filter-margin 0.010`: an extra 10 mm for model, calibration, and
-  depth uncertainty.
-
-The seven default capsule radii are conservative initial values for the
-UR7e links and gripper. They are not a replacement for your actual end-effector
-geometry: measure the installed gripper/tool, then supply all values with
-`--robot-link-radii BASE SHOULDER UPPER FOREARM WRIST1 WRIST2 GRIPPER`.
-
-For the final production-grade mask, replace/augment the capsule filter with a
-URDF collision-mesh depth render in each camera before fusion. The official
-`ur_description` package provides UR7e link meshes; add your gripper/tool mesh
-and robot-specific kinematics calibration. The capsule filter is the complete,
-dependency-free runtime fallback included in this repository and is safer than
-the previous sparse-point radius test, but it cannot model cables or unmodelled
-tooling exactly.
-
-### 3.1 PiKA-ready assets and mesh-depth interface
-
-The repository already contains the preparation that does not require a ChArUco
-board:
+之后的 LingBot 深度修正、UR7e/PiKA 深度与体积剔除、环境点云导出逻辑相同。结果包括：
 
 ```text
-assets/robot_models/ur_description/                 official UR7e description
-assets/robot_models/pika_gripper/collision/          PiKA collision STL exports
-assets/robot_models/ur7e_pika/                       Xacro wrapper and config template
+outputs/ur7e_live_scene/
+├── lingbot_fused_scene.ply
+├── lingbot_fused_scene_viewer.html
+├── environment_without_ur7e.ply
+├── *_urdf_removed_overlay.png
+└── summary.json                         # 含 point_cloud_mode 和 fusion_enabled
 ```
 
-The PiKA STEP source unit is millimetres. Every PiKA mesh must therefore use
-the URDF scale `0.001 0.001 0.001`. Before live use, copy
-`assets/robot_models/ur7e_pika/ur7e_pika_mask.example.json` to a non-example
-configuration, fill the measured `flange_to_pika_step_frame`, and replace the
-camera calibration placeholder. The preflight check is deliberately split:
+旧标定文件若不含序列号，可补充映射：
 
 ```bash
-# Works now: validates source meshes and PiKA state convention.
-python real_scripts/validate_ur7e_pika_mask_config.py \
-  assets/robot_models/ur7e_pika/ur7e_pika_mask.example.json
-
-# Run only after measuring PiKA mounting and camera-to-base transforms.
-python real_scripts/validate_ur7e_pika_mask_config.py \
-  assets/robot_models/ur7e_pika/ur7e_pika_mask.json --ready-for-live-mask
+python real_scripts/capture_fuse_separate_ur7e_live.py \
+  --calibration real_scripts/ur7e_d435i_camera_calibration.json \
+  --camera-serial front=405622074939 \
+  --camera-serial side=348522070576
 ```
 
-Normalize messages from PiKA `/gripper/data` or `/gripper/joint_states` with
-`PikaGripperState` in `real_scripts/pika_gripper_state.py`. Its opening range
-is checked as 0–0.095 m, and `nearest_pika_state` rejects a state more than
-20 ms from an RGB-D timestamp by default.
+## PI05 联合训练数据预处理
 
-For each camera, render **only** the robot collision geometry into an
-RGB-camera depth image. Pass that render to `fuse_rgbd_frames(...,
-rendered_robot_depths={"front": front_render, "side": side_render})`. The
-included `robot_depth_keep_mask` removes a measurement only when it agrees with
-the rendered robot surface (default: `8 mm + 1%` depth tolerance and 1-pixel
-dilation). It retains an object physically in front of the gripper, unlike a
-silhouette-only mask.
+原始 PI05 episode 由 `UR7eSafetyEpisodeRecorder` 保存 RGB、深度、关节、夹爪、动作和时间戳。深度不能直接作为未来点流标签：可见的机器人点会因遮挡而改变数量和顺序。请离线运行下面的预处理器；它利用标定和深度重建机器人观测点用于质量审计，但输出只保存 RGB、状态、动作和有固定 ID 的碰撞面点集。
 
-### 3.2 First-day procedure after the board arrives
+```bash
+python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir outputs/raw_episode_001 \
+  --output outputs/pi05_surface/episode_001.npz \
+  --pika-mount-transform-json <measured-flange-to-pika.json> \
+  --scene-camera-names front side \
+  --scene-camera-map front=123456789012 \
+  --scene-camera-map side=234567890123
+```
 
-1. Capture D435i colour intrinsics and board frames, then produce the camera
-   calibration JSON using section 1.
-2. Measure `^flange T_pika_step_frame` with PiKA installed; also replace the
-   generic UR7e kinematics YAML with calibration extracted from this controller.
-3. At fully open and fully closed PiKA positions, verify the two candidate
-   finger meshes and encode their motion. Keep the full PiKA mesh fixed until
-   this check is complete.
-4. Render the assembled collision model for front and side, call the mesh-depth
-   filter before projection/fusion, then run the passive overlay in section 4.
-5. Check a held object and an empty gripper from both cameras. Raise depth
-   tolerance only from measured residuals; do not delete every pixel behind a
-   robot silhouette.
+如果 episode 相机名与标定文件键相同，可省略 `--scene-camera-map`。输出不含深度数组，包含：
 
-### 3.3 Current UR7e dual-D435i fusion and filled-volume mask
+- `rgb_*`、`task_text`、`qpos`、`gripper_state`、`actions`；
+- `fixed_link_points[T, L, P, 3]` 与稳定的 `point_ids[L, P, 2]`；
+- `current_link_points[N, K, 3]`、`action_chunks[N, H, 7]` 和 `target_point_offsets[N, H, K, 3]`；
+- `observed_robot_point_counts[T, C]` 与时间戳偏差，用于拒绝标定差或遮挡严重的 episode。
 
-The current fixed-camera setup uses these two colour-stream serial numbers:
+### 可选：真实机器人表面轨迹
+
+若要采用 PointWorld 式的“同一初始像素 seed 在各帧的可见表面对应”，先在**一个固定相机**的全段 RGB 上运行 CoTracker（或任意 2D tracker），再把结果保存成 NPZ：
 
 ```text
-front = 405622074939
-side  = 348522070576
-UR RTDE IP = 169.254.175.10
+tracks_xy[T, M, 2]   # 颜色图像像素坐标 (u, v)，第 m 列为永久 seed ID
+visibility[T, M]     # 跟踪器可见性
+confidence[T, M]     # 可选；缺失时视为 1
+tick_ids[T]          # raw episode 的 tick_id，必须唯一
+seed_xy[M, 2]        # 可选；缺失时使用 tracks_xy[0]
 ```
 
-Use the `safety` Conda environment. The live command below is receive-only for
-the robot: it reads `actual_q` through RTDE before and after capture, sends no
-motion/control command, runs LingBot-Depth on the two RGB-D frames, fuses them
-in `ur_base`, then removes UR7e points. Keep the robot stationary while the
-capture is made; the CPU LingBot pass takes about 40 seconds on this machine.
+传入该文件后，预处理器以实测深度回投每个轨迹点，并要求其深度与 FK 渲染的 UR7e/PiKA 表面一致；遮挡、漂移、深度无效或低置信度的点只会变为 `False`，绝不会删除或改变 ID：
 
-```powershell
-conda run -n safety python real_scripts\capture_fuse_separate_ur7e_live.py `
-  --robot-ip 169.254.175.10 `
-  --front-serial 405622074939 `
-  --side-serial 348522070576 `
-  --calibration real_scripts\ur7e_d435i_camera_calibration.json `
-  --output-dir outputs\ur7e_d435i_live_lingbot_urdf
+```bash
+python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir outputs/raw_episode_001 \
+  --output outputs/pi05_surface/episode_001.npz \
+  --pika-mount-transform-json <measured-flange-to-pika.json> \
+  --scene-camera-names front side \
+  --scene-camera-map front=123456789012 \
+  --scene-camera-map side=234567890123 \
+  --robot-tracks outputs/tracks/episode_001_front.npz \
+  --robot-tracks-camera front
 ```
 
-Its default robot removal is a two-part test: rendered mesh-depth agreement
-plus a **filled collision volume**. The official collision STLs have small
-openings, so each mesh is voxelized, filled, and expanded outwards by the
-default **15 mm**. This masks points inside the robot and tolerates small
-extrinsic/depth errors without deleting all pixels behind the silhouette.
-Defaults are `--volume-voxel-pitch-m 0.006` and
-`--volume-exterior-margin-m 0.015`. Increase the margin only after checking
-the saved `*_urdf_removed_overlay.png` images for accidental deletion of nearby
-objects.
+输出新增 `visual_robot_track_xy[T,M,2]`、`visual_robot_tracks[T,M,3]`、`visual_robot_visible_mask[T,M]`、`visual_robot_future_offsets[N,H,M,3]` 和 `visual_robot_flow_supervision_mask[N,H,M]`。损失必须只在最后一个 mask 为真的位置计算。`fixed_link_points` 仍是 FK 得到的确定性机器人运动条件；视觉轨迹适合监督真实表面残差、附着物或标定/执行误差，不能取代 FK。
 
-The output directory contains:
+`collect_ur7e_vla_surface_dataset.py` 现在要求 `--camera-calibration`，并把该文件复制到 raw episode 中，供预处理器默认读取。PyTorch PI05 已有联合点流头；若部署 JAX/Flax PI05，则必须实现同构头部，不能直接复用原先独立 PyTorch SafetyModule 的权重。
 
-```text
-lingbot_fused_scene_viewer.html          fused two-camera cloud
-ur7e_urdf_observed_viewer.html           points attributed to UR7e
-environment_without_ur7e_viewer.html     filtered environment cloud
-front_urdf_removed_overlay.png           magenta = removed robot points
-side_urdf_removed_overlay.png
-summary.json                             qpos, synchronization, and point counts
+### PyTorch PI05 联合训练
+
+仓库的 PyTorch PI05 已增加 `PI05SafetyPytorch`：关节角与稳定点集进入 PI05 的非因果 prefix；同一个 action-expert 后缀同时输出动作流匹配速度和未来点偏移。用预处理后的真实 episode 训练：
+
+```bash
+cd openpi
+uv run --project . ../scripts/train_pi05_ur7e_surface_pytorch.py \
+  --dataset ../outputs/pi05_surface \
+  --output ../outputs/pi05_ur7e_joint/last.pt \
+  --pretrained /path/to/pi05_pytorch/model.safetensors \
+  --camera-map front=base_0_rgb \
+  --camera-map side=left_wrist_0_rgb \
+  --point-target fixed \
+  --max-points 128 \
+  --batch-size 1 --epochs 20
 ```
 
-### 3.4 Live fused-cloud browser viewer
+`--max-points 128` 对每个 sample 使用固定的等间隔点下标；需要全量点云时设为 `0`，但 Transformer 前缀长度和显存会显著增加。`--point-target visual` 使用已接入 CoTracker 轨迹并由深度/FK 门控后的 `visual_robot_*` 字段；此时点流损失只在其可见性 mask 为真的位置计算。checkpoint 会保存真实 UR 动作与 qpos 的均值/标准差；推理时必须将前 7 维预测动作反归一化，未来点云为 `current_points + predicted_offsets`。
 
-`live_ur7e_scene_viewer.py` provides a local browser interface for the full
-live pipeline. Every displayed frame has gone through RGB-D capture,
-LingBot-Depth repair, UR-base fusion, UR7e/PiKA mesh removal, isolated-point
-cleanup, and tabletop-connected obstacle clustering. The display uses:
+当前 PiKA 采样器把完整夹爪视为刚性法兰附件；若训练数据包含明显的开合运动，需要先标定手指运动学并把夹爪拆成独立固定点组，否则仅应将这些点用于保守碰撞包络。
 
-- native-colour points: filtered environment cloud;
-- red points: points attributed to the UR7e and PiKA;
-- green wireframes: only 3-D clusters connected to the fitted tabletop plane.
+## 可选功能
 
-An OBB is created only from the following chain: points first classified as
-non-UR7e/non-PiKA → points at least 25 mm above the tabletop → isolated-point
-filter → 3-D connected component → component has a point within 50 mm of the
-tabletop. Bare tabletop points and floating components are excluded; red robot
-points are never an OBB input.
+### LingBot-Depth
 
-It opens a browser at `http://127.0.0.1:8765` and uses RTDE receive only; it
-never sends robot motion or control commands.
-
-```powershell
-conda run -n safety python real_scripts\live_ur7e_scene_viewer.py `
-  --robot-ip 169.254.175.10 `
-  --front-serial 405622074939 `
-  --side-serial 348522070576
-```
-
-The default filled-mesh margin is 15 mm. Isolated tabletop points whose nearest
-distinct neighbour is farther than 20 mm are removed before clustering. A
-cluster must have at least one point within 50 mm of the fitted tabletop plane
-to receive an obstacle OBB; suspended clusters are excluded. Use Ctrl+C in the
-terminal to stop the viewer.
-
-The viewer defaults to CUDA LingBot-Depth. On the current RTX 5060 laptop the
-GPU repair takes about 1.6 seconds and the optimized full live update about
-2.6 seconds. The browser keeps the most recently completed frame visible until
-the next repaired and fused frame is ready.  UR7e/PiKA filled-mesh voxels are
-cached under `outputs/live_ur7e_mesh_voxel_cache/`; they retain the same 15 mm
-volume expansion while avoiding STL voxelization on every frame.
-
-For a faster but sparser display/fusion use `--point-stride 4`; the default
-`--point-stride 3` is the recommended balance. Use `--point-stride 2` only
-when inspecting small geometry, as it increases CPU point processing.
-
-To re-filter a previously captured LingBot RGB-D pair with the current RTDE
-pose and the same 15 mm volume margin, run:
-
-```powershell
-conda run -n safety python real_scripts\filter_ur7e_urdf_mesh_depth.py `
-  --input-dir outputs\ur7e_d435i_live_lingbot_urdf `
-  --output-dir outputs\ur7e_d435i_live_lingbot_urdf\ur7e_body_filled_15mm `
-  --robot-ip 169.254.175.10 `
-  --absolute-tolerance-m 0.025 `
-  --relative-tolerance 0.03 `
-  --dilation-pixels 4
-```
-
-For PiKA, only add `--pika-mount-transform-json <measured-transform.json>`
-after measuring `^flange T_pika_step_frame`. The current
-`pika_mount_candidate_unverified.json` is a visual-fit diagnostic, not a
-production or safety calibration.
-
-## 4. Passive real-time verification
-
-The following command only reads robot/camera state, repairs depth, fuses the
-two scene cameras, removes the robot, and writes an overlay video:
+安装 LingBot-Depth 后可用于离线或在线深度修正。CUDA 默认使用 FP16；CPU 诊断应明确关闭 FP16：
 
 ```bash
 python real_scripts/demo_record_ur7e_safety_overlay_video.py \
   --adapter real_scripts.ur7e_realsense_adapter:create_adapter \
-  --camera-calibration real_scripts/ur7e_d435i_camera_calibration.json \
+  --camera-calibration outputs/calibration/session_01/camera_calibration.json \
   --lingbot-depth --lingbot-device cuda:0 \
-  --scene-camera-names front side \
-  --workspace-bounds -0.8 0.8 -0.8 0.8 -0.05 0.8 \
-  --table-z 0.0 \
-  --debug-npz outputs/lingbot_depth_debug.npz \
-  --output outputs/lingbot_depth_two_view_overlay.mp4
+  --output outputs/overlay.mp4
 ```
 
-Cyan points in the overlay are FK link samples used for visualization; orange
-points are the post-filter environment cloud; green boxes are tabletop OBBs.
-Review the saved video and debug NPZ before connecting this geometry to an
-automatic safety decision.
-
-## 5. PI05 collection with the same geometry
-
-Start the prefix-token policy server from OpenPI, then run:
+### 浏览实时场景
 
 ```bash
-python real_scripts/collect_pi05_real_safety_dataset.py \
-  --prompt "pick up the block" \
-  --adapter real_scripts.ur7e_realsense_adapter:create_adapter \
-  --camera-calibration real_scripts/ur7e_d435i_camera_calibration.json \
-  --lingbot-depth --lingbot-device cuda:0 \
-  --scene-camera-names front side \
-  --debug-pointcloud-output outputs/pi05_safety_decoder/real_geometry_debug.npz \
-  --output outputs/pi05_safety_decoder/pi05_real_ur_safety_dataset.npz
+python real_scripts/live_ur7e_scene_viewer.py \
+  --robot-ip "$UR_ROBOT_IP" \
+  --calibration outputs/calibration/session_01/camera_calibration.json
 ```
 
-The PI05 observation still contains `front`, `side`, and `wrist` RGB images;
-only the safety geometry chain excludes wrist. Supplying different camera name
-lists to LingBot and fusion is rejected deliberately, so a repaired/fused scene
-cannot silently omit or mix a view.
+该工具只读取相机和 RTDE 状态；使用 `Ctrl+C` 停止。启用 PiKA 前，必须先测量并验证 `^flange T_pika_step_frame`，示例变换不可用于生产或安全决策。
+
+## 故障排查
+
+- **ChArUco 检测失败**：确认字典、棋盘格数和边长参数准确；增大棋盘在画面中的占比，避免反光与模糊。
+- **四点 TCP 拟合失败**：重新触碰脚本指出的内角点；确认探针 TCP 工具偏置已经在 PolyScope 中完成。
+- **相机无法打开**：检查序列号、USB 带宽/供电，以及是否有其他进程占用设备。
+- **点云错位**：确认点云流分辨率未被命令行覆盖；默认会使用标定文件记录的宽高与 FPS。
+- **机器人点未完全剔除**：检查 `*_urdf_removed_overlay.png`；只根据实测误差调整深度容差与体积外扩边界。
