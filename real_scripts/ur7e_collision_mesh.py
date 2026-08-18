@@ -74,18 +74,26 @@ def link_and_collision_transforms(qpos: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def flange_transform(qpos: np.ndarray) -> np.ndarray:
-    """Return ``^base T_flange`` using the fixed transform in ur_macro.xacro."""
+    """Return ``^base T_flange`` in the controller's standard-DH TCP convention.
+
+    This is intentionally separate from :func:`link_and_collision_transforms`:
+    the latter includes per-mesh URDF collision origins.  A flange-mounted
+    tool (PiKA) instead needs the unmodified final standard-DH frame.  Applying
+    the wrist3 collision/visual fixed rotations here would rotate a tool by a
+    large, incorrect offset while leaving the flange position unchanged.
+    """
     q = np.asarray(qpos, dtype=np.float64).reshape(-1)
     if q.size < 6:
         raise ValueError("qpos must contain six UR joint angles")
     q = q[:6]
-    shoulder = _translation(0.0, 0.0, 0.1625) @ _rotation_z(q[0])
-    upperarm = shoulder @ _rotation_x(np.pi / 2.0) @ _rotation_z(q[1])
-    forearm = upperarm @ _translation(-0.425, 0.0, 0.0) @ _rotation_z(q[2])
-    wrist1 = forearm @ _translation(-0.3922, 0.0, 0.1333) @ _rotation_z(q[3])
-    wrist2 = wrist1 @ _translation(0.0, -0.0997, 0.0) @ _rotation_x(np.pi / 2.0) @ _rotation_z(q[4])
-    wrist3 = wrist2 @ _translation(0.0, 0.0996, 0.0) @ _rpy(np.pi / 2.0, np.pi, np.pi) @ _rotation_z(q[5])
-    return wrist3 @ _rpy(0.0, -np.pi / 2.0, -np.pi / 2.0)
+    # Standard DH: RotZ(theta) · TransZ(d) · TransX(a) · RotX(alpha).
+    a = (0.0, -0.425, -0.3922, 0.0, 0.0, 0.0)
+    d = (0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996)
+    alpha = (np.pi / 2.0, 0.0, 0.0, np.pi / 2.0, -np.pi / 2.0, 0.0)
+    transform = np.eye(4, dtype=np.float64)
+    for theta, link_a, link_d, link_alpha in zip(q, a, d, alpha):
+        transform = transform @ _rotation_z(theta) @ _translation(0.0, 0.0, link_d) @ _translation(link_a, 0.0, 0.0) @ _rotation_x(link_alpha)
+    return transform
 
 
 def load_collision_meshes() -> dict[str, trimesh.Trimesh]:

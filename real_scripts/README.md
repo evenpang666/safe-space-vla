@@ -33,12 +33,13 @@ python -m pip install opencv-contrib-python ur-rtde trimesh
 export UR_ROBOT_IP=169.254.175.10
 
 python real_scripts/calibrate_ur7e_realsense_integrated.py \
-  --serials 123456789012 234567890123 \
+  --serials 405622074939 234567890123 \
   --robot-ip "$UR_ROBOT_IP" \
   --output-dir outputs/calibration/session_01 \
-  --squares-x 7 --squares-y 5 \
-  --square-length-m 0.040 \
-  --marker-length-m 0.030
+  --squares-x 10 --squares-y 7 \
+  --square-length-m 0.037 \
+  --marker-length-m 0.027 \
+  --dictionary DICT_5X5_100
 ```
 
 脚本依次执行：
@@ -187,8 +188,12 @@ python real_scripts/demo_record_ur7e_safety_overlay_video.py \
 ```bash
 python real_scripts/live_ur7e_scene_viewer.py \
   --robot-ip "$UR_ROBOT_IP" \
-  --calibration outputs/calibration/session_01/camera_calibration.json
+  --calibration outputs/calibration/session_01/camera_calibration.json \
+  --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
+  --bind-host 0.0.0.0
 ```
+
+<!-- http://192.168.124.57:8765/ -->
 
 该工具只读取相机和 RTDE 状态；使用 `Ctrl+C` 停止。启用 PiKA 前，必须先测量并验证 `^flange T_pika_step_frame`，示例变换不可用于生产或安全决策。
 

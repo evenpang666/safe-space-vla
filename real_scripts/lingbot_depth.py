@@ -121,11 +121,9 @@ class LingBotDepthRefiner:
             from mdm.model.dinov2_rgbd.layers.attention import XFORMERS_AVAILABLE
         except ImportError:
             XFORMERS_AVAILABLE = False
-        if self.device.type != "cuda" or not XFORMERS_AVAILABLE:
+        self._native_sdpa_mode = self.device.type != "cuda" or not XFORMERS_AVAILABLE
+        if self._native_sdpa_mode:
             self.model.enable_pytorch_native_sdpa()
-            self._cpu_compatibility_mode = True
-        else:
-            self._cpu_compatibility_mode = False
         self.last_inference_seconds = 0.0
 
     def _refine_one(self, frame: RGBDFrame, calibration: CameraCalibration) -> RGBDFrame:
@@ -150,9 +148,9 @@ class LingBotDepthRefiner:
                 intrinsics=intrinsics_tensor,
                 use_fp16=self.use_fp16,
                 # The upstream nested-token depth mask requires xFormers.
-                # Standard tensor execution remains available for CPU-only
-                # offline diagnostics while retaining RGB-D conditioning.
-                enable_depth_mask=not self._cpu_compatibility_mode,
+                # Standard tensor execution remains available with PyTorch
+                # native SDPA while retaining RGB-D conditioning.
+                enable_depth_mask=not self._native_sdpa_mode,
             )
         refined_depth = output["depth"].detach().float().cpu().numpy()
         if refined_depth.shape != (1, height, width):

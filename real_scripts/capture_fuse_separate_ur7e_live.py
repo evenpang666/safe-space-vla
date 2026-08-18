@@ -25,7 +25,14 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.lingbot_depth import LingBotDepthRefiner
 from real_scripts.real_robot_adapter import RGBDFrame, depth_to_world_points, load_camera_calibration_session, robot_depth_keep_mask, voxel_downsample_points
 from real_scripts.reconstruct_realsense_pointcloud import depth_to_vis, render_topdown_camera_points, save_interactive_pointcloud_html, save_ply_ascii
-from real_scripts.ur7e_collision_mesh import collision_volume_keep_mask, occupied_collision_voxels, render_collision_depth
+from real_scripts.ur7e_collision_mesh import (
+    collision_volume_keep_mask,
+    flange_transform,
+    occupied_collision_voxels,
+    render_collision_depth,
+    render_surface_points_depth,
+    sample_mesh_surface_points,
+)
 from real_scripts.ur7e_realsense_adapter import D435iCameraConfig, RealSenseD435iSource
 
 
@@ -55,6 +62,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-size-m", type=float, default=0.005)
     parser.add_argument("--volume-voxel-pitch-m", type=float, default=0.006, help="Filled UR collision-volume voxel edge length.")
     parser.add_argument("--volume-exterior-margin-m", type=float, default=0.015, help="Extra exterior mask margin for calibration/depth error.")
+    parser.add_argument(
+        "--pika-mount-transform-json",
+        type=Path,
+        default="outputs/calibration/pika_mount_from_tcp_provisional.json",
+        help="Measured 4x4 flange_to_pika_step_frame JSON. Enables conservative PiKA full-mesh masking.",
+    )
+    parser.add_argument(
+        "--pika-full-collision-mesh",
+        type=Path,
+        default=REPO_ROOT / "assets" / "robot_models" / "pika_gripper" / "collision" / "pika_gripper_full_collision.stl",
+        help="PiKA full collision mesh in STEP millimetres.",
+    )
     return parser.parse_args()
 
 
@@ -86,6 +105,19 @@ def _camera_serial_overrides(values: list[str]) -> dict[str, str]:
             raise ValueError(f"Duplicate --camera-serial override for camera {name!r}")
         overrides[name] = serial
     return overrides
+
+
+def _load_pika_mount_transform(path: Path) -> np.ndarray:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    transform = np.asarray(payload.get("flange_to_pika_step_frame", payload), dtype=np.float64)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError("PiKA mount transform must be a finite 4x4 matrix")
+    if not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0)):
+        raise ValueError("PiKA mount transform has an invalid final homogeneous row")
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5) or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5):
+        raise ValueError("PiKA mount transform rotation must be orthonormal with determinant +1")
+    return transform
 
 
 def _camera_configs_for_calibration(session, args: argparse.Namespace) -> tuple[D435iCameraConfig, ...]:
@@ -190,16 +222,34 @@ def main() -> None:
         np.save(output_dir / f"{frame.camera_name}_raw_depth_m.npy", frame.depth_m)
         Image.fromarray(depth_to_vis(frame.depth_m, vis_max=2.5, with_colorbar=True)).save(output_dir / f"{frame.camera_name}_raw_depth.png")
 
+    pika_mesh = None
+    pika_to_base = None
+    if args.pika_mount_transform_json is not None:
+        import trimesh
+
+        pika_mesh = trimesh.load_mesh(args.pika_full_collision_mesh, process=False)
+        pika_mesh.vertices = np.asarray(pika_mesh.vertices, dtype=np.float64) * 0.001  # PiKA STEP/STL uses millimetres.
+        pika_to_base = flange_transform(qpos) @ _load_pika_mount_transform(args.pika_mount_transform_json)
+    else:
+        print("[WARN] PiKA gripper is not masked: pass --pika-mount-transform-json with a measured flange-to-PiKA transform.")
+
     refiner = LingBotDepthRefiner(
         camera_names=camera_names,
         device=args.lingbot_device,
         use_fp16=(args.lingbot_device is None or str(args.lingbot_device).lower().startswith("cuda")),
     )
     refined = refiner.refine(frames, calibrations)
+    extra_meshes = () if pika_mesh is None or pika_to_base is None else ((pika_mesh, pika_to_base),)
+    pika_surface_points = (
+        None
+        if pika_mesh is None or pika_to_base is None
+        else sample_mesh_surface_points(pika_mesh, pika_to_base, samples_per_face=args.samples_per_face)
+    )
     occupied_volume, volume_pitch = occupied_collision_voxels(
         qpos,
         voxel_pitch_m=args.volume_voxel_pitch_m,
         exterior_margin_m=args.volume_exterior_margin_m,
+        extra_meshes=extra_meshes,
     )
 
     robot_sets: list[tuple[np.ndarray, np.ndarray]] = []
@@ -215,6 +265,21 @@ def main() -> None:
             width=frame.rgb.shape[1], height=frame.rgb.shape[0],
             samples_per_face=args.samples_per_face, splat_radius_pixels=2,
         )
+        pika_rendered = None
+        if pika_surface_points is not None:
+            pika_rendered = render_surface_points_depth(
+                pika_surface_points,
+                calibrations[name].camera_to_world,
+                calibrations[name].intrinsics,
+                width=frame.rgb.shape[1],
+                height=frame.rgb.shape[0],
+                splat_radius_pixels=3,
+            )
+            rendered = np.where(
+                (rendered > 0.0) & (pika_rendered > 0.0),
+                np.minimum(rendered, pika_rendered),
+                np.maximum(rendered, pika_rendered),
+            )
         keep = robot_depth_keep_mask(
             frame.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m,
             relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels,
@@ -229,6 +294,8 @@ def main() -> None:
         environment_sets.append((depth_environment_points[volume_keep_environment], depth_environment_colors[volume_keep_environment]))
         fused_sets.append((all_points, all_colors))
         Image.fromarray(depth_to_vis(rendered, vis_max=2.5, with_colorbar=True)).save(output_dir / f"{name}_urdf_rendered_depth.png")
+        if pika_rendered is not None:
+            Image.fromarray(depth_to_vis(pika_rendered, vis_max=2.5, with_colorbar=True)).save(output_dir / f"{name}_pika_rendered_depth.png")
         overlay = frame.rgb.copy()
         overlay[~keep] = (0.35 * overlay[~keep] + 0.65 * np.asarray([255, 0, 255])).astype(np.uint8)
         Image.fromarray(overlay).save(output_dir / f"{name}_urdf_removed_overlay.png")
@@ -237,6 +304,7 @@ def main() -> None:
             "depth_matched_robot_pixels": int((~keep).sum()),
             "raw_depth_valid_pixels": int(np.count_nonzero(raw_frames_by_name[name].depth_m > 0)),
             "lingbot_depth_valid_pixels": int(np.count_nonzero(frame.depth_m > 0)),
+            "pika_rendered_pixels": 0 if pika_rendered is None else int(np.count_nonzero(pika_rendered > 0)),
             "volume_contained_points": int((~volume_keep_all).sum()),
             "volume_additional_environment_points_removed": int((~volume_keep_environment).sum()),
         }
@@ -258,11 +326,12 @@ def main() -> None:
         "qpos_rad": qpos.astype(float).tolist(),
         "max_q_delta_during_capture_rad": q_delta,
         "lingbot_inference_seconds": refiner.last_inference_seconds,
-        "method": "synchronized RGB-D capture + RTDE actual_q + LingBot-Depth + official UR7e collision mesh z-buffer depth consistency",
+        "method": "synchronized RGB-D capture + RTDE actual_q + LingBot-Depth + official UR7e and optional PiKA collision meshes with z-buffer depth consistency",
         "volume_voxel_pitch_m": float(volume_pitch),
         "volume_exterior_margin_m": float(args.volume_exterior_margin_m),
         "occupied_volume_voxel_count": int(len(occupied_volume)),
-        "excludes": "PiKA gripper is excluded unless a measured flange-to-PiKA mesh transform is supplied to the offline filter.",
+        "pika_mount_transform_json": None if args.pika_mount_transform_json is None else str(args.pika_mount_transform_json),
+        "excludes": None if pika_mesh is not None else "PiKA gripper/tool: supply --pika-mount-transform-json to enable full-mesh masking.",
         "camera_stats": camera_stats,
         "fused_point_count": int(len(all_points)),
         "ur7e_observed_point_count": int(len(robot_points)),

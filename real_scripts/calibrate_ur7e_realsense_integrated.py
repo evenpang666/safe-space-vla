@@ -65,7 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=30)
     parser.add_argument("--wait-timeout-ms", type=int, default=5000)
-    parser.add_argument("--dictionary", default="DICT_5X5_100")
+    parser.add_argument(
+        "--dictionary",
+        default="DICT_4X4_50",
+        help="OpenCV ArUco dictionary printed on the ChArUco board (default: DICT_4X4_50).",
+    )
     parser.add_argument("--squares-x", type=int, required=True)
     parser.add_argument("--squares-y", type=int, required=True)
     parser.add_argument("--square-length-m", type=float, required=True)
@@ -91,9 +95,13 @@ def create_charuco_board(
     *, squares_x: int, squares_y: int, square_length_m: float, marker_length_m: float, dictionary_name: str
 ):
     cv2 = _require_cv2()
-    dictionary_id = getattr(cv2.aruco, dictionary_name, None)
+    normalized_dictionary_name = str(dictionary_name).upper()
+    dictionary_id = getattr(cv2.aruco, normalized_dictionary_name, None)
     if dictionary_id is None:
-        raise ValueError(f"Unknown OpenCV ArUco dictionary {dictionary_name!r}")
+        raise ValueError(
+            f"Unknown OpenCV ArUco dictionary {dictionary_name!r} "
+            f"(normalized to {normalized_dictionary_name!r})"
+        )
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
     if hasattr(cv2.aruco, "CharucoBoard"):
         return cv2.aruco.CharucoBoard((int(squares_x), int(squares_y)), float(square_length_m), float(marker_length_m), dictionary)
@@ -244,12 +252,37 @@ def _intrinsics_payload(source: RealSenseD435iSource, camera_names: Sequence[str
     }
 
 
+def _save_placement_preview(
+    path: Path,
+    *,
+    board: Any,
+    rgb: np.ndarray,
+    camera_name: str,
+    attempt: int,
+    observation: CharucoObservation,
+) -> None:
+    """Save an RGB placement-check frame, with detected ChArUco corners overlaid."""
+    cv2 = _require_cv2()
+    preview = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+    corners, ids = _detect_charuco(board, rgb)
+    if corners is not None and ids is not None and len(ids):
+        # Detection runs on a 2x upscaled image; map its coordinates back to
+        # the native-resolution RGB frame before drawing.
+        cv2.aruco.drawDetectedCornersCharuco(preview, corners / 2.0, ids)
+    label = f"{camera_name} | attempt {attempt} | ChArUco corners: {observation.corner_count}"
+    cv2.rectangle(preview, (0, 0), (min(preview.shape[1], 620), 32), (0, 0, 0), thickness=-1)
+    cv2.putText(preview, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), preview):
+        raise RuntimeError(f"Failed to save ChArUco placement preview to {path}")
+
+
 def _wait_for_valid_placement(
     source: RealSenseD435iSource,
     intrinsics_payload: dict[str, Any],
     board: Any,
     probe_corners: Sequence[ProbeCorner],
-    *, min_corners: int, max_rms_px: float,
+    *, min_corners: int, max_rms_px: float, preview_dir: Path,
 ) -> dict[str, CharucoObservation]:
     required_ids = [corner.charuco_id for corner in probe_corners]
     attempt = 0
@@ -266,6 +299,16 @@ def _wait_for_valid_placement(
                 distortion=np.asarray(item.get("distortion", np.zeros(5)), dtype=np.float64),
             )
             observations[name] = observation
+            preview_path = preview_dir / f"attempt_{attempt:03d}_{name}_rgb.png"
+            _save_placement_preview(
+                preview_path,
+                board=board,
+                rgb=frames[name].rgb,
+                camera_name=name,
+                attempt=attempt,
+                observation=observation,
+            )
+            print(f"[preview] saved RGB placement frame: {preview_path}")
             problem = placement_problem(observation, required_ids=required_ids, min_corners=min_corners, max_rms_px=max_rms_px)
             if problem:
                 problems[name] = problem
@@ -353,7 +396,13 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         print("Place the rigid ChArUco board where every selected camera can see all four indicated inner corners.")
         input("Press Enter to start the all-camera ChArUco placement check: ")
         observations = _wait_for_valid_placement(
-            source, intrinsics, board, probe_corners, min_corners=args.min_charuco_corners, max_rms_px=args.max_reprojection_rms_px
+            source,
+            intrinsics,
+            board,
+            probe_corners,
+            min_corners=args.min_charuco_corners,
+            max_rms_px=args.max_reprojection_rms_px,
+            preview_dir=output_dir / "charuco_placement_previews",
         )
     finally:
         source.stop()

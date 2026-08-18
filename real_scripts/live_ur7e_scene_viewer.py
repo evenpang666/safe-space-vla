@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -28,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.cluster_tabletop_objects import _expanded_obb
 from real_scripts.demo_record_ur7e_safety_overlay_video import UprightOBB
 from real_scripts.lingbot_depth import LingBotDepthRefiner
-from real_scripts.real_robot_adapter import RGBDFrame, depth_to_world_points, load_camera_calibrations, robot_depth_keep_mask, voxel_downsample_points
+from real_scripts.real_robot_adapter import RGBDFrame, depth_to_world_points, load_camera_calibration_session, robot_depth_keep_mask, voxel_downsample_points
 from real_scripts.reconstruct_realsense_pointcloud import _cluster_points_3d, estimate_dominant_plane
 from real_scripts.ur7e_collision_mesh import (
     collision_surface_samples,
@@ -41,9 +42,13 @@ from real_scripts.ur7e_collision_mesh import (
     mesh_surface_samples,
 )
 from real_scripts.ur7e_realsense_adapter import D435iCameraConfig, RealSenseD435iSource
+from real_scripts.capture_fuse_separate_ur7e_live import (
+    _camera_configs_for_calibration,
+    _stream_config_for_calibration,
+)
 
 
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>UR7e live fused scene</title>
+CANVAS_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>UR7e live fused scene</title>
 <style>html,body{margin:0;height:100%;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000a;padding:9px 12px;border-radius:7px;line-height:1.55}canvas{width:100vw;height:100vh;display:block;cursor:grab}canvas:active{cursor:grabbing}.red{color:#ff5045}.green{color:#4cff90}</style></head>
 <body><div id="hud"><b>UR7e live LingBot fused scene</b><br><span id="s">waiting for first processed frame…</span><br><span class="red">red: UR7e + PiKA</span> · <span class="green">green: tabletop obstacle OBB</span><br>drag: rotate · wheel: zoom</div><canvas id="c"></canvas>
 <script>
@@ -57,14 +62,14 @@ function visible(q){return q[2]>-cameraDistance()+.02}
 function line(a,b,col){let u=proj(a),v=proj(b);if(!visible(u)||!visible(v))return;X.strokeStyle=col;X.beginPath();X.moveTo(u[0],u[1]);X.lineTo(v[0],v[1]);X.stroke()}
 function drawAxes(){let c=D.view_center,r=Math.max(.25,D.view_radius*.35);line(c,[c[0]+r,c[1],c[2]],'#ff4b4b');line(c,[c[0],c[1]+r,c[2]],'#58ff70');line(c,[c[0],c[1],c[2]+r],'#579cff')}
 function draw(){X.clearRect(0,0,innerWidth,innerHeight);if(!D)return;let all=[];for(const group of [D.environment,D.robot])for(let i=0;i<group.points.length;i++)all.push([proj(group.points[i]),group.colors[i]]);all.sort((a,b)=>b[0][2]-a[0][2]);let d=cameraDistance();for(const [q,c] of all){if(!visible(q))continue;let depth=Math.max(.08,q[2]+d),size=Math.max(1,Math.min(4,5.2/depth)),fade=Math.max(.28,Math.min(1,1.35-depth/(d*1.7)));X.fillStyle=`rgba(${c[0]},${c[1]},${c[2]},${fade})`;X.fillRect(q[0]-size*.5,q[1]-size*.5,size,size)}X.lineWidth=2;drawAxes();for(const b of D.obbs){let e=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];for(const z of e)line(b.corners[z[0]],b.corners[z[1]],'#43ff83')}}
-async function poll(){try{let r=await fetch('/snapshot.json?'+Date.now());if(r.ok){D=await r.json();S.textContent=`frame ${D.frame} · ${D.status} · environment ${D.environment.points.length} · robot ${D.robot.points.length} · OBB ${D.obbs.length}`;draw()}}catch(e){S.textContent='connection retrying…'}setTimeout(poll,1000)}poll();
+async function poll(){try{let r=await fetch('/snapshot.json?'+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error(`snapshot HTTP ${r.status}`);D=await r.json();S.textContent=`frame ${D.frame} · ${D.status} · environment ${D.environment.points.length} · robot ${D.robot.points.length} · OBB ${D.obbs.length}`;draw()}catch(e){console.error('snapshot poll failed:',e);S.textContent=`snapshot retrying: ${e.name||'Error'}: ${e.message||e}`}setTimeout(poll,1000)}poll();
 C.addEventListener('pointerdown',e=>last=[e.clientX,e.clientY]);addEventListener('pointerup',()=>last=null);addEventListener('pointermove',e=>{if(!last)return;yaw+=(e.clientX-last[0])*.008;pitch=Math.max(-1.45,Math.min(1.45,pitch+(e.clientY-last[1])*.008));last=[e.clientX,e.clientY];draw()});C.addEventListener('wheel',e=>{dist=Math.max(.2,Math.min(8,dist+e.deltaY*.001));draw();e.preventDefault()},{passive:false});addEventListener('keydown',e=>{if(e.key==='1'){yaw=0;pitch=0;draw()}if(e.key==='2'){yaw=.78;pitch=-.75;draw()}if(e.key.toLowerCase()==='r'){yaw=.82;pitch=-.52;dist=Math.max(.45,(D?.view_radius||.8)*1.55);draw()}});
 </script></body></html>"""
 
 # Native WebGL 3-D viewer.  This deliberately supersedes the small Canvas
 # prototype above: Scatter3d uses an actual depth buffer and orbit camera, so
 # a tabletop cannot be visually flattened by a hand-written projection.
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>UR7e live fused scene</title>
+PLOTLY_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>UR7e live fused scene</title>
 <script src="/plotly.min.js"></script>
 <style>html,body,#scene{margin:0;width:100%;height:100%;overflow:hidden;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000c;padding:10px 13px;border-radius:7px;line-height:1.6;pointer-events:none}.red{color:#ff5045}.green{color:#4cff90}.dim{color:#9aa8b8}</style></head>
 <body><div id="hud"><b>UR7e live fused scene — WebGL 3-D</b><br><span id="s">waiting for first processed frame...</span><br><span class="red">red: UR7e + PiKA</span> · <span class="green">green: full 3-D tabletop obstacle OBB</span><br><span class="dim">drag: orbit · wheel: zoom · double click: reset view</span></div><div id="scene"></div>
@@ -75,7 +80,7 @@ function pointTrace(group,name,size){const p=group.points,c=group.colors;return 
 function boxTraces(boxes){let out=[];for(let n=0;n<boxes.length;n++){let q=boxes[n].corners;let x=[],y=[],z=[];for(const[e,f]of edges){x.push(q[e][0],q[f][0],null);y.push(q[e][1],q[f][1],null);z.push(q[e][2],q[f][2],null)}out.push({type:'scatter3d',mode:'lines',name:`obstacle ${n+1}`,x,y,z,line:{color:'#43ff83',width:6},hoverinfo:'skip'})}return out}
 function layout(d){return {uirevision:'orbit-'+viewToken,showlegend:false,paper_bgcolor:'#080a0d',plot_bgcolor:'#080a0d',margin:{l:0,r:0,t:0,b:0},scene:{bgcolor:'#080a0d',aspectmode:'data',camera:{projection:{type:'perspective'},eye:{x:1.65,y:-1.65,z:1.25},center:{x:0,y:0,z:0},up:{x:0,y:0,z:1}},xaxis:{title:'UR base X (m)',gridcolor:'#27313e',zerolinecolor:'#526273'},yaxis:{title:'UR base Y (m)',gridcolor:'#27313e',zerolinecolor:'#526273'},zaxis:{title:'UR base Z (m)',gridcolor:'#27313e',zerolinecolor:'#526273'}}}}
 function render(d){let traces=[pointTrace(d.environment,'environment',0.65),pointTrace(d.robot,'UR7e + PiKA',1.0),...boxTraces(d.obbs)];Plotly.react(G,traces,layout(d),{displaylogo:false,responsive:true,scrollZoom:true});rendered=true;let span=(d.axis_ranges||[]).map(v=>v.toFixed(2)).join(' × ');S.textContent=`frame ${d.frame} · ${d.status} · environment ${d.environment.points.length} · robot ${d.robot.points.length} · OBB ${d.obbs.length} · xyz span ${span} m`}
-async function poll(){try{const r=await fetch('/snapshot.json?'+Date.now());if(r.ok)render(await r.json())}catch(e){S.textContent='connection retrying...'}setTimeout(poll,1000)}poll();
+async function poll(){try{const r=await fetch('/snapshot.json?'+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error(`snapshot HTTP ${r.status}`);render(await r.json())}catch(e){console.error('snapshot poll failed:',e);S.textContent=`snapshot retrying: ${e.name||'Error'}: ${e.message||e}`}setTimeout(poll,1000)}poll();
 </script></body></html>"""
 
 
@@ -85,15 +90,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--front-serial", default=os.environ.get("REAL_SENSE_FRONT_SERIAL", "405622074939"))
     p.add_argument("--side-serial", default=os.environ.get("REAL_SENSE_SIDE_SERIAL", "348522070576"))
     p.add_argument("--calibration", type=Path, default=REPO_ROOT / "real_scripts" / "ur7e_d435i_camera_calibration.json")
-    p.add_argument("--pika-mount-transform-json", type=Path, default=REPO_ROOT / "outputs" / "ur7e_d435i_live_lingbot_urdf" / "pika_mount_candidate_unverified.json")
-    p.add_argument("--pika-mesh", type=Path, default=REPO_ROOT / "assets" / "robot_models" / "pika_gripper" / "collision" / "pika_gripper_full_collision.stl")
+    p.add_argument(
+        "--pika-mount-transform-json",
+        type=Path,
+        default=REPO_ROOT / "outputs" / "calibration" / "pika_mount_from_tcp_provisional.json",
+        help="PiKA flange_to_pika_step_frame JSON used by the live depth and volume mask.",
+    )
+    p.add_argument(
+        "--pika-full-collision-mesh",
+        "--pika-mesh",
+        dest="pika_full_collision_mesh",
+        type=Path,
+        default=REPO_ROOT / "assets" / "robot_models" / "pika_gripper" / "collision" / "pika_gripper_full_collision.stl",
+    )
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--width", type=int, default=1280); p.add_argument("--height", type=int, default=720); p.add_argument("--fps", type=int, default=30)
+    p.add_argument(
+        "--bind-host",
+        default="127.0.0.1",
+        help=(
+            "HTTP listen address (default: 127.0.0.1, local machine only). "
+            "Use 0.0.0.0 to allow other hosts on the LAN to connect."
+        ),
+    )
+    p.add_argument("--camera-serial", action="append", default=[], metavar="NAME=SERIAL", help="Override a physical camera serial recorded in calibration.")
+    p.add_argument("--width", type=int, default=None); p.add_argument("--height", type=int, default=None); p.add_argument("--fps", type=int, default=None)
     p.add_argument("--warmup-frames", type=int, default=30)
-    p.add_argument("--lingbot-device", default="cuda", help="LingBot device; use cpu only for diagnostics.")
+    p.add_argument("--lingbot-device", default=None, help="LingBot device; defaults to CUDA when available.")
     p.add_argument("--volume-pitch-m", type=float, default=.006); p.add_argument("--volume-margin-m", type=float, default=.015)
+    p.add_argument("--absolute-tolerance-m", type=float, default=.012)
+    p.add_argument("--relative-tolerance", type=float, default=.015)
+    p.add_argument("--dilation-pixels", type=int, default=2)
+    p.add_argument("--voxel-size-m", type=float, default=.005)
     p.add_argument("--point-stride", type=int, default=3, help="Pixel stride for live fusion; 2 is denser, 4 is faster.")
-    p.add_argument("--urdf-samples-per-face", type=int, default=9, help="Cached URDF surface samples per triangle for the depth mask.")
+    p.add_argument("--urdf-samples-per-face", type=int, default=16, help="Cached URDF/PiKA surface samples per triangle for the depth mask.")
     p.add_argument("--display-max-points", type=int, default=60000)
     p.add_argument("--workspace-bounds", nargs=6, type=float, default=(-0.2, 1.0, -0.8, 0.4, -0.1, 0.45), metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="UR-base workcell crop for display, obstacles, and fusion diagnostics.")
     p.add_argument("--outlier-neighbour-m", type=float, default=.020); p.add_argument("--cluster-radius-m", type=float, default=.015); p.add_argument("--min-cluster-points", type=int, default=100); p.add_argument("--attachment-distance-m", type=float, default=.050)
@@ -186,10 +215,27 @@ def cached_filled_voxel_indices(
 
 
 def main() -> None:
-    args = parse_args(); calibrations = load_camera_calibrations(args.calibration)
+    args = parse_args()
+    # Plotly is optional.  The Canvas viewer remains fully local and lets the
+    # live reconstruction run in minimal robotics environments.
+    try:
+        import plotly
+        candidate = Path(plotly.__file__).resolve().parent / "package_data" / "plotly.min.js"
+        plotly_js_path = candidate if candidate.is_file() else None
+    except ImportError:
+        plotly_js_path = None
+    html = PLOTLY_HTML if plotly_js_path is not None else CANVAS_HTML
+    if plotly_js_path is None:
+        print("[viewer] Plotly is unavailable; using the built-in Canvas 3-D viewer.")
+    calibration_session = load_camera_calibration_session(args.calibration)
+    calibrations = calibration_session.calibrations
+    camera_names = calibration_session.camera_names
+    fusion_enabled = calibration_session.fusion_enabled
+    camera_configs = _camera_configs_for_calibration(calibration_session, args)
+    width, height, fps = _stream_config_for_calibration(calibration_session, args)
     import trimesh
     from rtde_receive import RTDEReceiveInterface
-    pika_mesh = trimesh.load_mesh(args.pika_mesh, process=False); pika_mesh.vertices = np.asarray(pika_mesh.vertices, dtype=np.float64) * .001
+    pika_mesh = trimesh.load_mesh(args.pika_full_collision_mesh, process=False); pika_mesh.vertices = np.asarray(pika_mesh.vertices, dtype=np.float64) * .001
     pika_mount = load_transform(args.pika_mount_transform_json)
     # Expensive mesh work is invariant to joint position, so do it once.
     from real_scripts.ur7e_collision_mesh import COLLISION_ROOT, load_collision_meshes
@@ -198,33 +244,58 @@ def main() -> None:
         name: cached_filled_voxel_indices(cache_dir / f"{name}_{args.volume_pitch_m:.6f}.npz", mesh, mesh_source=COLLISION_ROOT / f"{name}.stl", voxel_pitch_m=args.volume_pitch_m)
         for name, mesh in load_collision_meshes().items()
     }
-    pika_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_{args.volume_pitch_m:.6f}.npz", pika_mesh, mesh_source=args.pika_mesh, voxel_pitch_m=args.volume_pitch_m)
+    pika_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_{args.volume_pitch_m:.6f}.npz", pika_mesh, mesh_source=args.pika_full_collision_mesh, voxel_pitch_m=args.volume_pitch_m)
     urdf_surface_samples = collision_surface_samples(samples_per_face=args.urdf_samples_per_face)
-    pika_surface_samples = mesh_surface_samples(pika_mesh, samples_per_face=4)
+    pika_surface_samples = mesh_surface_samples(pika_mesh, samples_per_face=args.urdf_samples_per_face)
     latest: dict = {"frame": 0, "status": "initializing", "environment": {"points": [], "colors": []}, "robot": {"points": [], "colors": []}, "obbs": []}
     lock = threading.Lock(); stop = threading.Event()
 
     def process_loop() -> None:
         nonlocal latest
-        receiver = RTDEReceiveInterface(str(args.robot_ip)); source = RealSenseD435iSource(cameras=(D435iCameraConfig("front", str(args.front_serial)), D435iCameraConfig("side", str(args.side_serial))), width=args.width, height=args.height, fps=args.fps)
-        refiner = LingBotDepthRefiner(device=args.lingbot_device, use_fp16=str(args.lingbot_device).lower().startswith("cuda")); frame_index = 0
+        receiver = RTDEReceiveInterface(str(args.robot_ip))
+        source = RealSenseD435iSource(cameras=camera_configs, width=width, height=height, fps=fps)
+        refiner = LingBotDepthRefiner(
+            camera_names=camera_names,
+            device=args.lingbot_device,
+            use_fp16=(args.lingbot_device is None or str(args.lingbot_device).lower().startswith("cuda")),
+        )
+        frame_index = 0
         try:
             source.start()
             for _ in range(max(1, args.warmup_frames)): source.read()
             while not stop.is_set():
                 frame_started = time.perf_counter()
-                q0 = np.asarray(receiver.getActualQ(), dtype=np.float32); captured = source.read(); q1 = np.asarray(receiver.getActualQ(), dtype=np.float32); q = (q0 + q1) * .5
-                refined = refiner.refine([RGBDFrame(name, captured[name][0], captured[name][1]) for name in ("front", "side")], calibrations); repair_seconds = refiner.last_inference_seconds
+                q0 = np.asarray(receiver.getActualQ(), dtype=np.float32)
+                captured = source.read()
+                q1 = np.asarray(receiver.getActualQ(), dtype=np.float32)
+                q = (q0 + q1) * .5
+                if q0.shape != (6,) or q1.shape != (6,) or not np.isfinite(q).all():
+                    raise RuntimeError(f"RTDE returned invalid actual_q: before={q0}, after={q1}")
+                refined = refiner.refine(
+                    [RGBDFrame(name, captured[name].rgb, captured[name].depth_m) for name in camera_names],
+                    calibrations,
+                )
+                repair_seconds = refiner.last_inference_seconds
                 pika_to_base = flange_transform(q) @ pika_mount
                 volume, pitch = occupied_collision_voxels_from_local_indices(q, local_indices=local_volume_indices, voxel_pitch_m=args.volume_pitch_m, exterior_margin_m=args.volume_margin_m, extra_local_indices=(pika_volume_indices, pika_to_base))
                 robot_sets=[]; env_sets=[]
                 for f in refined:
                     name=f.camera_name; rendered=render_collision_depth(q,calibrations[name].camera_to_world,calibrations[name].intrinsics,width=f.rgb.shape[1],height=f.rgb.shape[0],samples_per_face=args.urdf_samples_per_face,splat_radius_pixels=2,local_samples=urdf_surface_samples)
                     pika_points=(pika_to_base[:3,:3]@pika_surface_samples.T).T+pika_to_base[:3,3]; pdepth=render_surface_points_depth(pika_points,calibrations[name].camera_to_world,calibrations[name].intrinsics,width=f.rgb.shape[1],height=f.rgb.shape[0],splat_radius_pixels=3)
-                    rendered=np.where((rendered>0)&(pdepth>0),np.minimum(rendered,pdepth),np.maximum(rendered,pdepth)); keep=robot_depth_keep_mask(f.depth_m,rendered,absolute_tolerance_m=.025,relative_tolerance=.03,dilation_pixels=4)
+                    rendered=np.where((rendered>0)&(pdepth>0),np.minimum(rendered,pdepth),np.maximum(rendered,pdepth)); keep=robot_depth_keep_mask(f.depth_m,rendered,absolute_tolerance_m=args.absolute_tolerance_m,relative_tolerance=args.relative_tolerance,dilation_pixels=args.dilation_pixels)
                     rgbd=RGBDFrame(name,f.rgb,f.depth_m); ap,ac=depth_to_world_points(rgbd,calibrations[name],stride=args.point_stride,max_depth=2.5); ep,ec=depth_to_world_points(rgbd,calibrations[name],stride=args.point_stride,max_depth=2.5,keep_mask=keep); rp,rc=depth_to_world_points(rgbd,calibrations[name],stride=args.point_stride,max_depth=2.5,keep_mask=~keep)
                     vk_all=collision_volume_keep_mask(ap,volume,voxel_pitch_m=pitch); vk_env=collision_volume_keep_mask(ep,volume,voxel_pitch_m=pitch); robot_sets.append((np.concatenate((rp,ap[~vk_all])),np.concatenate((rc,ac[~vk_all])))); env_sets.append((ep[vk_env],ec[vk_env]))
-                def fuse(items): return voxel_downsample_points(np.concatenate([a for a,_ in items]),np.concatenate([b for _,b in items]),voxel_size=.005)
+                def fuse(items):
+                    nonempty = [(points, colors) for points, colors in items if len(points)]
+                    if not nonempty:
+                        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+                    if not fusion_enabled:
+                        return nonempty[0]
+                    return voxel_downsample_points(
+                        np.concatenate([points for points, _ in nonempty]),
+                        np.concatenate([colors for _, colors in nonempty]),
+                        voxel_size=args.voxel_size_m,
+                    )
                 robot, rcol=fuse(robot_sets); env, ecol=fuse(env_sets)
                 xmin,xmax,ymin,ymax,zmin,zmax = (float(v) for v in args.workspace_bounds)
                 in_workcell=(env[:,0]>=xmin)&(env[:,0]<=xmax)&(env[:,1]>=ymin)&(env[:,1]<=ymax)&(env[:,2]>=zmin)&(env[:,2]<=zmax)
@@ -268,24 +339,52 @@ def main() -> None:
     if args.once:
         worker.join(); print(json.dumps(latest)[0:500]); return
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send_bytes(self, data: bytes, content_type: str, *, gzip_encoded: bool = False) -> None:
+            """Send a complete response, tolerating a browser cancelling a poll."""
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                if gzip_encoded:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                # Normal when a browser refreshes or cancels a polling request.
+                pass
+
         def do_GET(self):
             if self.path.startswith('/snapshot.json'):
-                with lock: data=json.dumps(latest).encode('utf-8')
-                self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(data)
+                # Point clouds can make this several megabytes.  Browsers transparently
+                # decode gzip, substantially reducing Wi-Fi/LAN transfer time.
+                with lock:
+                    snapshot = latest
+                data = json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+                accepts_gzip = "gzip" in self.headers.get("Accept-Encoding", "").lower()
+                if accepts_gzip:
+                    data = gzip.compress(data, compresslevel=1)
+                self._send_bytes(data, "application/json", gzip_encoded=accepts_gzip)
             elif self.path.startswith('/plotly.min.js'):
-                try:
-                    import plotly
-                    asset = Path(plotly.__file__).resolve().parent / 'package_data' / 'plotly.min.js'
-                    data = asset.read_bytes()
-                    self.send_response(200); self.send_header('Content-Type','application/javascript'); self.send_header('Cache-Control','public, max-age=86400'); self.end_headers(); self.wfile.write(data)
-                except Exception as exc:
-                    self.send_error(500, f'Could not load local Plotly asset: {exc}')
+                if plotly_js_path is not None:
+                    data = plotly_js_path.read_bytes()
+                    self._send_bytes(data, "application/javascript")
+                else:
+                    self.send_error(404, "Plotly is not installed; reload the viewer page for Canvas mode.")
             else:
-                self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(HTML.encode('utf-8'))
+                self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
         def log_message(self, *args): pass
-    server=ThreadingHTTPServer(('127.0.0.1',int(args.port)),Handler); url=f'http://127.0.0.1:{args.port}'
-    print(f'[viewer] {url}  (Ctrl+C to stop)')
-    if not args.no_browser: webbrowser.open(url)
+    server = ThreadingHTTPServer((args.bind_host, int(args.port)), Handler)
+    local_url = f'http://127.0.0.1:{args.port}'
+    if args.bind_host in {"0.0.0.0", "::"}:
+        print(f'[viewer] listening on all network interfaces, port {args.port}')
+        print(f'[viewer] local: {local_url}; LAN: http://<this-host-LAN-IP>:{args.port}  (Ctrl+C to stop)')
+    else:
+        print(f'[viewer] {local_url}  (Ctrl+C to stop)')
+    if not args.no_browser: webbrowser.open(local_url)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: stop.set(); server.shutdown()

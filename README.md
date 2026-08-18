@@ -12,8 +12,8 @@ conda activate safety
 cd openpi
 uv sync
 uv pip install -e .
-pip install chex pytest
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip install chex pytest pyrealsense2 ur-rtde
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ### 0.2 LIBERO / MuJoCo 数据采集环境
