@@ -7,6 +7,7 @@ Vive Tracker模块 - 基于pysurvive库
 
 import sys
 import time
+import gc
 import os
 import signal
 import math
@@ -60,6 +61,9 @@ class ViveTracker:
         self.pose_queue = queue.Queue(maxsize=100)  # 用于存储最新位姿的队列
         self.devices_info = {}  # 存储设备信息的字典
         self.data_lock = threading.Lock()
+        # Only the pose-collector thread touches SimpleContext after startup.
+        # pysurvive does not guarantee that Objects()/NextUpdated() are safe
+        # when called concurrently from diagnostics and worker threads.
         self.latest_poses = {}  # 存储每个设备的最新位姿
         
         # 线程对象
@@ -116,11 +120,6 @@ class ViveTracker:
             self.processor_thread.daemon = True
             self.processor_thread.start()
             
-            # 创建并启动设备监控线程
-            self.device_monitor_thread = threading.Thread(target=self._device_monitor)
-            self.device_monitor_thread.daemon = True
-            self.device_monitor_thread.start()
-            
             logger.info("Vive Tracker位姿追踪已启动")
             
             # 等待初始数据
@@ -130,36 +129,47 @@ class ViveTracker:
         except Exception as e:
             logger.error(f"连接Vive Tracker时发生错误: {e}")
             self.running = False
+            self.disconnect()
             return False
     
     def disconnect(self):
         """
         断开Vive Tracker设备连接
         """
-        if not self.running:
+        if not self.running and self.context is None:
             return
         
         logger.info("正在停止Vive Tracker位姿追踪...")
         self.running = False
         
         # 等待线程结束
-        if self.collector_thread:
+        if self.collector_thread and self.collector_thread is not threading.current_thread():
             self.collector_thread.join(timeout=2.0)
         
-        if self.processor_thread:
+        if self.processor_thread and self.processor_thread is not threading.current_thread():
             self.processor_thread.join(timeout=2.0)
             
-        if self.device_monitor_thread:
+        if self.device_monitor_thread and self.device_monitor_thread is not threading.current_thread():
             self.device_monitor_thread.join(timeout=2.0)
         
         # 清理资源
+        context = self.context
         self.context = None
         self.pose_queue = queue.Queue(maxsize=100)
+        self.latest_poses.clear()
+        self.collector_thread = None
+        self.processor_thread = None
+        self.device_monitor_thread = None
         
         # 打印统计信息
         logger.info("设备统计信息:")
         for device_name, info in self.devices_info.items():
             logger.info(f"  - {device_name}: 更新次数 {info['updates']}")
+        self.devices_info.clear()
+        # SimpleContext releases the native libsurvive context when its last
+        # Python reference is dropped. Force this before the next Start retry.
+        del context
+        gc.collect()
         
         logger.info("Vive Tracker已断开连接")
     
@@ -174,10 +184,9 @@ class ViveTracker:
         self._update_device_list()
         
         # 定期检查新设备
-        while self.running and self.context.Running():
+        while self.running:
             # 更新设备列表
             self._update_device_list()
-            
             # 每秒检查一次
             time.sleep(1.0)
     
@@ -187,6 +196,8 @@ class ViveTracker:
         """
         try:
             # 获取当前所有设备
+            if self.context is None:
+                return
             devices = list(self.context.Objects())
             
             # 更新设备信息字典
@@ -207,19 +218,24 @@ class ViveTracker:
         logger.info("位姿收集线程已启动")
         
         # 获取并打印所有可用设备
-        devices = list(self.context.Objects())
+        self._update_device_list()
+        with self.data_lock:
+            devices = list(self.devices_info)
         if not devices:
             logger.warning("警告: 未检测到任何设备")
         else:
             logger.info(f"检测到 {len(devices)} 个设备:")
-            for device in devices:
-                device_name = str(device.Name(), 'utf-8')
+            for device_name in devices:
                 logger.info(f"  - {device_name}")
-                self.devices_info[device_name] = {"updates": 0, "last_update": 0}
         
         # 持续获取最新位姿
-        while self.running and self.context.Running():
-            updated = self.context.NextUpdated()
+        while self.running:
+            # This is deliberately the sole long-running SimpleContext call.
+            # get_pose/get_devices read Python-side snapshots only.
+            context = self.context
+            if context is None or not context.Running():
+                break
+            updated = context.NextUpdated()
             if updated:
                 # 获取设备名称
                 device_name = str(updated.Name(), 'utf-8')
@@ -318,9 +334,6 @@ class ViveTracker:
             logger.warning("Vive Tracker未连接，返回空位姿数据")
             return None if device_name else {}
         
-        # 强制更新一次设备列表，确保能获取到最新添加的设备
-        self._update_device_list()
-        
         with self.data_lock:
             if device_name:
                 return self.latest_poses.get(device_name)
@@ -334,9 +347,6 @@ class ViveTracker:
         返回:
             list: 设备名称列表
         """
-        # 强制更新一次设备列表，确保能获取到最新添加的设备
-        self._update_device_list()
-        
         with self.data_lock:
             return list(self.devices_info.keys())
     
@@ -350,9 +360,6 @@ class ViveTracker:
         返回:
             dict: 设备信息字典
         """
-        # 强制更新一次设备列表，确保能获取到最新添加的设备
-        self._update_device_list()
-        
         with self.data_lock:
             if device_name:
                 return self.devices_info.get(device_name)

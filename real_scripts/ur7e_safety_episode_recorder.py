@@ -37,6 +37,7 @@ class ControlTickRecord:
     frames: tuple[RGBDFrame, ...]
     qpos: np.ndarray
     gripper_state: np.ndarray
+    gripper_opening_mm: float | None
     robot_state_timestamp_ns: int
     policy_query_id: int | None
     action_index: int | None
@@ -87,7 +88,7 @@ class UR7eSafetyEpisodeRecorder:
         self._written_queries = 0
         self.output_dir.mkdir(parents=True, exist_ok=False)
         manifest_payload = dict(manifest or {})
-        manifest_payload.update({"status": "recording", "format_version": 1})
+        manifest_payload.update({"status": "recording", "format_version": 2})
         _atomic_write_json(self.output_dir / "manifest.json", manifest_payload)
         if calibration_path is not None:
             source = Path(calibration_path)
@@ -143,6 +144,7 @@ class UR7eSafetyEpisodeRecorder:
         frames: Sequence[RGBDFrame],
         qpos: np.ndarray,
         gripper_state: np.ndarray,
+        gripper_opening_mm: float | None = None,
         robot_state_timestamp_ns: int,
         policy_query_id: int | None,
         action_index: int | None,
@@ -163,11 +165,15 @@ class UR7eSafetyEpisodeRecorder:
         names = [frame.camera_name for frame in copied_frames]
         if len(names) != len(set(names)):
             raise ValueError(f"Each tick must contain at most one frame per camera, got {names}")
+        opening_mm = None if gripper_opening_mm is None else float(gripper_opening_mm)
+        if opening_mm is not None and (not np.isfinite(opening_mm) or not 0.0 <= opening_mm <= 95.0):
+            raise ValueError(f"gripper_opening_mm must be finite and within [0, 95], got {opening_mm!r}")
         record = ControlTickRecord(
             tick_id=int(tick_id),
             frames=copied_frames,
             qpos=np.asarray(qpos, dtype=np.float32).reshape(-1).copy(),
             gripper_state=np.asarray(gripper_state, dtype=np.float32).reshape(-1).copy(),
+            gripper_opening_mm=opening_mm,
             robot_state_timestamp_ns=int(robot_state_timestamp_ns),
             policy_query_id=None if policy_query_id is None else int(policy_query_id),
             action_index=None if action_index is None else int(action_index),
@@ -195,6 +201,11 @@ class UR7eSafetyEpisodeRecorder:
         tick_dir.mkdir(parents=True, exist_ok=False)
         _atomic_save_npy(tick_dir / "qpos.npy", record.qpos)
         _atomic_save_npy(tick_dir / "gripper_state.npy", record.gripper_state)
+        if record.gripper_opening_mm is not None:
+            _atomic_save_npy(
+                tick_dir / "gripper_opening_mm.npy",
+                np.asarray([record.gripper_opening_mm], dtype=np.float32),
+            )
         if record.commanded_action is not None:
             _atomic_save_npy(tick_dir / "commanded_action.npy", record.commanded_action)
         frames_meta: dict[str, Any] = {}
@@ -216,6 +227,7 @@ class UR7eSafetyEpisodeRecorder:
             {
                 "tick_id": record.tick_id,
                 "robot_state_timestamp_ns": record.robot_state_timestamp_ns,
+                "gripper_opening_mm": record.gripper_opening_mm,
                 "policy_query_id": record.policy_query_id,
                 "action_index": record.action_index,
                 "camera_host_skew_ns": skew_ns,

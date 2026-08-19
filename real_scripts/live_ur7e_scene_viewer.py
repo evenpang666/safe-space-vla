@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.cluster_tabletop_objects import _expanded_obb
 from real_scripts.demo_record_ur7e_safety_overlay_video import UprightOBB
 from real_scripts.lingbot_depth import LingBotDepthRefiner
+from real_scripts.pika_gripper_live_reader import PikaOpeningReader
 from real_scripts.real_robot_adapter import RGBDFrame, depth_to_world_points, load_camera_calibration_session, robot_depth_keep_mask, voxel_downsample_points
 from real_scripts.reconstruct_realsense_pointcloud import _cluster_points_3d, estimate_dominant_plane
 from real_scripts.ur7e_collision_mesh import (
@@ -103,6 +104,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT / "assets" / "robot_models" / "pika_gripper" / "collision" / "pika_gripper_full_collision.stl",
     )
+    p.add_argument(
+        "--pika-gripper-port",
+        default=os.environ.get("PIKA_GRIPPER_PORT", "/dev/ttyUSB1"),
+        help="PiKA USB serial port used only to read the live finger opening (default: PIKA_GRIPPER_PORT or /dev/ttyUSB1).",
+    )
+    p.add_argument(
+        "--pika-mesh-reference-opening-mm",
+        type=float,
+        default=0.0,
+        help="Finger opening represented by the exported PiKA STEP meshes (default: 0, closed).",
+    )
+    p.add_argument(
+        "--pika-max-opening-mm",
+        type=float,
+        default=95.0,
+        help="Reject PiKA opening readbacks outside [0, this value] mm (default: 95).",
+    )
     p.add_argument("--port", type=int, default=8765)
     p.add_argument(
         "--bind-host",
@@ -137,6 +155,12 @@ def load_transform(path: Path) -> np.ndarray:
     if t.shape != (4, 4) or not np.allclose(t[3], (0, 0, 0, 1)):
         raise ValueError("PiKA transform must be a 4x4 homogeneous matrix")
     return t
+
+
+def translated_local_indices(indices: np.ndarray, translation_m: np.ndarray, pitch_m: float) -> np.ndarray:
+    """Translate pre-voxelized local geometry by a whole-voxel offset."""
+    offset = np.rint(np.asarray(translation_m, dtype=np.float64) / float(pitch_m)).astype(np.int64)
+    return np.asarray(indices, dtype=np.int64) + offset[None, :]
 
 
 def cap(points: np.ndarray, colors: np.ndarray, limit: int) -> tuple[list, list]:
@@ -233,9 +257,26 @@ def main() -> None:
     fusion_enabled = calibration_session.fusion_enabled
     camera_configs = _camera_configs_for_calibration(calibration_session, args)
     width, height, fps = _stream_config_for_calibration(calibration_session, args)
+    if not 0.0 <= args.pika_mesh_reference_opening_mm <= args.pika_max_opening_mm:
+        raise ValueError("--pika-mesh-reference-opening-mm must be within the configured PiKA opening range")
     import trimesh
     from rtde_receive import RTDEReceiveInterface
-    pika_mesh = trimesh.load_mesh(args.pika_full_collision_mesh, process=False); pika_mesh.vertices = np.asarray(pika_mesh.vertices, dtype=np.float64) * .001
+    pika_collision_dir = args.pika_full_collision_mesh.parent
+
+    def load_pika_collision_mesh(name: str):
+        path = pika_collision_dir / name
+        if not path.is_file():
+            raise FileNotFoundError(f"PiKA collision mesh does not exist: {path}")
+        mesh = trimesh.load_mesh(path, process=False)
+        mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * 0.001
+        return mesh, path
+
+    # The exported STEP assembly separates the static body from its two long,
+    # symmetric fingers.  Positive opening moves the negative-X finger toward
+    # -X and the positive-X finger toward +X in the PiKA STEP frame.
+    pika_body_mesh, pika_body_path = load_pika_collision_mesh("pika_gripper_body_collision.stl")
+    pika_finger_a_mesh, pika_finger_a_path = load_pika_collision_mesh("finger_a_candidate.stl")
+    pika_finger_b_mesh, pika_finger_b_path = load_pika_collision_mesh("finger_b_candidate.stl")
     pika_mount = load_transform(args.pika_mount_transform_json)
     # Expensive mesh work is invariant to joint position, so do it once.
     from real_scripts.ur7e_collision_mesh import COLLISION_ROOT, load_collision_meshes
@@ -244,9 +285,13 @@ def main() -> None:
         name: cached_filled_voxel_indices(cache_dir / f"{name}_{args.volume_pitch_m:.6f}.npz", mesh, mesh_source=COLLISION_ROOT / f"{name}.stl", voxel_pitch_m=args.volume_pitch_m)
         for name, mesh in load_collision_meshes().items()
     }
-    pika_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_{args.volume_pitch_m:.6f}.npz", pika_mesh, mesh_source=args.pika_full_collision_mesh, voxel_pitch_m=args.volume_pitch_m)
+    pika_body_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_body_{args.volume_pitch_m:.6f}.npz", pika_body_mesh, mesh_source=pika_body_path, voxel_pitch_m=args.volume_pitch_m)
+    pika_finger_a_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_finger_a_{args.volume_pitch_m:.6f}.npz", pika_finger_a_mesh, mesh_source=pika_finger_a_path, voxel_pitch_m=args.volume_pitch_m)
+    pika_finger_b_volume_indices = cached_filled_voxel_indices(cache_dir / f"pika_finger_b_{args.volume_pitch_m:.6f}.npz", pika_finger_b_mesh, mesh_source=pika_finger_b_path, voxel_pitch_m=args.volume_pitch_m)
     urdf_surface_samples = collision_surface_samples(samples_per_face=args.urdf_samples_per_face)
-    pika_surface_samples = mesh_surface_samples(pika_mesh, samples_per_face=args.urdf_samples_per_face)
+    pika_body_surface_samples = mesh_surface_samples(pika_body_mesh, samples_per_face=args.urdf_samples_per_face)
+    pika_finger_a_surface_samples = mesh_surface_samples(pika_finger_a_mesh, samples_per_face=args.urdf_samples_per_face)
+    pika_finger_b_surface_samples = mesh_surface_samples(pika_finger_b_mesh, samples_per_face=args.urdf_samples_per_face)
     latest: dict = {"frame": 0, "status": "initializing", "environment": {"points": [], "colors": []}, "robot": {"points": [], "colors": []}, "obbs": []}
     lock = threading.Lock(); stop = threading.Event()
 
@@ -254,6 +299,18 @@ def main() -> None:
         nonlocal latest
         receiver = RTDEReceiveInterface(str(args.robot_ip))
         source = RealSenseD435iSource(cameras=camera_configs, width=width, height=height, fps=fps)
+        opening_reader: PikaOpeningReader | None = None
+        opening_mm = float(args.pika_mesh_reference_opening_mm)
+        opening_status = "PiKA opening unavailable; using mesh reference"
+        if args.pika_gripper_port:
+            try:
+                opening_reader = PikaOpeningReader(args.pika_gripper_port, max_opening_mm=args.pika_max_opening_mm)
+                opening_reader.connect()
+                opening_status = f"PiKA opening reader {args.pika_gripper_port}"
+                print(f"[viewer] {opening_status} connected (read-only)")
+            except Exception as exc:
+                print(f"[viewer] warning: cannot read PiKA opening on {args.pika_gripper_port}: {exc}")
+                opening_reader = None
         refiner = LingBotDepthRefiner(
             camera_names=camera_names,
             device=args.lingbot_device,
@@ -277,6 +334,31 @@ def main() -> None:
                 )
                 repair_seconds = refiner.last_inference_seconds
                 pika_to_base = flange_transform(q) @ pika_mount
+                if opening_reader is not None:
+                    try:
+                        opening_mm = opening_reader.opening_mm()
+                        opening_status = f"PiKA opening {opening_mm:.1f} mm"
+                    except Exception as exc:
+                        opening_status = f"PiKA opening read failed; retaining {opening_mm:.1f} mm ({type(exc).__name__})"
+                finger_offset_m = 0.5 * (opening_mm - args.pika_mesh_reference_opening_mm) / 1000.0
+                finger_a_shift = np.array((-finger_offset_m, 0.0, 0.0))
+                finger_b_shift = np.array((finger_offset_m, 0.0, 0.0))
+                pika_volume_indices = np.concatenate(
+                    (
+                        pika_body_volume_indices,
+                        translated_local_indices(pika_finger_a_volume_indices, finger_a_shift, args.volume_pitch_m),
+                        translated_local_indices(pika_finger_b_volume_indices, finger_b_shift, args.volume_pitch_m),
+                    ),
+                    axis=0,
+                )
+                pika_surface_samples = np.concatenate(
+                    (
+                        pika_body_surface_samples,
+                        pika_finger_a_surface_samples + finger_a_shift,
+                        pika_finger_b_surface_samples + finger_b_shift,
+                    ),
+                    axis=0,
+                )
                 volume, pitch = occupied_collision_voxels_from_local_indices(q, local_indices=local_volume_indices, voxel_pitch_m=args.volume_pitch_m, exterior_margin_m=args.volume_margin_m, extra_local_indices=(pika_volume_indices, pika_to_base))
                 robot_sets=[]; env_sets=[]
                 for f in refined:
@@ -325,7 +407,7 @@ def main() -> None:
                 all_for_ranges = np.concatenate((env, robot), axis=0)
                 axis_ranges = np.ptp(all_for_ranges, axis=0).astype(float).tolist() if len(all_for_ranges) else [0.0, 0.0, 0.0]
                 snapshot={"frame":frame_index,"status":f"LingBot {refiner.last_inference_seconds:.1f}s · qΔ {float(np.max(np.abs(q1-q0))):.5f} rad · {len(obbs)} tabletop-connected obstacles","environment":{"points":ep,"colors":ec},"robot":{"points":rp,"colors":rc},"obbs":[{"corners":b.corners.astype(float).tolist()} for b in obbs]}
-                snapshot["status"] = f"frame {time.perf_counter()-frame_started:.1f}s (LingBot {repair_seconds:.1f}s) · q delta {float(np.max(np.abs(q1-q0))):.5f} rad · {len(obbs)} tabletop-connected obstacles · {floating_components} floating excluded"
+                snapshot["status"] = f"frame {time.perf_counter()-frame_started:.1f}s (LingBot {repair_seconds:.1f}s) · {opening_status} · q delta {float(np.max(np.abs(q1-q0))):.5f} rad · {len(obbs)} tabletop-connected obstacles · {floating_components} floating excluded"
                 snapshot["view_center"] = view_center; snapshot["view_radius"] = view_radius; snapshot["axis_ranges"] = axis_ranges
                 with lock: latest=snapshot
                 if args.once: break
@@ -334,6 +416,8 @@ def main() -> None:
             raise
         finally:
             source.stop(); receiver.disconnect()
+            if opening_reader is not None:
+                opening_reader.close()
 
     worker=threading.Thread(target=process_loop,daemon=True); worker.start()
     if args.once:

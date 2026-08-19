@@ -1,6 +1,5 @@
 __pycache__/
 outputs/
-docs/
 *.pyc
 *.egg-info
 *.egg

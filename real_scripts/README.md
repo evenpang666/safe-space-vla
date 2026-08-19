@@ -33,7 +33,7 @@ python -m pip install opencv-contrib-python ur-rtde trimesh
 export UR_ROBOT_IP=169.254.175.10
 
 python real_scripts/calibrate_ur7e_realsense_integrated.py \
-  --serials 405622074939 234567890123 \
+  --serials 405622074939 348522070576 \
   --robot-ip "$UR_ROBOT_IP" \
   --output-dir outputs/calibration/session_01 \
   --squares-x 10 --squares-y 7 \
@@ -69,7 +69,8 @@ outputs/calibration/session_01/
 python real_scripts/capture_fuse_separate_ur7e_live.py \
   --robot-ip "$UR_ROBOT_IP" \
   --calibration outputs/calibration/session_01/camera_calibration.json \
-  --output-dir outputs/ur7e_live_scene
+  --output-dir outputs/ur7e_live_scene_1 \
+  --pika-max-opening-mm 110
 ```
 
 脚本会从标定文件自动读取相机序列号与标定流配置：
@@ -118,7 +119,158 @@ python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
 - `current_link_points[N, K, 3]`、`action_chunks[N, H, 7]` 和 `target_point_offsets[N, H, K, 3]`；
 - `observed_robot_point_counts[T, C]` 与时间戳偏差，用于拒绝标定差或遮挡严重的 episode。
 
-### 可选：真实机器人表面轨迹
+### 两种机器人表面点目标
+
+预处理器保留两种互补的点表示，不能把它们混为同一个监督目标：
+
+| 表示 | 核心字段 | 点的来源 | 适用场景 |
+| --- | --- | --- | --- |
+| 模型碰撞网格固定点 | `fixed_link_points`、`point_ids` | UR7e/PiKA collision mesh 的确定性表面采样 + 每帧 FK | 安全几何、保守碰撞、关节条件、无缺失的确定性点流 |
+| PointWorld 真实表面点 | `visual_robot_tracks`、`visual_robot_visible_mask` | 跨帧 RGB 轨迹 + 实测深度反投影；模型仅作门控 | 真实外观/执行残差、附着物、标定偏差和可见表面点流监督 |
+
+#### 模型碰撞网格固定点（保留的默认安全预处理）
+
+这是默认且必须保留的安全几何路径。每个 UR7e collision link 与 PiKA
+表面各采样 `--points-per-link` 个确定性点；`point_ids[link_id, point_id]`
+在所有帧恒定，空间位置随实测关节角和夹爪开度更新。相机深度只用于
+`observed_robot_point_counts` 审计，**不会**改变、删除或补充
+`fixed_link_points`。
+
+双视角 legacy demo 的命令如下（只有 front RGB-D 时删除 `side` 和对应的
+`--scene-camera-map`）：
+
+```bash
+conda run -n safety python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir ur7e_inference/outputs/ur7e_demo_episodes/pick_cube/episode_003 \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view.npz \
+  --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
+  --scene-camera-names front side \
+  --scene-camera-map side=348522070576 \
+  --points-per-link 128 --future-horizon 8
+```
+
+该输出包含 `fixed_link_points[T, L, P, 3]`、`point_ids[L, P, 2]`、
+`local_link_points`、`target_point_offsets` 和 `future_link_offsets`。可用
+下面的脚本检查模型点在相机上的投影；传入 `--side-camera-name` 时为三栏
+front/side/UR-base 视频，省略时为 front/UR-base 视频：
+
+```bash
+conda run -n safety python real_scripts/visualize_ur7e_fixed_surface_trajectory.py \
+  --surface-npz outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view.npz \
+  --calibration ur7e_inference/outputs/ur7e_demo_episodes/pick_cube/episode_003/calibration.json \
+  --camera-name 405622074939 --side-camera-name 348522070576 \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view_trajectory.mp4 \
+  --preview outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view_preview.png \
+  --fps 15
+```
+
+该视频用于检验 FK、相机标定与 PiKA 安装变换；即使视觉重合，也不能把该
+模型点视频当作实测表面点云。
+
+#### PointWorld 真实机器人表面轨迹
+
+##### 推荐流程：PointWorld 式真实 RGB-D 表面点（GPU）
+
+`fixed_link_points` 是 UR7e/PiKA 碰撞网格上固定 ID 的模型点，用于
+运动学条件、机器人区域门控和保守碰撞判断；它**不是**相机实测表面。
+若训练或分析需要真实机器人表面点，应使用下面的 PointWorld 流程：
+
+```text
+首帧真实深度 + FK 深度一致性 → 机器人表面 pixel seeds
+→ CoTracker3 跨帧保持 seed ID → 每帧真实深度反投影到 UR base
+→ FK 深度一致性门控 → visual_robot_tracks + visible mask
+```
+
+模型只参与 seed 的机器人区域筛选和每帧一致性门控；输出的
+`visual_robot_tracks` 坐标来自真实 RGB 跟踪像素与真实深度。被遮挡、
+深度无效或跟踪漂移的 seed 不会被重排或替换，而是保留原列 ID 并把
+`visual_robot_visible_mask` 置为 `False`。
+
+先在 `safety` conda 环境确认 CUDA 可见，再下载一次官方 CoTracker3
+checkpoint（后续 episode 复用该文件）：
+
+```bash
+conda run -n safety python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'
+
+mkdir -p outputs/ur7e_demo_surface/cotracker
+curl -L --fail -o outputs/ur7e_demo_surface/cotracker/cotracker3_scaled_offline.pth \
+  https://huggingface.co/facebook/cotracker3/resolve/main/scaled_offline.pth
+```
+
+以一个同时具有 front/side RGB-D 的 legacy demo episode 为例，先运行
+基础 safety 预处理一次。该步骤提供 FK 门控用的机器人表面，但不把它
+作为真实点流标签：
+
+```bash
+conda run -n safety python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir ur7e_inference/outputs/ur7e_demo_episodes/pick_cube/episode_003 \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view.npz \
+  --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
+  --scene-camera-names front side \
+  --scene-camera-map side=348522070576 \
+  --points-per-link 128 --future-horizon 8
+```
+
+随后每个**固定相机**独立生成一套 512 个 stable seed 的 CoTracker3
+轨迹。两个相机的 seed ID 是独立集合，不能直接当作同一个物理点：
+
+```bash
+TRACKER_CKPT=outputs/ur7e_demo_surface/cotracker/cotracker3_scaled_offline.pth
+BASE_SURFACE=outputs/ur7e_demo_surface/pick_cube_episode_003_fixed_surface_dual_view.npz
+EPISODE=ur7e_inference/outputs/ur7e_demo_episodes/pick_cube/episode_003
+
+conda run -n safety python real_scripts/generate_cotracker_robot_tracks.py \
+  --episode-dir "$EPISODE" --surface-npz "$BASE_SURFACE" \
+  --camera front --calibration-camera 405622074939 \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_front_cotracker_dense_tracks.npz \
+  --checkpoint "$TRACKER_CKPT" --tracker cotracker --device cuda \
+  --max-seeds 512 --seed-stride 2 --tracking-scale 0.5 --chunk-size 32
+
+conda run -n safety python real_scripts/generate_cotracker_robot_tracks.py \
+  --episode-dir "$EPISODE" --surface-npz "$BASE_SURFACE" \
+  --camera side --calibration-camera 348522070576 \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_side_cotracker_dense_tracks.npz \
+  --checkpoint "$TRACKER_CKPT" --tracker cotracker --device cuda \
+  --max-seeds 512 --seed-stride 2 --tracking-scale 0.5 --chunk-size 32
+```
+
+将每一套 2-D 轨迹重新送入预处理器，得到真实深度反投影的 3-D 点流。
+由于每个相机各有独立的 stable ID，本版本分别写出两个 NPZ：
+
+```bash
+conda run -n safety python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir "$EPISODE" \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_front.npz \
+  --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
+  --scene-camera-names front side --scene-camera-map side=348522070576 \
+  --robot-tracks outputs/ur7e_demo_surface/pick_cube_episode_003_front_cotracker_dense_tracks.npz \
+  --robot-tracks-camera front --points-per-link 128 --future-horizon 8
+
+conda run -n safety python real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
+  --episode-dir "$EPISODE" \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_side.npz \
+  --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
+  --scene-camera-names front side --scene-camera-map side=348522070576 \
+  --robot-tracks outputs/ur7e_demo_surface/pick_cube_episode_003_side_cotracker_dense_tracks.npz \
+  --robot-tracks-camera side --points-per-link 128 --future-horizon 8
+```
+
+渲染真实点而不是模型点。传入 `--side-npz` 时得到 front、side、UR base
+三栏视频；单相机 episode（例如只有 front RGB-D 的 episode_002）则省略
+该参数，生成 front 与 UR base 两栏视频：
+
+```bash
+conda run -n safety python real_scripts/visualize_pointworld_robot_tracks.py \
+  --front-npz outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_front.npz \
+  --side-npz outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_side.npz \
+  --output outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_measured_surface_trajectory.mp4 \
+  --preview outputs/ur7e_demo_surface/pick_cube_episode_003_pointworld_dense_measured_surface_preview.png \
+  --fps 15
+```
+
+`--max-seeds` 是每个相机的理论最大 stable point 数；视频中实际显示的点
+通常更少，这是正常现象：门控会排除遮挡、无效深度以及与 FK 深度不一致
+的跟踪像素。不要以补点、重采样或重排 ID 来填满不可见区域。
 
 若要采用 PointWorld 式的“同一初始像素 seed 在各帧的可见表面对应”，先在**一个固定相机**的全段 RGB 上运行 CoTracker（或任意 2D tracker），再把结果保存成 NPZ：
 
@@ -167,7 +319,7 @@ uv run --project . ../scripts/train_pi05_ur7e_surface_pytorch.py \
 
 `--max-points 128` 对每个 sample 使用固定的等间隔点下标；需要全量点云时设为 `0`，但 Transformer 前缀长度和显存会显著增加。`--point-target visual` 使用已接入 CoTracker 轨迹并由深度/FK 门控后的 `visual_robot_*` 字段；此时点流损失只在其可见性 mask 为真的位置计算。checkpoint 会保存真实 UR 动作与 qpos 的均值/标准差；推理时必须将前 7 维预测动作反归一化，未来点云为 `current_points + predicted_offsets`。
 
-当前 PiKA 采样器把完整夹爪视为刚性法兰附件；若训练数据包含明显的开合运动，需要先标定手指运动学并把夹爪拆成独立固定点组，否则仅应将这些点用于保守碰撞包络。
+当前 PiKA 预处理会把 body 与两指分开采样，并依记录的开口距离做对称线性平移；这仍是近似运动学。用于精确点流或安全边界前，必须标定真实手指运动学与 `^flange T_pika_step_frame`，并复核投影视频。
 
 ## 可选功能
 
@@ -192,8 +344,6 @@ python real_scripts/live_ur7e_scene_viewer.py \
   --pika-mount-transform-json outputs/calibration/pika_mount_from_tcp_provisional.json \
   --bind-host 0.0.0.0
 ```
-
-<!-- http://192.168.124.57:8765/ -->
 
 该工具只读取相机和 RTDE 状态；使用 `Ctrl+C` 停止。启用 PiKA 前，必须先测量并验证 `^flange T_pika_step_frame`，示例变换不可用于生产或安全决策。
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from contextlib import contextmanager
+import os
 import time
 from typing import Any
 
@@ -20,6 +22,33 @@ from real_scripts.real_robot_adapter import RGBDFrame
 
 DEFAULT_LINGBOT_DEPTH_MODEL = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
 DEFAULT_LINGBOT_CAMERA_NAMES = ("front", "side")
+
+
+@contextmanager
+def _without_legacy_socks_all_proxy():
+    """Allow httpx-based model loading with a legacy ``socks://`` setting.
+
+    httpx rejects the legacy URL spelling before making a request.  Many lab
+    shells also define HTTP(S)_PROXY for the same local proxy; in that case,
+    temporarily hiding only ALL_PROXY retains proxy access for Hugging Face
+    while avoiding the invalid fallback URL.  The caller's environment is
+    restored immediately afterwards.
+    """
+    has_http_proxy = any(
+        os.environ.get(name)
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+    )
+    removed: dict[str, str] = {}
+    if has_http_proxy:
+        for name in ("ALL_PROXY", "all_proxy"):
+            value = os.environ.get(name)
+            if value and value.lower().startswith("socks://"):
+                removed[name] = value
+                os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        os.environ.update(removed)
 
 
 def add_lingbot_depth_cli_args(parser: Any) -> None:
@@ -113,7 +142,10 @@ class LingBotDepthRefiner:
             raise ValueError("--lingbot-fp16 requires a CUDA device; use --no-lingbot-fp16 for CPU inference")
         self.use_fp16 = bool(use_fp16)
         self.model_id = str(model_id)
-        self.model = MDMModel.from_pretrained(self.model_id).to(self.device).eval()
+        # Hugging Face Hub uses httpx.  Keep a malformed legacy SOCKS fallback
+        # out of this process-local request without disabling HTTP(S) proxies.
+        with _without_legacy_socks_all_proxy():
+            self.model = MDMModel.from_pretrained(self.model_id).to(self.device).eval()
         # The released model defaults to nested-tensor attention, which needs
         # xFormers.  Use PyTorch SDPA when xFormers is unavailable (notably
         # CPU-only diagnostic machines) while preserving the same weights.

@@ -127,6 +127,7 @@ def run_collection(args: argparse.Namespace) -> int:
         for step_id in range(args.max_steps):
             tick_started = time.monotonic()
             observation, frames, qpos, gripper = platform.observe(args.prompt)
+            gripper_opening_mm = platform.gripper_opening_mm()
             surface_frames.append(sampler.link_points(qpos))
             need_query = action_chunk is None or action_offset >= len(action_chunk) or replan_offset >= args.replan_steps
             if need_query:
@@ -149,6 +150,7 @@ def run_collection(args: argparse.Namespace) -> int:
                 frames=frames,
                 qpos=qpos,
                 gripper_state=gripper,
+                gripper_opening_mm=gripper_opening_mm,
                 robot_state_timestamp_ns=time.monotonic_ns(),
                 policy_query_id=active_query_id,
                 action_index=action_offset,

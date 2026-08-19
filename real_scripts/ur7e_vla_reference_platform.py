@@ -83,6 +83,11 @@ class UR7eReferenceVLAPlatform:
     def policy_name(self) -> str:
         return "mani_real_pi05"
 
+    def gripper_opening_mm(self) -> float | None:
+        """Measured PiKA jaw opening for raw-recording geometry alignment."""
+        read_opening = getattr(self.gripper, "opening_mm", None)
+        return None if not callable(read_opening) else read_opening()
+
     def start(self) -> None:
         self.robot.connect()
         try:
