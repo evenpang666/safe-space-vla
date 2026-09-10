@@ -55,7 +55,8 @@ def add_lingbot_depth_cli_args(parser: Any) -> None:
     """Add the shared optional LingBot-Depth controls to an argparse parser."""
     parser.add_argument(
         "--lingbot-depth",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Refine front/side RGB-D depth with LingBot-Depth before point-cloud fusion.",
     )
     parser.add_argument("--lingbot-model-id", default=DEFAULT_LINGBOT_DEPTH_MODEL)

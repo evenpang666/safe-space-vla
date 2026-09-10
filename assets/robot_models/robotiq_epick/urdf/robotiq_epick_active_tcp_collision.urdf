@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  Fixed collision model for Robotiq EPick rooted at the controller active TCP.
+  +Z points away from the flange through the cup contact point.  The EPick
+  body/cup dimensions follow PickNik's BSD-3-Clause epick_description model:
+  body length 0.1023 m, collision radius 0.044 m, cup radius 0.012 m, cup
+  height 0.015 m.  The 0.0447 m rear segment is the current flange-to-TCP
+  installation allowance measured from the right UR controller.
+-->
+<robot name="robotiq_epick_active_tcp_collision">
+  <link name="epick_active_tcp"/>
+  <link name="mount_extension"><collision><origin xyz="0 0 -0.1400"/><geometry><cylinder radius="0.028" length="0.0447"/></geometry></collision></link>
+  <joint name="tcp_to_extension" type="fixed"><parent link="epick_active_tcp"/><child link="mount_extension"/><origin xyz="0 0 0"/></joint>
+  <link name="epick_body"><collision><origin xyz="0 0 -0.06615"/><geometry><cylinder radius="0.044" length="0.1023"/></geometry></collision></link>
+  <joint name="extension_to_body" type="fixed"><parent link="mount_extension"/><child link="epick_body"/><origin xyz="0 0 0"/></joint>
+  <link name="suction_cup"><collision><origin xyz="0 0 -0.0075"/><geometry><cylinder radius="0.012" length="0.015"/></geometry></collision></link>
+  <joint name="body_to_cup" type="fixed"><parent link="epick_body"/><child link="suction_cup"/><origin xyz="0 0 0"/></joint>
+</robot>

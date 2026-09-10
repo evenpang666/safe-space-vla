@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Conservative fixed collision model for an installed Robotiq 2F-85.
+  Root is the controller's active TCP at the closed-finger contact midpoint.
+  +Z points out from the UR flange toward the fingers.
+  The finger pair is an open/closed swept envelope, intentionally safe for
+  RGB-D robot removal when no live gripper joint angle is available.
+-->
+<robot name="robotiq_2f85_active_tcp_collision">
+  <link name="robotiq_2f85_active_tcp"/>
+  <link name="mount_adapter"><collision><origin xyz="0 0 -0.180"/><geometry><cylinder radius="0.038" length="0.020"/></geometry></collision></link>
+  <joint name="tcp_to_adapter" type="fixed"><parent link="robotiq_2f85_active_tcp"/><child link="mount_adapter"/><origin xyz="0 0 0"/></joint>
+  <link name="gripper_body"><collision><origin xyz="0 0 -0.130"/><geometry><box size="0.090 0.082 0.100"/></geometry></collision></link>
+  <joint name="adapter_to_body" type="fixed"><parent link="mount_adapter"/><child link="gripper_body"/><origin xyz="0 0 0"/></joint>
+  <link name="left_finger_envelope"><collision><origin xyz="0.034 0 -0.047"/><geometry><box size="0.028 0.032 0.115"/></geometry></collision></link>
+  <joint name="body_to_left_finger" type="fixed"><parent link="gripper_body"/><child link="left_finger_envelope"/><origin xyz="0 0 0"/></joint>
+  <link name="right_finger_envelope"><collision><origin xyz="-0.034 0 -0.047"/><geometry><box size="0.028 0.032 0.115"/></geometry></collision></link>
+  <joint name="body_to_right_finger" type="fixed"><parent link="gripper_body"/><child link="right_finger_envelope"/><origin xyz="0 0 0"/></joint>
+</robot>
