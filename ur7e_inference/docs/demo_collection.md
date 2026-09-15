@@ -65,15 +65,9 @@ outputs/ur7e_demo_episodes/
 
 任务名称会规范化为小写下划线形式。录制期间先写入 `demo.staging_dir`；若进程被强制杀死、断电或 Python 崩溃，暂存目录不会自动完成保存，不能交给预处理器。
 
-采集前必须在 `config.yaml` 配置 `demo.safety_calibration_path` 和 `demo.safety_front_calibration_name`。默认配置已使用前视 D435i `405622074939` 与 `outputs/calibration/session_01/camera_calibration.json`。RGB 与深度按相机原始分辨率保存；预处理器会读取实际尺寸，只有当旧 episode 的保存尺寸与标定流尺寸不同才缩放临时内参：
-
-```bash
-python ../real_scripts/preprocess_pi05_rgbd_surface_dataset.py \
-  --episode-dir outputs/ur7e_demo_episodes/pick_cube/episode_002 \
-  --output outputs/pi05_surface/pick_cube_episode_002.npz \
-  --pika-mount-transform-json ../outputs/calibration/pika_mount_from_tcp_provisional.json \
-  --scene-camera-names front
-```
+这一节描述的是已停止使用的 PiKA 文件夹格式，仅用于历史数据解释。当前项目
+只接受 Quest3 采集的 HDF5；规范预处理命令见仓库根目录 `README.md`，不要把
+此处的旧文件夹 episode 交给当前安全训练链路。
 
 ```bash
 ur7e-vla collect-demo --config config.yaml --task "pick cube" --execute \

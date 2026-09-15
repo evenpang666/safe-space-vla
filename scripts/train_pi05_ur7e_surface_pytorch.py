@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Jointly fine-tune PyTorch PI05 for UR7e actions and robot-surface flow.
 
-Input shards are produced by ``preprocess_pi05_rgbd_surface_dataset.py``.
+Input shards are produced by ``scripts/preprocess_quest3_hdf5.py``.
 Each sample uses task text, current RGB images, qpos, and current robot points;
-the targets are a normalized 7-D action chunk and its future point offsets.
+the targets are a normalized Quest3 action chunk (7-D single arm or 14-D
+dual arm) and its future point offsets.
 Run inside the OpenPI Python environment, for example:
 
   uv run --project openpi ../scripts/train_pi05_ur7e_surface_pytorch.py \
@@ -37,7 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, nargs="+", required=True, help="Preprocessed .npz files or directories.")
     parser.add_argument("--output", type=Path, required=True, help="Output PyTorch checkpoint (.pt).")
-    parser.add_argument("--pretrained", type=Path, default=None, help="Optional converted PI05 model.safetensors checkpoint.")
+    parser.add_argument("--pretrained", type=Path, default=None, help="Converted PI05 model.safetensors backbone (required for real training).")
+    parser.add_argument("--allow-random-init", action="store_true", help="Testing only: train without a pretrained PI05 backbone.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -60,7 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--freeze-base", action="store_true", help="Train only the new point-token and point-flow layers.")
+    parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=None,
+        help="Cap batches per epoch for a bounded smoke test; omitted means use the complete dataset.",
+    )
     parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--validate-only", action="store_true", help="Validate shards and print the resolved contract without loading PI05.")
     return parser.parse_args()
 
 
@@ -88,8 +97,11 @@ def _parse_camera_map(values: list[str], rgb_names: list[str]) -> dict[str, str]
             raise ValueError(f"Multiple cameras mapped to the same PI05 view: {target}")
         mapping[source] = target
     if not mapping:
-        for source, target in zip(rgb_names, MODEL_IMAGE_KEYS, strict=False):
-            mapping[source] = target
+        # The deployed obstacle service owns the one calibrated front D455.
+        # Wrist views remain in the shard for later experiments, but the
+        # default train/deploy contract is deliberately front-only.
+        source = "front" if "front" in rgb_names else rgb_names[0]
+        mapping[source] = "base_0_rgb"
     return mapping
 
 
@@ -124,6 +136,7 @@ class _Tokenizer:
 class _Episode:
     path: Path
     task_text: str
+    task_text_source: str
     qpos: np.ndarray
     actions: np.ndarray
     current_points: np.ndarray
@@ -131,6 +144,13 @@ class _Episode:
     target_mask: np.ndarray
     rgb: dict[str, np.ndarray]
     sample_count: int
+    action_dim: int
+    joint_dim: int
+    selected_point_indices: np.ndarray
+    surface_model_hash: str
+    point_identity_version: str
+    points_per_link: int
+    arm_count: int
 
 
 class Ur7eSurfaceDataset(Dataset):
@@ -182,7 +202,7 @@ class Ur7eSurfaceDataset(Dataset):
 
     def _load_episode(self, path: Path, *, max_points: int, point_target: str, action_horizon: int | None) -> _Episode:
         with np.load(path, allow_pickle=False) as data:
-            required = ("task_text", "qpos", "action_chunks", "sample_frame_indices")
+            required = ("task_text", "qpos", "action_chunks", "sample_frame_indices", "coordinate_frame")
             missing = [key for key in required if key not in data]
             if missing:
                 raise ValueError(f"{path} is not a preprocessed PI05 surface shard; missing {missing}")
@@ -197,16 +217,29 @@ class Ur7eSurfaceDataset(Dataset):
             else:
                 current = np.asarray(data["current_link_points"], dtype=np.float32)
                 offsets = np.asarray(data["target_point_offsets"], dtype=np.float32)
-                mask = np.ones(offsets.shape[:-1], dtype=bool)
+                mask = np.asarray(data["target_point_mask"], dtype=bool) if "target_point_mask" in data else np.ones(offsets.shape[:-1], dtype=bool)
             actions = np.asarray(data["action_chunks"], dtype=np.float32)
             sample_frames = np.asarray(data["sample_frame_indices"], dtype=np.int64)
-            qpos = np.asarray(data["qpos"], dtype=np.float32)[sample_frames, :6]
+            qpos = np.asarray(data["qpos"], dtype=np.float32)[sample_frames]
             rgb = {key[4:]: np.asarray(data[key], dtype=np.uint8)[sample_frames] for key in data.files if key.startswith("rgb_")}
-            task_text = str(np.asarray(data["task_text"]).item())
+            task_text = str(np.asarray(data["task_text"]).item()).strip()
+            task_text_source = (
+                str(np.asarray(data["task_text_source"]).item())
+                if "task_text_source" in data
+                else "legacy_shard"
+            )
+            surface_model_hash = str(np.asarray(data["surface_model_hash"]).item())
+            point_identity_version = str(np.asarray(data["point_identity_version"]).item())
+            points_per_link = int(np.asarray(data["points_per_link"]).item())
+            arm_count = int(np.asarray(data["arm_count"]).item())
+        if not task_text:
+            raise ValueError(f"{path} has an empty task_text")
         if not rgb:
             raise ValueError(f"{path} contains no rgb_* arrays")
-        if actions.ndim != 3 or actions.shape[-1] != 7:
-            raise ValueError(f"{path} action_chunks must have shape [N,H,7], got {actions.shape}")
+        if actions.ndim != 3 or not 1 <= actions.shape[-1] <= 32:
+            raise ValueError(f"{path} action_chunks must have shape [N,H,A] with 1<=A<=32, got {actions.shape}")
+        if qpos.ndim != 2 or qpos.shape[1] not in (6, 12):
+            raise ValueError(f"{path} qpos must resolve to [N,6] or [N,12], got {qpos.shape}")
         if action_horizon is not None and actions.shape[1] != action_horizon:
             raise ValueError(f"{path} horizon {actions.shape[1]} does not match --action-horizon={action_horizon}")
         if current.ndim != 3 or current.shape[0] != actions.shape[0] or current.shape[-1] != 3:
@@ -219,6 +252,7 @@ class Ur7eSurfaceDataset(Dataset):
         return _Episode(
             path=path,
             task_text=task_text,
+            task_text_source=task_text_source,
             qpos=qpos,
             actions=actions,
             current_points=current[:, ids],
@@ -226,6 +260,13 @@ class Ur7eSurfaceDataset(Dataset):
             target_mask=mask[:, :, ids],
             rgb=rgb,
             sample_count=actions.shape[0],
+            action_dim=actions.shape[-1],
+            joint_dim=qpos.shape[-1],
+            selected_point_indices=ids,
+            surface_model_hash=surface_model_hash,
+            point_identity_version=point_identity_version,
+            points_per_link=points_per_link,
+            arm_count=arm_count,
         )
 
     def set_camera_map(self, mapping: dict[str, str]) -> None:
@@ -242,7 +283,7 @@ class Ur7eSurfaceDataset(Dataset):
         episode = self.episodes[episode_index]
         qpos = (episode.qpos[sample_index] - self.qpos_mean) / self.qpos_std
         state = np.zeros((32,), dtype=np.float32)
-        state[:6] = qpos
+        state[: len(qpos)] = qpos
         tokens, token_mask = self.tokenizer.tokenize(episode.task_text, state)
         images = {key: np.zeros(self.image_shape, dtype=np.uint8) for key in MODEL_IMAGE_KEYS}
         image_masks = {key: np.asarray(False) for key in MODEL_IMAGE_KEYS}
@@ -250,7 +291,7 @@ class Ur7eSurfaceDataset(Dataset):
             images[target] = episode.rgb[source][sample_index]
             image_masks[target] = np.asarray(True)
         actions = np.zeros((episode.actions.shape[1], 32), dtype=np.float32)
-        actions[:, :7] = (episode.actions[sample_index] - self.action_mean) / self.action_std
+        actions[:, : episode.action_dim] = (episode.actions[sample_index] - self.action_mean) / self.action_std
         return {
             "images": images,
             "image_masks": image_masks,
@@ -265,27 +306,32 @@ class Ur7eSurfaceDataset(Dataset):
         }
 
 
-def _normalization_stats(paths: list[Path]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-    qpos_values, action_values, horizon = [], [], None
+def _normalization_stats(paths: list[Path]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int]:
+    qpos_values, action_values, horizon, action_dim, joint_dim = [], [], None, None, None
     for path in paths:
         with np.load(path, allow_pickle=False) as data:
             qpos = np.asarray(data["qpos"], dtype=np.float32)
             sample_frames = np.asarray(data["sample_frame_indices"], dtype=np.int64)
             actions = np.asarray(data["action_chunks"], dtype=np.float32)
-        if actions.ndim != 3 or actions.shape[-1] != 7:
-            raise ValueError(f"{path} must contain action_chunks[N,H,7]")
+        if actions.ndim != 3 or not 1 <= actions.shape[-1] <= 32:
+            raise ValueError(f"{path} must contain action_chunks[N,H,A], 1<=A<=32")
         if horizon is not None and horizon != actions.shape[1]:
             raise ValueError("All shards must have the same action horizon")
+        if action_dim is not None and action_dim != actions.shape[2]:
+            raise ValueError("Do not mix single-arm 7-D and dual-arm 14-D shards in one checkpoint")
+        if joint_dim is not None and joint_dim != qpos.shape[1]:
+            raise ValueError("Do not mix six-joint and twelve-joint shards in one checkpoint")
         horizon = actions.shape[1]
-        qpos_values.append(qpos[sample_frames, :6])
-        action_values.append(actions.reshape(-1, 7))
+        action_dim, joint_dim = actions.shape[2], qpos.shape[1]
+        qpos_values.append(qpos[sample_frames])
+        action_values.append(actions.reshape(-1, action_dim))
     qpos_all, action_all = np.concatenate(qpos_values), np.concatenate(action_values)
     return (
         qpos_all.mean(axis=0).astype(np.float32),
         qpos_all.std(axis=0).clip(1e-6).astype(np.float32),
         action_all.mean(axis=0).astype(np.float32),
         action_all.std(axis=0).clip(1e-6).astype(np.float32),
-        int(horizon),
+        int(horizon), int(action_dim), int(joint_dim),
     )
 
 
@@ -317,13 +363,15 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.max_points < 0:
         raise ValueError("epochs and batch-size must be positive; max-points must be >= 0")
+    if args.max_train_batches is not None and args.max_train_batches < 1:
+        raise ValueError("--max-train-batches must be positive when supplied")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     shards = _resolve_shards(args.dataset)
-    qpos_mean, qpos_std, action_mean, action_std, detected_horizon = _normalization_stats(shards)
+    qpos_mean, qpos_std, action_mean, action_std, detected_horizon, logical_action_dim, joint_dim = _normalization_stats(shards)
     horizon = detected_horizon if args.action_horizon is None else args.action_horizon
-    tokenizer = _Tokenizer(max_len=200, model_path=args.tokenizer_model)
+    tokenizer = None if args.validate_only else _Tokenizer(max_len=200, model_path=args.tokenizer_model)
     dataset = Ur7eSurfaceDataset(
         shards,
         max_points=args.max_points,
@@ -337,6 +385,24 @@ def main() -> None:
     )
     rgb_names = sorted(dataset.episodes[0].rgb)
     dataset.set_camera_map(_parse_camera_map(args.camera_map, rgb_names))
+    reference = dataset.episodes[0]
+    for episode in dataset.episodes[1:]:
+        if (episode.surface_model_hash, episode.point_identity_version, episode.points_per_link, episode.arm_count) != (
+            reference.surface_model_hash, reference.point_identity_version, reference.points_per_link, reference.arm_count
+        ):
+            raise ValueError("All shards in one checkpoint must use the same arm/tool surface model and point identity")
+    if args.validate_only:
+        print({
+            "shards": len(shards), "samples": len(dataset), "joint_dim": joint_dim,
+            "logical_action_dim": logical_action_dim, "action_horizon": horizon,
+            "point_count": dataset.point_count, "rgb_views": rgb_names,
+            "camera_map": dataset.camera_map, "coordinate_frame": "left_base",
+            "episode_task_texts": [episode.task_text for episode in dataset.episodes],
+            "episode_task_text_sources": [episode.task_text_source for episode in dataset.episodes],
+        })
+        return
+    if args.pretrained is None and not args.allow_random_init:
+        raise ValueError("Joint world-action training requires --pretrained PI05 weights (or explicit testing-only --allow-random-init)")
     if len(dataset) < args.batch_size:
         raise ValueError(f"Dataset has {len(dataset)} samples, smaller than --batch-size={args.batch_size}")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
@@ -349,25 +415,46 @@ def main() -> None:
             "cd openpi && uv run --project . ../scripts/train_pi05_ur7e_surface_pytorch.py ..."
         ) from exc
     config = Pi0Config(action_dim=32, action_horizon=horizon, pi05=True, dtype=args.precision)
-    model = PI05SafetyPytorch(config).to(device)
+    model = PI05SafetyPytorch(config, joint_dim=joint_dim).to(device)
     if args.pretrained is not None:
-        from safetensors.torch import load_file
+        from safetensors.torch import load_model
 
-        incompatible = model.load_state_dict(load_file(str(args.pretrained)), strict=False)
-        print(f"[weights] missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}")
+        # load_model understands the tied-weight aliases recorded by
+        # safetensors.save_model. load_file()+load_state_dict() silently leaves
+        # PaliGemma's shared token embedding random.
+        missing, unexpected = load_model(model, str(args.pretrained), strict=False, device=str(device))
+        disallowed_missing = [key for key in missing if not key.startswith("surface_")]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "Pretrained PI05 backbone is incomplete or incompatible: "
+                f"missing={disallowed_missing}, unexpected={unexpected}"
+            )
+        print(f"[weights] PI05 backbone complete; new_surface_keys={len(missing)}")
     if args.freeze_base:
         for name, parameter in model.named_parameters():
             parameter.requires_grad_(name.startswith("surface_"))
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     metadata = {
         "dataset": [str(path) for path in shards], "point_target": args.point_target, "point_count": dataset.point_count,
-        "camera_map": dataset.camera_map, "action_mean": action_mean, "action_std": action_std,
-        "qpos_mean": qpos_mean, "qpos_std": qpos_std, "action_horizon": horizon,
+        "camera_map": dataset.camera_map,
+        "action_mean": action_mean.tolist(), "action_std": action_std.tolist(),
+        "qpos_mean": qpos_mean.tolist(), "qpos_std": qpos_std.tolist(), "action_horizon": horizon,
+        "logical_action_dim": logical_action_dim, "joint_dim": joint_dim,
+        "model_action_dim": 32, "coordinate_frame": "left_base",
+        "selected_point_indices": dataset.episodes[0].selected_point_indices.tolist(),
+        "precision": args.precision,
+        "surface_model_hash": reference.surface_model_hash,
+        "point_identity_version": reference.point_identity_version,
+        "points_per_link": reference.points_per_link,
+        "arm_count": reference.arm_count,
+        "episode_task_texts": [episode.task_text for episode in dataset.episodes],
+        "episode_task_text_sources": [episode.task_text_source for episode in dataset.episodes],
+        "max_train_batches": args.max_train_batches,
     }
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = total_action = total_point = 0.0
-        for batch in loader:
+        for batch_index, batch in enumerate(loader, start=1):
             optimizer.zero_grad(set_to_none=True)
             losses = model.compute_losses(
                 _to_observation(batch, device),
@@ -384,7 +471,9 @@ def main() -> None:
             total_loss += float(losses["loss"].detach())
             total_action += float(losses["action_loss"])
             total_point += float(losses["point_loss"])
-        batches = len(loader)
+            if args.max_train_batches is not None and batch_index >= args.max_train_batches:
+                break
+        batches = batch_index
         print(f"epoch={epoch:03d} loss={total_loss / batches:.6f} action={total_action / batches:.6f} point={total_point / batches:.6f}")
         if epoch % args.save_every == 0 or epoch == args.epochs:
             _save_checkpoint(args.output, model, optimizer, epoch, metadata)

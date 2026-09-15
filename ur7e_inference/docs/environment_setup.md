@@ -56,7 +56,7 @@ cp config.example.yaml config.yaml
 ```bash
 ur7e-vla --help
 ur7e-vla list-cameras
-python scripts/probe_policy.py --host 192.168.124.15 --port 8000
+python scripts/probe_policy.py --host 192.168.125.59 --port 8000
 ```
 
 ## 启动交互式 VLA 推理与示教采集
@@ -92,4 +92,4 @@ ur7e-vla collect-demo --config config.yaml --task "pick cube" --execute \
 
 页面会一直运行；**Start Teleoperation** 启动独立遥操进程但尚不录制，状态 READY 后点击 **Start Recording** 才开始写入数据，最后通过 **Stop Teleoperation & Save** 正常结束并把 episode 保存到 `demo.output_dir`。采集进程异常退出后可直接再次点击 Start。
 
-在 `config.yaml` 配置 Pika 串口、两路相机和 UR 地址。默认的 `auto` 会被动识别 PiKA Sense、PiKA Gripper 和相应腕部相机；Linux 用户还必须有串口设备访问权限，通常执行 `sudo usermod -aG dialout "$USER"` 后重新登录。机器人主机必须能同时访问 UR7e 的 `169.254.175.10` 与推理主机的 `192.168.124.15`；通常需要两张网卡或正确的静态路由。
+在 `config.yaml` 配置 Pika 串口、两路相机和 UR 地址。默认的 `auto` 会被动识别 PiKA Sense、PiKA Gripper 和相应腕部相机；Linux 用户还必须有串口设备访问权限，通常执行 `sudo usermod -aG dialout "$USER"` 后重新登录。机器人主机必须能同时访问 UR7e 的 `169.254.175.10` 与推理主机的 `192.168.125.59`；通常需要两张网卡或正确的静态路由。

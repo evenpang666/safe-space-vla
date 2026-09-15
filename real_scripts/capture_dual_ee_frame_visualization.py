@@ -5,9 +5,8 @@ This is the first, non-moving step for aligning end-effector mounting
 directions.  It writes a front-camera overlay and a 3-D Plotly HTML scene in
 ``left_base``.  It never opens RTDE control or sends robot/gripper commands.
 
-The repository has no vendor Robotiq 2F-85 or EPick CAD/URDF model, so a
-vendor ``model`` coordinate frame cannot be inferred.  The output instead
-shows the two unambiguous measured frames needed to align it:
+The repository includes vendor Robotiq 2F-85 and EPick CAD/URDF models.  The
+output shows the two measured frames used to place those models:
 
 * ``flange``: UR7e FK frame from the current receive-only joint state;
 * ``active_tcp``: the pose currently configured on each robot controller.

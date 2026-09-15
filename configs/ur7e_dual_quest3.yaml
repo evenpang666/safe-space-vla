@@ -1,0 +1,67 @@
+schema_version: 1
+scene: ur7e_dual_quest3
+coordinate_frame: left_base
+
+# Paths are resolved relative to this repository.  The Quest3 collector is a
+# sibling project in the default workstation layout.
+quest3:
+  hardware_config: ../quest3_collect/config/hardware_dual_teleop.yaml
+  data_globs:
+    - ../quest3_collect/data/left_vr_episodes/*.hdf5
+    - ../quest3_collect/data/dual_vr_episodes/*.hdf5
+  front_camera: front
+  camera_to_model:
+    front: base_0_rgb
+
+robot:
+  arm_order: [left_arm, right_arm]
+  joint_names:
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - elbow_joint
+    - wrist_1_joint
+    - wrist_2_joint
+    - wrist_3_joint
+  tools:
+    left_arm: robotiq_2f85
+    right_arm: robotiq_epick
+  # ^flange T_active_tcp, measured receive-only from both controllers on 2026-09-10.
+  flange_to_active_tcp:
+    left_arm:
+      source: measured_receive_only_rtde_2026-09-10
+      verified: true
+      matrix:
+        - [0.9999984051565306, -0.0000939596446073407, 0.0017834954388077516, 0.0007995585511560085]
+        - [0.0000956716033822228, 0.9999995347879068, -0.000959828585800899, -0.0005245842345504986]
+        - [-0.0017834044239512998, 0.0009599976848928029, 0.9999979489344493, 0.18298864323189268]
+        - [0.0, 0.0, 0.0, 1.0]
+    right_arm:
+      source: measured_receive_only_rtde_2026-09-10
+      verified: true
+      matrix:
+        - [0.999999568471559, 0.000655015429167971, -0.0006587954794618209, -0.000296112627913403]
+        - [-0.0006562993377756256, 0.999997882313685, -0.0019505484677651856, 0.0006828212434020209]
+        - [0.0006575164449979234, 0.0019509799930849463, 0.9999978806723501, 0.16185311527147203]
+        - [0.0, 0.0, 0.0, 1.0]
+
+preprocess:
+  points_per_link: 128
+  future_horizon: 8
+  task_text: manipulate the tabletop instruments safely
+  action_source: commanded
+
+model:
+  backbone: pi05_base
+  framework: pytorch
+  pretrained: outputs/pretrained/pi05_base_pytorch/model.safetensors
+  source_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi05_base
+
+safety:
+  obstacle_url: http://127.0.0.1:8766/snapshot.json
+  stale_timeout_s: 1.5
+  collision_margin_m: 0.010
+  trigger_margin_m: 0.025
+  max_joint_step_rad: 0.015
+  cbf_alpha: 1.0
+  cbf_iterations: 64
+  inter_arm_margin_m: 0.035

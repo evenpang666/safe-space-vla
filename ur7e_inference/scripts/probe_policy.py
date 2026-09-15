@@ -13,7 +13,7 @@ from openpi_client import websocket_client_policy
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="192.168.124.57")
+    parser.add_argument("--host", default="192.168.125.59")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", default="connectivity test; do not execute")
     args = parser.parse_args()

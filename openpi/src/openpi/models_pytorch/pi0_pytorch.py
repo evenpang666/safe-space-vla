@@ -489,23 +489,26 @@ class PI05SafetyPytorch(PI0Pytorch):
     action-chunk step; its validity mask is applied only to the auxiliary loss.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, joint_dim: int = 6):
         if not config.pi05:
             raise ValueError("PI05SafetyPytorch requires Pi0Config(pi05=True)")
+        if int(joint_dim) < 1 or int(joint_dim) > int(config.action_dim):
+            raise ValueError("joint_dim must be between one and config.action_dim")
         super().__init__(config)
+        self.surface_joint_dim = int(joint_dim)
         prefix_width = int(self.paligemma_with_expert.paligemma.config.text_config.hidden_size)
         expert_width = int(self.action_in_proj.out_features)
         self.surface_point_prefix_proj = nn.Sequential(
             nn.Linear(3, prefix_width), nn.SiLU(), nn.Linear(prefix_width, prefix_width)
         )
         self.surface_joint_prefix_proj = nn.Sequential(
-            nn.Linear(6, prefix_width), nn.SiLU(), nn.Linear(prefix_width, prefix_width)
+            nn.Linear(self.surface_joint_dim, prefix_width), nn.SiLU(), nn.Linear(prefix_width, prefix_width)
         )
         self.surface_point_query_proj = nn.Sequential(
             nn.Linear(3, expert_width), nn.SiLU(), nn.Linear(expert_width, expert_width)
         )
         self.surface_joint_query_proj = nn.Sequential(
-            nn.Linear(6, expert_width), nn.SiLU(), nn.Linear(expert_width, expert_width)
+            nn.Linear(self.surface_joint_dim, expert_width), nn.SiLU(), nn.Linear(expert_width, expert_width)
         )
         self.surface_offset_head = nn.Sequential(
             nn.Linear(expert_width, expert_width), nn.SiLU(), nn.Linear(expert_width, 3)
@@ -515,12 +518,13 @@ class PI05SafetyPytorch(PI0Pytorch):
         nn.init.zeros_(self.surface_offset_head[-1].weight)
         nn.init.zeros_(self.surface_offset_head[-1].bias)
 
-    @staticmethod
-    def _validate_surface_inputs(robot_points: Tensor, joint_positions: Tensor) -> None:
+    def _validate_surface_inputs(self, robot_points: Tensor, joint_positions: Tensor) -> None:
         if robot_points.ndim != 3 or robot_points.shape[-1] != 3:
             raise ValueError(f"robot_points must have shape [B, K, 3], got {tuple(robot_points.shape)}")
-        if joint_positions.ndim != 2 or joint_positions.shape[-1] != 6:
-            raise ValueError(f"joint_positions must have shape [B, 6], got {tuple(joint_positions.shape)}")
+        if joint_positions.ndim != 2 or joint_positions.shape[-1] != self.surface_joint_dim:
+            raise ValueError(
+                f"joint_positions must have shape [B, {self.surface_joint_dim}], got {tuple(joint_positions.shape)}"
+            )
         if robot_points.shape[0] != joint_positions.shape[0]:
             raise ValueError("robot_points and joint_positions must have the same batch size")
         if not torch.isfinite(robot_points).all() or not torch.isfinite(joint_positions).all():

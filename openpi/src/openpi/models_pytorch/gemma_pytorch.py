@@ -60,6 +60,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        # The action expert consumes projected action tokens and its hidden
+        # states are decoded by PI0.action_out_proj.  A 257k-token language
+        # head is therefore both unused and absent from the JAX checkpoint;
+        # keeping it would add roughly 0.5 GiB of random bfloat16 weights.
+        self.gemma_expert.lm_head = None
 
         self.to_bfloat16_for_selected_params(precision)
 

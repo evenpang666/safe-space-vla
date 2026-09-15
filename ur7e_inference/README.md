@@ -14,7 +14,7 @@ ur7e-vla --help
 ur7e-vla list-cameras
 
 # 检查策略服务连通性和 action 形状；不会连接机械臂
-python scripts/probe_policy.py --host 192.168.124.57 --port 8000
+python scripts/probe_policy.py --host 192.168.125.59 --port 8000
 ```
 
 ```bash

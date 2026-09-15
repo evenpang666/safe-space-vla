@@ -1,5 +1,5 @@
 policy:
-  host: "192.168.124.57"
+  host: "192.168.125.59"
   port: 8000
   # Exact keys consumed by Sci-VLA ur_policy.py / mani_real_pi05.
   exterior_image_key: "observation/image"

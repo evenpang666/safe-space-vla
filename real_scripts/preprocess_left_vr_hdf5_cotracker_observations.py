@@ -35,7 +35,7 @@ DEFAULT_COTRACKER_CHECKPOINT = Path("/home/mypc/.cache/torch/hub/checkpoints/sca
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episode", type=Path, required=True)
-    parser.add_argument("--mesh-surface-npz", type=Path, required=True, help="Prior fixed mesh flow; used only for FK depth gates, never emitted as observations.")
+    parser.add_argument("--mesh-surface-npz", type=Path, required=True, help="Canonical preprocess_quest3_hdf5.py shard; fixed_link_points are used only for FK depth gates, never emitted as observations.")
     parser.add_argument("--calibration", type=Path, default=REPO_ROOT.parent / "quest3_collect" / "config" / "calibration" / "left_base_to_front_camera.yaml")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--visualization", type=Path, required=True)

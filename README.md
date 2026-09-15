@@ -1,366 +1,196 @@
-# Safety Module Architecture
+# Dual UR7e Safety World-Action Model
 
+本项目的默认部署场景是当前 Quest3 双臂工作站：左 UR7e + Robotiq 2F-85、右
+UR7e + Robotiq EPick、单台 front D455，全部安全几何统一到 `left_base`。
 
-## 0. 环境安装
-
-### 0.1 基础 safety module 和 openpi 环境
-
-```bash
-conda create -n safety python=3.11
-conda activate safety
-
-cd openpi
-uv sync
-uv pip install -e .
-pip install chex pytest pyrealsense2 ur-rtde
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
-
-### 0.2 LIBERO / MuJoCo 数据采集环境
-
-LIBERO 相关脚本用于重建场景点云、采样 robot point flow、生成 action chunk 数据集。建议单独建 Python 3.8 环境：
-
-```bash
-uv venv --python 3.8 openpi/examples/libero/.venv
-source openpi/examples/libero/.venv/bin/activate
-uv pip sync openpi/examples/libero/requirements.txt openpi/third_party/libero/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu113 --index-strategy=unsafe-best-match
-uv pip install -e openpi/packages/openpi-client
-uv pip install -e openpi/third_party/libero
-uv pip install h5py
-
-export PYTHONPATH=$PYTHONPATH:$PWD/openpi/third_party/libero
-```
-
-无显示器服务器上运行 MuJoCo/LIBERO 时通常需要 EGL：
-
-```bash
-export MUJOCO_GL=egl
-```
-
-若本机没有 EGL/GPU 渲染，先用 `MUJOCO_GL=osmesa` 或在有显示环境的机器上采集点云；这部分取决于机器的 MuJoCo/OpenGL 驱动配置。
-
-
-
-## 1. 重建当前场景点云
-
-从 RGB-D / 多视角深度融合出当前场景点云，默认去掉机器人自身点：
-
-```bash
-python scripts/libero_reconstruct_pointcloud.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --camera-names agentview sideview leftsideview \
-  --width 256 \
-  --height 256 \
-  --stride 2 \
-  --output-dir outputs/libero_pointcloud
-```
-
-## 2. 生成机器人点流和障碍物obb
-
-### 2.1 LIBERO 点云和 safespace 图片生成
-
-下面这组命令用于生成论文/调试时检查的 LIBERO 图片。建议先设置公共环境变量：
-
-```bash
-export MUJOCO_GL=egl
-export PYTHONPATH=$PWD:$PWD/openpi/third_party/libero:$PYTHONPATH
-LIBERO_PY=/home/evan/anaconda3/envs/libero/bin/python
-TASK=pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate
-```
-
-重建三视角场景点云，用于后续障碍物 OBB / safespace 建模：
-
-```bash
-$LIBERO_PY scripts/libero_reconstruct_pointcloud.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --camera-names frontview sideview leftsideview \
-  --width 256 \
-  --height 256 \
-  --stride 2 \
-  --output-dir outputs/libero_pointcloud \
-  --mujoco-gl egl
-```
-
-生成桌面障碍物 OBB 和 safespace 图。预览图里的黑色虚线框使用 `display_workspace_bounds`，底面是桌面平面 `table_z`，底面大小是桌面 x/y 范围；`workspace_bounds` 仍用于 voxel grid / SDF 计算。
-
-```bash
-$LIBERO_PY scripts/build_safe_space_from_pointcloud.py \
-  --pointcloud outputs/libero_pointcloud/${TASK}_pointcloud.npz \
-  --obstacle-mode tabletop_boxes \
-  --box-orientation xy_oriented \
-  --box-shape cuboid \
-  --component-voxel-size 0.02 \
-  --min-component-points 40 \
-  --box-margin 0.01 \
-  --voxel-size 0.04 \
-  --draw-pointcloud \
-  --output-dir outputs/safe_space \
-  --name ${TASK}_tabletop_xy_oriented_obstacle_obb
-```
-
-主要输出：
+唯一主流程为：
 
 ```text
-outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz
-outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space_preview.png
+Quest3 HDF5
+  → 固定身份真实碰撞网格点流
+  → PI05 联合预测 action chunk + 未来机器人表面点流
+  → front D455 + LingBot-Depth 实时桌面障碍物 OBB
+  → 12-DOF CBF-QP 修正双臂关节 action
 ```
 
-生成左、右、前三个深度视角融合的机械臂可见表面点云：
+项目默认配置在 [configs/ur7e_dual_quest3.yaml](configs/ur7e_dual_quest3.yaml)。
+环境统一使用 `conda safety`；OpenPI 训练/服务也可以从 `openpi` 项目用 `uv run`。
+
+## 0. 当前安全前置条件
+
+左右臂 `flange→active_tcp` 均已于 2026-09-10 通过只读 RTDE 连续 30 次实测，
+结果保存在 `outputs/calibration/dual_flange_to_active_tcp.json` 并写入项目配置。
+若 pendant active TCP、转接板或末端工具发生变化，请重新运行（不会创建
+RTDE control）：
 
 ```bash
-$LIBERO_PY scripts/libero_reconstruct_pointcloud.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --camera-names frontview sideview leftsideview \
-  --width 512 \
-  --height 512 \
-  --stride 1 \
-  --max-depth 4.0 \
-  --only-robot \
-  --save-robot-masks \
-  --output-dir outputs/libero_visible_robot_pointcloud \
-  --mujoco-gl egl
+conda run -n safety python real_scripts/read_dual_active_tcp_calibration.py
 ```
 
-把这个三视角融合 3D 点云投影到 `frontview` 正面相机视角：
+未核验 TCP 时，双臂安全标签生成和实机执行会自动被阻止。
+
+## 1. Quest3 HDF5 预处理
+
+单臂 episode 默认生成 7D 动作（6 关节 delta + 1 夹爪目标），双臂 episode
+自动生成 14D 动作。若要以左臂遥操数据训练部署用的双臂动作接口，显式传
+`--pad-inactive-right-arm`：右臂状态/动作补零并表示不下发命令，点流仍只使用
+真实左臂表面，绝不伪造未知右臂位姿的网格点。
 
 ```bash
-$LIBERO_PY scripts/render_libero_pointcloud_camera_view.py \
-  --pointcloud outputs/libero_visible_robot_pointcloud/${TASK}_visible_robot_pointcloud.npz \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --camera-name frontview \
-  --width 768 \
-  --height 768 \
-  --point-size 3 \
-  --output-dir outputs/libero_visible_robot_pointcloud_frontview_render \
-  --name ${TASK}_three_view_visible_robot_pointcloud \
-  --mujoco-gl egl
+conda run -n safety python scripts/preprocess_quest3_hdf5.py \
+  --episode ../quest3_collect/data/left_vr_episodes/episode_00008.hdf5 \
+  --output outputs/quest3_pi05/episode_00008.npz \
+  --pad-inactive-right-arm
 ```
 
-主要输出：
+输出包含：
 
-```text
-outputs/libero_visible_robot_pointcloud_frontview_render/${TASK}_three_view_visible_robot_pointcloud_frontview_projected_points.png
-outputs/libero_visible_robot_pointcloud_frontview_render/${TASK}_three_view_visible_robot_pointcloud_frontview_projected_overlay.png
-```
+- `rgb_*`、`qpos`、`gripper_position`；
+- `action_chunks[N,H,7|14]` 与明确的 `action_layout`；
+- `fixed_link_points[T,L,P,3]`、`point_ids`；
+- `current_link_points[N,K,3]`；
+- `target_point_offsets[N,H,K,3]` 和监督 mask；
+- 坐标系、网格哈希、左右 base 变换、动作来源等审计字段。
 
-生成 LIBERO / Franka 机械臂 skeleton 扫略点云。默认 `--skeleton-source geom` 会在每个 FK 采样时刻读取机器人 MuJoCo geoms 的包络中心轴：capsule / cylinder 用几何体中心轴，box / ellipsoid 用最长中心轴，mesh 用编译后顶点包围盒最长中心轴；这比原来的 `robot0_link0..robot0_link7` 关节锚点连线更接近机械臂包裹面的中心。可视化时同一连杆 body 下的多个 geom 使用同一种颜色，不同连杆使用不同颜色。需要对比旧逻辑时可加 `--skeleton-source anchors`。
+如需把已有 CoTracker 实测点作为可选辅助监督，可加：
 
 ```bash
-$LIBERO_PY scripts/libero_joint_swept_pointcloud.py \
-  --task-suite libero_spatial \
-  --task-id 0 \
-  --horizon 200 \
-  --action-scale 0.12 \
-  --skeleton-source geom \
-  --samples-per-action 8 \
-  --swept-point-link-samples 8 \
-  --swept-point-time-samples 2 \
-  --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz \
-  --collision-margin 0.0 \
-  --save-video \
-  --video-fps 12 \
-  --frontview-width 768 \
-  --frontview-height 768 \
-  --frontview-point-size 3 \
-  --output-dir outputs/libero_joint_swept_pointcloud \
-  --mujoco-gl egl
+--measured-flow-npz outputs/episode_00008_left_surface/episode_00008_left_ur7e_2f85_cotracker1024_measured_surface.npz
 ```
 
-主要输出：
+默认安全训练目标仍是固定身份碰撞网格点。CoTracker 点会缺失且与 FK
+Jacobian 没有一一对应关系，不应直接作为在线 CBF 控制点。
 
-```text
-outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points.png
-outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points_overlay.png
-outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points_3d.png
-outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept_frontview_swept_points.mp4
-outputs/libero_joint_swept_pointcloud/${TASK}_joint_link_swept.npz
-```
+## 2. 联合训练 PI05
 
-其中 `*_frontview_swept_points.mp4` 会在 `frontview` 相机图像上按时间累计显示连杆点，点数随帧递增；`*_frontview_swept_points_3d.png` 标题会写明 `collision: YES/NO`；`*.npz` 内保存 `collision`、`collision_method`、`collision_point_count` 和 `collision_swept_point_indices`。
-
-
-## 3. 可视化
+项目使用 OpenPI JAX `pi05_base` 作为唯一预训练来源。首次使用时安装仓库随附的
+Transformers AdaRMSNorm/KV-cache 补丁，并执行低内存 bfloat16 转换：
 
 ```bash
-python scripts/visualize_pi05_safety_decoder_dataset_sample.py \
-  --dataset outputs/pi05_safety_decoder/pi05_libero_task0_decoder_dataset.npz \
-  --sample-index 0 \
-  --time-index 10
+conda run -n safety bash -lc 'cp -r \
+  openpi/src/openpi/models_pytorch/transformers_replace/. \
+  "$CONDA_PREFIX/lib/python3.11/site-packages/transformers/"'
+PYTHONPATH=openpi/src:openpi/packages/openpi-client/src \
+conda run -n safety python openpi/examples/convert_jax_model_to_pytorch.py \
+  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi05_base \
+  --config-name pi05_aloha \
+  --output-path outputs/pretrained/pi05_base_pytorch \
+  --precision bfloat16
 ```
 
+转换器会校验所有基础权重，并复制原检查点的 normalization assets。不要将
+LeRobot 缓存或 JAX `params/` 目录直接传给 PyTorch 训练器。
 
-## 4. safety flow decoder
+每个新 Quest3 HDF5 的根属性 `task_description` 会自动写入 shard 的
+`task_text`，并在训练时逐 episode tokenization；`--task` 仅用于有意覆盖，
+旧 HDF5 才回退到项目配置中的通用任务文本。
 
-safety decoder 使用 PI05 VLM `prefix_tokens` 预测未来点云，不直接预测碰撞分类。安全信号由预测点和障碍物 OBB / occupied grid 的几何重叠计算得到。
-
-直接在 LIBERO 中运行 `pi05_libero` 推理，并同步保存每个真实控制时间步的 prefix token、PI05 action chunk、当前关节 qpos、当前机械臂表面点，以及真实执行轨迹中的未来表面点偏移量。采集脚本固定使用 rollout surface 点云流：先按 `--replan-steps` 执行任务 rollout，并在每个真实仿真时间步记录一次机械臂表面点云；rollout 结束后，再为每个时间步样本从这条表面点云轨迹中切出当前帧和未来 `len(action_chunk)` 帧。
-
-OpenPI / safety 环境窗口，启动会额外返回 `prefix_tokens` 的 websocket policy server：
+先只检查 shard 契约，不加载大模型：
 
 ```bash
-python scripts/serve_pi05_prefix_policy.py \
-  --policy-config pi05_libero \
-  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+conda run -n safety python scripts/train_pi05_ur7e_surface_pytorch.py \
+  --dataset outputs/quest3_pi05/episode_00008.npz \
+  --output outputs/pi05_quest3/left_joint_safety.pt \
+  --validate-only
+```
+
+正式训练：
+
+```bash
+uv run --project openpi scripts/train_pi05_ur7e_surface_pytorch.py \
+  --dataset outputs/quest3_pi05 \
+  --output outputs/pi05_quest3/dual_joint_safety.pt \
+  --pretrained outputs/pretrained/pi05_base_pytorch/model.safetensors \
+  --max-points 256 \
+  --epochs 20
+```
+
+同一 checkpoint 中的 shard 必须具有相同的臂数、action 维度、horizon 和点
+布局；不要混合 7D 单臂与 14D 双臂数据。左臂数据使用占位模式后应全部采用
+14D shard。默认只使用 front D455，与实际推理
+一致；若要增加 wrist 视角，请在训练时显式传 `--camera-map`，并确保部署端也
+提供相同视角。
+
+checkpoint 保存 action/qpos 归一化统计、逻辑 action 维度、点子集索引、相机
+映射和坐标系。PI05 内部保留 32 个 action 槽，但只向执行器返回 7 或 14 个
+有定义的量。
+
+## 3. 联合推理服务
+
+```bash
+uv run --project openpi scripts/serve_quest3_pi05_safety.py \
+  --checkpoint outputs/pi05_quest3/dual_joint_safety.pt \
+  --device cuda \
   --port 8000
 ```
 
-LIBERO 环境窗口，连接上面的 server，负责仿真、表面点云采集和保存训练数据：
+每个请求一次性返回：
+
+- `actions[H,14]`；
+- `point_offsets[H,K,3]`；
+- `predicted_robot_points[H,K,3]`；
+- 与训练一致的 `selected_point_indices`。
+
+旧的 prefix-token + 独立 safety decoder 服务不属于当前部署主线。
+
+## 4. 实时桌面障碍物
+
+该服务是 front D455 和双臂 RTDE receive 的唯一所有者，只读机器人，不发送
+运动或夹爪指令：
 
 ```bash
-python scripts/collect_pi05_libero_safety_decoder_dataset.py \
-  --policy-server-host 127.0.0.1 \
-  --policy-server-port 8000 \
-  --task-suite libero_spatial \
-  --task-ids 0 1 2 \
-  --num-rollouts 5 \
-  --max-samples 256 \
-  --replan-steps 5 \
-  --points-per-link 256 \
-  --output outputs/pi05_safety_decoder/xxx.npz 
+conda run -n safety python real_scripts/live_dual_ur7e_obstacle_model.py
 ```
 
-可以只采集一部分任务，例如 `--task-ids 0 1 2 3` 或者使用 `all`。输出文件中的 `task_ids` 字段会记录每条样本来自哪个 LIBERO task。
+浏览器界面为 <http://127.0.0.1:8766>，安全快照为
+`http://127.0.0.1:8766/snapshot.json`。v2 快照包含 front RGB JPEG、双臂 qpos、
+采集单调时钟、`left_base` 坐标系以及每个 OBB 的 center/axes/half-sizes。
 
-如果不用 websocket server，也可以在单个同时安装了 OpenPI 和 LIBERO 依赖的环境里省略 `--policy-server-host`，让采集脚本本地加载 policy。
+障碍物链路为：机器人真实网格深度剔除 → LingBot-Depth 修复 → 原始 D455
+支持域限制 → 桌面 RANSAC → 离群点剔除 → 精确点级 DBSCAN → 桌面连接检查
+→ 时序 OBB 确认。界面可用按钮或空格暂停显示；暂停不停止后台安全快照更新。
 
-输出 `.npz` 可直接用于训练，关键字段为：
+## 5. 双臂 CBF-QP
+
+先运行 dry-run；它不会建立 RTDE control 连接：
+
+```bash
+conda run -n safety python real_scripts/run_ur7e_vla_safety_executor.py \
+  --prompt "manipulate the tabletop instruments safely" \
+  --once
+```
+
+执行器对预测点流建立两类约束：
+
+1. 未来固定表面点与桌面 OBB 的 signed-distance barrier；
+2. 左右臂预测表面点对的最小间距 barrier。
+
+有限差分 Jacobian 与两臂 12 个关节同时进入 bounded least-change QP。快照过期、
+坐标系错误、服务契约错误或 QP 不可满足时均 fail closed 为双臂 hold。
+
+物理执行需要右 TCP 已核验，并同时提供 `--execute` 与命令行显示的精确确认串。
+当前执行器只发送两臂 `servoJ`，不会猜测 EPick 的真空 I/O，也不会发送任何
+夹爪命令；配置并验证 EPick/2F-85 控制接口后才能补上该部分。
+
+## 6. 一键契约检查
+
+```bash
+conda run -n safety python scripts/validate_project_pipeline.py \
+  --episode ../quest3_collect/data/left_vr_episodes/episode_00008.hdf5 \
+  --shard outputs/quest3_pi05/episode_00008.npz
+```
+
+还可以传 `--checkpoint` 和 `--obstacle-url`，逐层检查训练 checkpoint 与实时
+快照。返回码 0 表示所检查层级通过；未核验 TCP 默认产生返回码 2。
+
+## 目录
 
 ```text
-prefix_tokens: shape [S, N, D]
-action_chunks: shape [S, T, A]
-start_joint_vectors: shape [S, J]
-target_link_points: shape [S, T_fk, L, P, 3]
-current_link_points: shape [S, L, P, 3]
-future_link_offsets: shape [S, T_action, L, P, 3]
-arm_points: shape [S, K, 3], K = L * P
-target_point_offsets: shape [S, T_action, K, 3]
-```
-
-其中 `T_action == len(action_chunk)`，`pi05_libero` 默认是 10；因此 `target_link_points` 包含当前帧和 10 个未来真实执行帧，长度为 11。采集只保留拥有完整未来窗口的时间步：如果一条轨迹记录了 150 个 surface 帧、未来长度为 10，就会生成 `150 - 10 = 140` 条样本。
-
-采集脚本固定使用 rollout surface 点云流：在仿真中对 `robot0_link1..robot0_link7` 的机械臂表面固定采样，因此 `L=7`，每个 link 有 `P=points_per_link` 个固定身份点。当前点云和未来点云都来自真实执行 rollout 中同一批 link-local 表面采样点在各时间步的 MuJoCo world 坐标，适合用 MSE / Flow Matching 学习 `future - current` 偏移。真实部署时可用真实机器人关节状态和 URDF / mesh 的同一套固定采样点通过 FK 生成当前机械臂点云；障碍物仍由 RGB-D 点云 / OBB 重建。
-
-其中 `arm_points` 是 `SafetyFlowPointModel` 的当前机械臂局部点云输入，`target_point_offsets` 是 Flow Matching 的真实 `x_1 = P_arm_future - P_arm_current`。`target_link_points` 仍保留完整绝对坐标路径；第 0 帧是当前点，后续帧用于计算 `future_link_offsets`。
-
-`target_link_points` / `current_link_points` / `arm_points` 使用 MuJoCo world 坐标系保存，字段 `coordinate_frame=mujoco_world` / `target_link_points_frame=mujoco_world` / `arm_points_frame=mujoco_world` 会写入 `.npz`。偏移量字段使用 `mujoco_world_delta`。由 `scripts/libero_reconstruct_pointcloud.py` 重建出的障碍物点云，以及 `scripts/build_safe_space_from_pointcloud.py` 生成的 OBB / safe-space 也使用同一 `mujoco_world` 坐标系。
-
-
-Flow Matching 点云安全模型 `SafetyFlowPointModel`。该模型使用 `prefix_tokens + arm_points` 作为条件，学习 `target_point_offsets` 的 velocity field：
-
-```bash
-python scripts/train_pi05_safety_flow_point_model.py \
-  --dataset outputs/pi05_safety_decoder/xxx.npz \
-  --output outputs/pi05_safety_decoder/xxx.pt \
-  --hidden-dim 256 \
-  --num-encoder-layers 4 \
-  --num-decoder-layers 4 \
-  --num-heads 8 \
-  --ffn-dim 1024 \
-  --epochs 128 \
-  --batch-size 4 \
-  --lr 1e-4
-```
-
-训练“去掉 prefix 条件”的 ablation 时，保持同一份数据和模型结构，只在训练批次中把 `prefix_tokens` 置零，并在 checkpoint metadata 中记录 `prefix_ablation=zero`
-
-
-在线验证 `SafetyFlowPointModel` 时分两个窗口运行。窗口 1 在 `safety` 环境启动完整 PI05 policy + prefix token server：
-
-```bash
-python scripts/serve_pi05_prefix_policy.py \
-  --policy-config pi05_libero \
-  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
-  --safety-checkpoint outputs/pi05_safety_decoder/xxx.pt \
-  --port 8000
-```
-
-窗口 2 在 LIBERO 环境运行在线验证。脚本会连接窗口 1 的 server，在 LIBERO 中执行任务，并生成包含机械臂执行画面、每个真实时间步预测未来 point flow、场景 OBB 方框和碰撞提示的 MP4。视频底部的 `POSSIBLE COLLISION` 来自预测点云进入 OBB 的几何判断；`REAL COLLISION` 来自 MuJoCo contact 中机器人 geom 与目标障碍物 geom 的真实接触，并会同步写入 `.npz` 的 `real_collision_flags` 和 `real_collision_contact_counts`：
-
-```bash
-python scripts/evaluate_pi05_safety_decoder_on_libero.py   \
---policy-server-host 127.0.0.1  \
- --policy-server-port 8000   \
- --task-suite libero_spatial   \
- --task-id 0   \
- --num-rollouts 1   \
- --max-samples 256   \
- --replan-steps 5   \
- --points-per-link 256   \
- --prediction-steps 10   \
- --realtime-obbs   \
- --enable-cbf-qp   \
- --output outputs/pi05_safety_decoder/pi05_libero_task0_eval.npz   \
- --video-output outputs/pi05_safety_decoder/pi05_libero_task0_eval.mp4   \
- --mujoco-gl egl
-```
-
-<!-- python scripts/evaluate_pi05_safety_decoder_on_libero.py   --policy-server-host 127.0.0.1   --policy-server-port 8000   --task-suite libero_spatial   --task-id 0   --num-rollouts 1   --max-samples 256   --replan-steps 5   --points-per-link 128   --prediction-steps 10   --realtime-obbs    --output outputs/pi05_safety_decoder/pi05_libero_task0_eval.npz   --video-output outputs/pi05_safety_decoder/pi05_libero_task0_eval.mp4   --scene-obstacle-xy 0.0 0.04 -->
-
-CBF-QP 默认使用 `--cbf-action-space auto`：当 LIBERO 环境 `action_dim == 4` 或 `action_dim == 7` 时，脚本按 OSC_POSITION 语义处理 PI05 动作，直接在可执行的笛卡尔 `xyz` action 空间做 QP，点云对 action 的 Jacobian 由“扰动 `xyz` -> 临时 `env.step` -> 重建下一帧机械臂点云”的有限差分估计，并保留原 orientation / gripper；其他环境默认沿用 joint-delta CBF。可用 `--cbf-action-space joint_delta` 强制使用关节增量模式，或用 `--cbf-action-space cartesian_delta` 选择上一版“笛卡尔动作先通过末端 Jacobian / pseudo-inverse 转 nominal 关节增量，再映射回 `xyz`”的模式。通常不建议在 LIBERO OSC_POSITION 实验里强制 `cartesian_delta`，因为它会把可执行的 `xyz` 动作绕到关节空间再映射回来，切向动作更容易被多约束投影改变。
-
-当前默认 CBF-QP 的 active set 只来自预测未来点云，且 `--cbf-correction-target` 默认为 `current_action`：如果预测未来任意第 `k` 帧点云进入 OBB，脚本会把这些 future-point 约束都投影到当前即将执行的 action 上。默认不会额外检查当前帧机械臂点云；若需要把当前帧点云约束也混入预测 point-flow CBF，可加 `--cbf-include-current-points`。若希望按预测时间对齐修正 action，可显式使用 `--cbf-correction-target predicted_frame_action`：此时预测未来第 `k` 帧触发的约束会修正 active action chunk 中 `current_offset + k` 对应的 action，其中未来第 `0` 帧会映射到当前 action；修正后的 chunk 会缓存到对应 action 真正执行时使用。
-
-CBF-QP 当前实现的数学形式如下。对第 $j$ 个 OBB，设中心为 $c_j$，世界系轴为 $R_j[:, a]$，半边长为 $d_j$，碰撞 margin 为 $m$，则使用膨胀半边长 $\bar d_j=d_j+m$。对一个被预测点云触发的机械臂表面点 $p_i$，先用当前帧点 $p_i^0$ 选择最近需要远离的 OBB face：
-
-$$
-\begin{aligned}
-y_i &= R_j^\top (p_i^0 - c_j), \\
-a^\star &= \arg\max_a \frac{|y_i[a]|}{\bar d_j[a]}, \\
-s &= \operatorname{sign}(y_i[a^\star]), \\
-n_i &= s R_j[:, a^\star], \\
-h_i &= n_i^\top (p_i^0 - c_j) - \bar d_j[a^\star].
-\end{aligned}
-$$
-
-$h_i \ge 0$ 表示该点在所选 face 外侧，$h_i < 0$ 表示已经进入膨胀 OBB。默认约束来自预测未来第 $k$ 帧点云，并会计算同一 face 方向上的预测 barrier：
-
-$$
-h_i^{(k)} = n_i^\top (p_i^k - c_j) - \bar d_j[a^\star],
-\qquad
-\tilde h_i = \min(h_i, h_i^{(k)}).
-$$
-
-这样当未来预测点已经进入 OBB 时，QP 会看到 $\tilde h_i < 0$，而不是只看到当前点仍在 OBB 外侧。若显式加 `--cbf-include-current-points`，当前帧点云触发的约束直接使用 $h_i$。设 QP 变量为 $u_r$，它可以是关节增量、可执行 Cartesian `xyz` 动作，或旧版 Cartesian-to-joint 变量；点云对该变量的一步 Jacobian 为 $J_i = \partial p_i^+ / \partial u_r$。在默认 `current_action` 下，对所有预测时间 `k` 触发的约束都有 $r=t$，即都修正当前 action；在 `predicted_frame_action` 下，约束按 $r=t+k$ 分组，各自修正对应 action chunk 行。脚本对每个被修正的 action 使用一阶线性化的离散 CBF 约束：
-
-$$
-\begin{aligned}
-\tilde h_i(p_i^+) &\approx \tilde h_i + n_i^\top J_i u_r, \\
-\tilde h_i + n_i^\top J_i u_r &\ge (1 - \alpha) \tilde h_i, \\
-n_i^\top J_i u_r &\ge -\alpha \tilde h_i.
-\end{aligned}
-$$
-
-因此每个 active point 生成一行 $A_i = n_i^\top J_i$、$b_i = -\alpha \tilde h_i$。最终对当前被修正的 action 求解保持 nominal action 尽量不变的投影问题：
-
-$$
-\begin{aligned}
-u_{r,\mathrm{safe}}
-&= \arg\min_{u_r} \frac{1}{2}\lVert u_r - u_{r,\mathrm{nom}}\rVert_2^2 \\
-\text{s.t.}\quad
-A u_r &\ge b, \\
-u_{\mathrm{lower}} &\le u_r \le u_{\mathrm{upper}}.
-\end{aligned}
-$$
-
-单个 face 约束只会去掉朝 OBB 内部的法向分量，理论上会保留沿 OBB 表面的切向分量，也就是“滑过 OBB”。之前默认 `--cbf-fallback zero` 时，如果多点 / 多面约束在有限迭代内没有完全满足，脚本会把 QP 变量整体清零，导致切向分量也被抹掉，看起来就无法滑过 OBB。现在默认 `--cbf-fallback projected`，即使 `success=False` 也会执行当前 best-effort 投影；如果需要旧的保守停止行为，可以显式设置 `--cbf-fallback zero`。
-
-运行“无预测 point-flow、仅当前机械臂点云触发 CBF-QP”的 eval ablation 时，复用同一验证脚本，打开 CBF-QP 并把 active-set 来源切到当前点云 `--cbf-trigger-source current_pointcloud`.
-
-默认验证会在每个采样时间步用当前 LIBERO RGB-D 状态实时重建障碍物 OBB，并用同一组 OBB 绘制视频方框和判断未来 point flow 是否进入 OBB。实时 OBB 默认通过 MuJoCo segmentation 只保留名称匹配 `eval_scene_obstacle` / `wine_bottle` / `winebottle` 的 geom/body 像素，因此当前只会给插入的 wine bottle 建 OBB；若要恢复旧的整张桌面障碍物建模，可使用 `--obb-target-geom-name-patterns all`。在 `all` 模式下，实时 OBB 不再做目标 geom 过滤，只排除 robot mask；桌面高度 / workspace 来自非机器人场景点云，桌面上方障碍物点也来自同一批非机器人场景点云，然后再通过体素连通聚类分割成 OBB。实时 OBB 默认使用 `--obb-component-connectivity 6`，只把共享面的体素连成同一障碍物，比旧的 26 邻接更不容易把相邻障碍物混成一个大 OBB；需要更细的建模时可同时减小 `--obb-stride`、`--obb-component-voxel-size` 和 `--obb-box-margin`。若需要复用预生成的静态 OBB 文件，可改用 `--no-realtime-obbs --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz`。
-
-当 websocket server 通过 `--safety-checkpoint` 启动时，验证脚本会根据 server metadata 自动使用远端 safety module 预测未来 point flow；验证环境不再需要选择 `cpu` / `cuda`。如果 server 没有加载 safety module，验证脚本会回退到本地 `--checkpoint`，并用 `--device auto` 自动选择设备。
-
-推理并用几何计算输出 `collision` 或 `safe`：
-
-```bash
-python scripts/run_pi05_safety_decoder.py \
-  --checkpoint outputs/pi05_safety_decoder/decoder.pt \
-  --prefix-tokens outputs/pi05_prefix_tokens/current_prefix_tokens.npz \
-  --safe-space outputs/safe_space/${TASK}_tabletop_xy_oriented_obstacle_obb_safe_space.npz \
-  --collision-margin 0.01 \
-  --output outputs/pi05_safety_decoder/current_safety_result.npz
+configs/                  当前双臂项目配置
+safety_module/            配置与学习模块
+scripts/                  HDF5 预处理、训练、服务、契约验证
+real_scripts/             双臂网格、实时障碍物、CBF 与执行器
+assets/robot_models/      UR7e、2F-85、EPick 网格/URDF
+openpi/                   上游 OpenPI 与本项目 PI05SafetyPytorch 扩展
+outputs/                  本地预处理、可视化与 checkpoint（不自动删除）
 ```

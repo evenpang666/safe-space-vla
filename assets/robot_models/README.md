@@ -1,52 +1,16 @@
-# Robot geometry assets for real-world point-cloud filtering
+# Robot geometry assets
 
-## Downloaded sources
+当前主线使用：
 
-- `ur_description/`: official Universal Robots ROS 2 description repository,
-  shallow-cloned from the `jazzy` branch at
-  `39242984dc8d1fff9584c922c17c69c58df3591d`.
-  - UR7e configuration: `config/ur7e/`.
-  - UR7e's official configuration intentionally references the common e-Series
-    geometry in `meshes/ur5e/`; see `config/ur7e/visual_parameters.yaml`.
-  - Use the `collision/*.stl` mesh files for depth masking, and the `visual/*.dae`
-    files only for visualization.
-- `pika_gripper/PiKA-Gripper-STEP.stp`: public PiKA Gripper CAD STEP download.
-  - `collision/` contains a 1.5 mm-tessellated collision export, its 16 source
-    components, full/body meshes, and per-component STEP-frame bounds.
-  - `finger_a_candidate.stl` and `finger_b_candidate.stl` are the two symmetric
-    long-finger candidates. Their joint axes and open/close mapping are not
-    assumed; verify them against the physical PiKA before moving-finger masking.
-- `ur7e_pika/urdf/ur7e_pika_collision.urdf.xacro`: collision-only UR7e + PiKA
-  wrapper. Pass the measured PiKA mounting transform and collision-mesh path
-  when expanding it with Xacro.
-- `ur7e_pika/ur7e_pika_mask.example.json`: ready-to-fill mask configuration.
-  Validate its downloaded geometry now with:
+- `ur_description/meshes/ur5e/collision/`：官方 UR e-Series collision mesh；
+- `vendor/ros2_robotiq_gripper/`：左臂 Robotiq 2F-85 上游 collision mesh；
+- `vendor/ros2_epick_gripper/`：右臂 Robotiq EPick 上游 body mesh；
+- `robotiq_2f85/urdf/` 与 `robotiq_epick/urdf/`：安装 adapter、吸盘等固定
+  collision primitive，用于补足 vendor mesh 未覆盖部分。
 
-  ```bash
-  python real_scripts/validate_ur7e_pika_mask_config.py \
-    assets/robot_models/ur7e_pika/ur7e_pika_mask.example.json
-  ```
+运行时几何由 `real_scripts/dual_ur7e_surface.py` 与
+`real_scripts/live_dual_ur7e_obstacle_model.py` 读取。所有安全几何必须使用实测
+`flange→active_tcp`，并统一到 `left_base`。
 
-## Still required before a mesh-based robot mask can be enabled
-
-1. Record the installed adapter and PiKA flange transform,
-   `^flange T_pika_step_frame`. Do not use a nominal transform when an adapter
-   plate is present.
-2. Verify the two exported finger candidates at fully open and fully closed
-   PiKA positions, then encode their real joint axes and state mapping.
-3. Replace the default UR7e kinematics YAML with the calibration extracted from
-   the individual robot controller.
-4. After the D435i-to-base calibration, fill both transforms and run:
-
-  ```bash
-  python real_scripts/validate_ur7e_pika_mask_config.py \
-    assets/robot_models/ur7e_pika/ur7e_pika_mask.json --ready-for-live-mask
-  ```
-
-5. Render the collision URDF in each calibrated D435i camera and remove only
-   pixels whose rendered robot depth agrees with measured depth.
-
-Source URLs:
-
-- https://github.com/UniversalRobots/Universal_Robots_ROS2_Description
-- https://www.scengrobotics.com/downloads/pika/PiKA-Gripper-STEP.stp
+`pika_gripper/` 和 `ur7e_pika/` 是早期单臂实验留下的资产，不属于当前
+2F-85/EPick 双臂部署逻辑；保留它们仅用于结果复现，不应被当前入口加载。

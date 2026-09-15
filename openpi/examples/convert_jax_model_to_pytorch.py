@@ -47,6 +47,17 @@ from openpi.training import utils
 import openpi.training.config as _config
 
 
+def numpy_to_torch(value):
+    """Create a Torch tensor without expanding Orbax bfloat16 arrays to float32."""
+    array = np.asarray(value)
+    if str(array.dtype) == "bfloat16":
+        # NumPy exposes bfloat16 through ml_dtypes, which torch.from_numpy does
+        # not accept directly.  Preserve the underlying 16-bit storage and
+        # reinterpret it as torch.bfloat16 without allocating a float32 copy.
+        return torch.from_numpy(array.view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(array)
+
+
 def slice_paligemma_state_dict(state_dict, config):
     """Convert PaliGemma JAX parameters to PyTorch format."""
     suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
@@ -261,7 +272,7 @@ def slice_paligemma_state_dict(state_dict, config):
 
     for key, value in state_dict.items():
         if key not in expert_keys:
-            final_state_dict[key] = torch.from_numpy(value)
+            final_state_dict[key] = numpy_to_torch(value)
         else:
             expert_dict[key] = value
 
@@ -386,7 +397,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     final_state_dict = {}
     for key, value in state_dict.items():
         if not isinstance(value, torch.Tensor):
-            final_state_dict[key] = torch.from_numpy(value)
+            final_state_dict[key] = numpy_to_torch(value)
         else:
             final_state_dict[key] = value
 
@@ -435,7 +446,13 @@ def convert_pi0_checkpoint(
     print(f"Model config: {model_config}")
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
-    initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
+    # Restoring a 3.3B model as float32 while constructing the destination
+    # model can exceed 32 GiB of RAM.  Keep bfloat16 inputs in their original
+    # 16-bit representation throughout conversion.
+    restore_precision = "bfloat16" if precision == "bfloat16" else "float32"
+    initial_params = slice_initial_orbax_checkpoint(
+        checkpoint_dir=checkpoint_dir, restore_precision=restore_precision
+    )
 
     # Process projection params
     if model_config.pi05:
@@ -468,8 +485,8 @@ def convert_pi0_checkpoint(
         pytorch_weight_key = f"{key}.weight"
         pytorch_bias_key = f"{key}.bias"
 
-        projection_params[pytorch_weight_key] = torch.from_numpy(np.array(weight)).T
-        projection_params[pytorch_bias_key] = torch.from_numpy(np.array(bias))
+        projection_params[pytorch_weight_key] = numpy_to_torch(weight).T
+        projection_params[pytorch_bias_key] = numpy_to_torch(bias)
 
     # Create configs based on checkpoint path
     # All models use the same PaliGemma config structure
@@ -516,8 +533,22 @@ def convert_pi0_checkpoint(
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    # Load state dict and surface conversion mistakes instead of silently
+    # producing a partially random checkpoint. PaliGemma ties its LM head to
+    # the token embedding, so that alias is the only acceptable missing key.
+    incompatible = pi0_model.load_state_dict(all_params, strict=False)
+    allowed_missing = {
+        "paligemma_with_expert.paligemma.lm_head.weight",
+    }
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    disallowed_missing = missing - allowed_missing
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            "Incomplete JAX-to-PyTorch conversion: "
+            f"missing={sorted(disallowed_missing)}, unexpected={sorted(unexpected)}"
+        )
+    print(f"State-dict validation passed (tied missing keys: {sorted(missing & allowed_missing)})")
 
     if precision == "float32":
         pi0_model = pi0_model.to(torch.float32)
@@ -533,7 +564,7 @@ def convert_pi0_checkpoint(
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
 
     # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    assets_source = pathlib.Path(checkpoint_dir) / "assets"
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():

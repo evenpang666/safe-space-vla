@@ -9,7 +9,7 @@ import yaml
 
 @dataclass
 class PolicyConfig:
-    host: str = "192.168.124.57"
+    host: str = "192.168.125.59"
     port: int = 8000
     exterior_image_key: str = "observation/image"
     wrist_image_key: str = "observation/wrist_image"

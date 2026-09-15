@@ -2,7 +2,7 @@
 """Render a UR7e/PiKA fixed-surface point-cloud trajectory as an MP4.
 
 The input is the ``.npz`` produced by
-``preprocess_pi05_rgbd_surface_dataset.py``.  The points are coloured by
+``scripts/preprocess_quest3_hdf5.py``.  The points are coloured by
 stable link ID, rather than by image colour, so the same physical sample has
 the same identity throughout the video.  The first pane overlays the rendered
 points on the front image.  When the preprocessed episode includes

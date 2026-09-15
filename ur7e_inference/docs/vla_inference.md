@@ -9,7 +9,7 @@
 先在推理主机启动服务，具体安装与启动命令见[环境安装](environment_setup.md)。机器人端先验证网络和 action 形状：
 
 ```bash
-python scripts/probe_policy.py --host 192.168.124.15 --port 8000
+python scripts/probe_policy.py --host 192.168.125.59 --port 8000
 ```
 
 ## 交互式推理界面

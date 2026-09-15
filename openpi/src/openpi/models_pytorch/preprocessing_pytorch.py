@@ -66,9 +66,12 @@ def preprocess_observation_pytorch(
                 max_h = height - crop_height
                 max_w = width - crop_width
                 if max_h > 0 and max_w > 0:
-                    # Use tensor operations instead of .item() for torch.compile compatibility
-                    start_h = torch.randint(0, max_h + 1, (1,), device=image.device)
-                    start_w = torch.randint(0, max_w + 1, (1,), device=image.device)
+                    # Slice bounds must be Python integers (or zero-dimensional
+                    # integer tensors).  A one-element tensor triggers advanced
+                    # indexing and drops a spatial dimension on current PyTorch.
+                    # This path is not compiled by the safety trainer.
+                    start_h = int(torch.randint(0, max_h + 1, (), device=image.device))
+                    start_w = int(torch.randint(0, max_w + 1, (), device=image.device))
                     image = image[:, start_h : start_h + crop_height, start_w : start_w + crop_width, :]
 
                 # Resize back to original size

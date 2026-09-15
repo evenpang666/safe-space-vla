@@ -16,6 +16,7 @@ mount/cup dimensions before treating the result as motion-planning geometry.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 from dataclasses import dataclass
 import gzip
@@ -30,6 +31,7 @@ import socket
 
 import numpy as np
 import yaml
+import cv2
 from scipy.ndimage import binary_dilation
 from scipy.spatial import cKDTree
 
@@ -37,8 +39,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from real_scripts.cluster_tabletop_objects import _expanded_obb
-from real_scripts.demo_record_ur7e_safety_overlay_video import UprightOBB
 from real_scripts.lingbot_depth import add_lingbot_depth_cli_args, create_lingbot_depth_refiner_from_args
 from real_scripts.real_robot_adapter import CameraCalibration, RGBDFrame, depth_to_world_points, robot_depth_keep_mask
 from real_scripts.reconstruct_realsense_pointcloud import estimate_dominant_plane
@@ -65,6 +65,23 @@ class Arm:
     base_to_left: np.ndarray
     tool: str
     tool_from_tcp: np.ndarray
+
+
+@dataclass(frozen=True)
+class UprightOBB:
+    center: np.ndarray
+    rotation: np.ndarray
+    extents: np.ndarray
+    corners: np.ndarray
+    point_count: int
+
+
+def expanded_obb(box: UprightOBB, margin_m: float) -> UprightOBB:
+    margin = max(float(margin_m), 0.0)
+    extents = np.asarray(box.extents, dtype=np.float32) + 2.0 * margin
+    signs = np.asarray(((-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)), dtype=np.float32)
+    corners = box.center[None, :] + (0.5 * signs * extents[None, :]) @ box.rotation.T
+    return UprightOBB(box.center, box.rotation, extents, corners.astype(np.float32), box.point_count)
 
 
 class ReadOnlyRobotiq2FPosition:
@@ -459,7 +476,7 @@ def main() -> None:
                     if oh[indices].min() <= args.attachment_distance_m:
                         connected_components += 1
                         box = tabletop_obb(op[indices], normal, offset)
-                        if box is not None: candidate_boxes.append(_expanded_obb(box, args.box_margin_m))
+                        if box is not None: candidate_boxes.append(expanded_obb(box, args.box_margin_m))
                     else:
                         floating_components += 1
                 boxes = obstacle_gate.update(candidate_boxes)
@@ -467,9 +484,31 @@ def main() -> None:
                 qdelta = max(float(np.max(np.abs(q1[a.name]-q0[a.name]))) for a in (left,right))
                 diagnostics = {"environment_points": int(len(env)), "object_candidate_points": int(len(op)), "table_connected_components": connected_components, "floating_components": floating_components, "candidate_obbs": len(candidate_boxes), "confirmed_obbs": len(boxes), "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": int(raw_support.sum()), "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
                 refinement = f" · LingBot {refiner.last_inference_seconds:.2f}s" if refiner is not None else ""
-                snapshot = {"frame": frame_no, "status": f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个桌面连接障碍物", "environment": {"points":ep,"colors":ec}, "robot":{"points":rp,"colors":rc}, "obbs":[{"corners":b.corners.astype(float).tolist()} for b in boxes], "calibration": report, "diagnostics": diagnostics}
+                ok, encoded_rgb = cv2.imencode(".jpg", captured.rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ok:
+                    raise RuntimeError("front RGB JPEG encoding failed")
+                snapshot = {
+                    "schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
+                    "frame": frame_no, "host_timestamp_ns": int(captured.host_timestamp_ns or time.monotonic_ns()),
+                    "status": f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个桌面连接障碍物",
+                    "qpos": {a.name: ((q0[a.name] + q1[a.name]) * .5).astype(float).tolist() for a in (left, right)},
+                    "gripper_position": {"left": float(finger_angle / .8), "right": 0.0},
+                    "rgb_front_jpeg_base64": base64.b64encode(encoded_rgb.tobytes()).decode("ascii"),
+                    "environment": {"points":ep,"colors":ec}, "robot":{"points":rp,"colors":rc},
+                    "obbs":[{
+                        "center": b.center.astype(float).tolist(), "axes": b.rotation.astype(float).tolist(),
+                        "half_sizes": (b.extents * .5).astype(float).tolist(), "corners":b.corners.astype(float).tolist(),
+                        "point_count": int(b.point_count),
+                    } for b in boxes],
+                    "calibration": report, "diagnostics": diagnostics,
+                }
                 with lock: latest = snapshot
-                if args.once: break
+                # A one-shot diagnostic must still observe enough frames to
+                # exercise the configured temporal persistence gate.  The old
+                # one-frame behavior could never emit an OBB with the default
+                # required_hits=3 and therefore produced a misleading zero.
+                if args.once and frame_no >= args.temporal_persistence_frames:
+                    break
         except Exception as exc:
             with lock: latest = {**latest, "status": f"error: {type(exc).__name__}: {exc}"}
             raise
@@ -481,7 +520,7 @@ def main() -> None:
     worker = threading.Thread(target=process, daemon=True); worker.start()
     if args.once:
         worker.join()
-        print(json.dumps({"frame": latest["frame"], "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": len(latest["obbs"]), "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {})}, ensure_ascii=False, indent=2)); return
+        print(json.dumps({"schema": latest.get("schema"), "coordinate_frame": latest.get("coordinate_frame"), "frame": latest["frame"], "host_timestamp_ns": latest.get("host_timestamp_ns"), "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": latest["obbs"], "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {})}, ensure_ascii=False, indent=2)); return
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
