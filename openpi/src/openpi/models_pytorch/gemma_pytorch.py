@@ -72,7 +72,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
         elif precision == "float16":
+            # V100's LayerNorm kernel requires its input and affine parameters
+            # to share a dtype.  Keeping selected norms in fp32 (the BF16
+            # stability policy below) produces ``Float but found Half`` in the
+            # SigLIP vision tower, so FP16 uses a uniform module dtype.
             self.to(dtype=torch.float16)
+            return
         elif precision == "float32":
             self.to(dtype=torch.float32)
             return
