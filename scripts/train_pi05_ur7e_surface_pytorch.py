@@ -14,7 +14,9 @@ Run inside the OpenPI Python environment, for example:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -22,8 +24,10 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as distributed
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPENPI_SRC = REPO_ROOT / "openpi" / "src"
@@ -32,13 +36,24 @@ for path in (REPO_ROOT, OPENPI_SRC):
         sys.path.insert(0, str(path))
 
 MODEL_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+DEFAULT_PRETRAINED = REPO_ROOT / "outputs" / "pretrained" / "pi05_base_pytorch" / "model.safetensors"
+DEFAULT_TOKENIZER_REPOSITORY = "google/paligemma-3b-pt-224"
+DEFAULT_TOKENIZER_FILENAME = "tokenizer.model"
+
+
+def _cached_huggingface_tokenizer() -> Path | None:
+    """Find a tokenizer even in a manually copied Hugging Face snapshot cache."""
+    hub_root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    snapshot_root = hub_root / "models--google--paligemma-3b-pt-224" / "snapshots"
+    candidates = sorted(snapshot_root.glob(f"*/{DEFAULT_TOKENIZER_FILENAME}"))
+    return candidates[-1] if candidates else None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, nargs="+", required=True, help="Preprocessed .npz files or directories.")
     parser.add_argument("--output", type=Path, required=True, help="Output PyTorch checkpoint (.pt).")
-    parser.add_argument("--pretrained", type=Path, default=None, help="Converted PI05 model.safetensors backbone (required for real training).")
+    parser.add_argument("--pretrained", type=Path, default=DEFAULT_PRETRAINED, help="Override the default converted PI05 backbone.")
     parser.add_argument("--allow-random-init", action="store_true", help="Testing only: train without a pretrained PI05 backbone.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -57,11 +72,15 @@ def parse_args() -> argparse.Namespace:
         metavar="RGB_NAME=MODEL_KEY",
         help="For example front=base_0_rgb. Unmapped model views are zero-filled and masked.",
     )
-    parser.add_argument("--tokenizer-model", type=Path, default=None, help="Optional local paligemma_tokenizer.model.")
-    parser.add_argument("--precision", choices=("float32", "bfloat16"), default="bfloat16")
+    parser.add_argument("--tokenizer-model", type=Path, default=None, help="Optional tokenizer override. Default uses Hugging Face cache/download.")
+    parser.add_argument("--precision", choices=("float32", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--freeze-base", action="store_true", help="Train only the new point-token and point-flow layers.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Optimizer steps after this many per-rank batches; effective global batch is world_size × batch_size × this value.")
+    parser.add_argument("--distributed", action="store_true", help="Require torchrun distributed launch; one DDP process per CUDA device.")
+    parser.add_argument("--no-gradient-checkpointing", action="store_true", help="Disable activation checkpointing (normally unsuitable for 16 GB GPUs).")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum optimizer updates across all epochs; omitted means epochs alone determine training length.")
     parser.add_argument(
         "--max-train-batches",
         type=int,
@@ -108,19 +127,25 @@ def _parse_camera_map(values: list[str], rgb_names: list[str]) -> dict[str, str]
 class _Tokenizer:
     def __init__(self, max_len: int, model_path: Path | None):
         self.max_len = int(max_len)
-        self._openpi = None
         if model_path is None:
-            from openpi.models import tokenizer as openpi_tokenizer
+            model_path = _cached_huggingface_tokenizer()
+        if model_path is None:
+            try:
+                from huggingface_hub import hf_hub_download
 
-            self._openpi = openpi_tokenizer.PaligemmaTokenizer(max_len=max_len)
-        else:
-            import sentencepiece
+                model_path = Path(
+                    hf_hub_download(repo_id=DEFAULT_TOKENIZER_REPOSITORY, filename=DEFAULT_TOKENIZER_FILENAME)
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not obtain the PaliGemma tokenizer from the Hugging Face cache or Hub. "
+                    "Check network access or pass --tokenizer-model explicitly."
+                ) from exc
+        import sentencepiece
 
-            self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
+        self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
 
     def tokenize(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if self._openpi is not None:
-            return self._openpi.tokenize(prompt, state=state)
         clean = prompt.strip().replace("_", " ").replace("\n", " ")
         bins = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
         text = f"Task: {clean}, State: {' '.join(map(str, bins))};\nAction: "
@@ -359,15 +384,40 @@ def _save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimi
     torch.save({"model_type": "PI05SafetyPytorch", "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch, "metadata": metadata}, path)
 
 
+def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, int, bool]:
+    """Initialize one process per GPU when launched through ``torchrun``."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if args.distributed and world_size < 2:
+        raise ValueError("--distributed requires torchrun with at least two processes")
+    if world_size == 1:
+        device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+        return device, 0, 1, False
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed PI05 training requires CUDA and an NCCL-capable torch build")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    distributed.init_process_group(backend="nccl")
+    return torch.device(f"cuda:{local_rank}"), int(distributed.get_rank()), world_size, True
+
+
 def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.max_points < 0:
         raise ValueError("epochs and batch-size must be positive; max-points must be >= 0")
     if args.max_train_batches is not None and args.max_train_batches < 1:
         raise ValueError("--max-train-batches must be positive when supplied")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValueError("--max-steps must be positive when supplied")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    device, rank, world_size, is_distributed = _distributed_context(args)
+    is_primary = rank == 0
+    if device.type == "cuda" and args.precision == "bfloat16" and torch.cuda.get_device_capability(device)[0] < 8:
+        raise ValueError("bfloat16 requires Ampere-or-newer CUDA hardware. V100 requires --precision float16.")
+    if device.type == "cuda" and not args.freeze_base and torch.cuda.get_device_properties(device).total_memory < 48 * 2**30:
+        raise ValueError("Full PI05 AdamW fine-tuning needs roughly 48+ GiB per GPU. On V100 use --freeze-base; DDP replicates rather than shards the backbone.")
     shards = _resolve_shards(args.dataset)
     qpos_mean, qpos_std, action_mean, action_std, detected_horizon, logical_action_dim, joint_dim = _normalization_stats(shards)
     horizon = detected_horizon if args.action_horizon is None else args.action_horizon
@@ -401,11 +451,17 @@ def main() -> None:
             "episode_task_text_sources": [episode.task_text_source for episode in dataset.episodes],
         })
         return
-    if args.pretrained is None and not args.allow_random_init:
-        raise ValueError("Joint world-action training requires --pretrained PI05 weights (or explicit testing-only --allow-random-init)")
+    pretrained = None if args.allow_random_init else args.pretrained
+    if pretrained is None and not args.allow_random_init:
+        raise ValueError("Joint world-action training requires the default PI05 weights (or explicit testing-only --allow-random-init)")
+    if pretrained is not None and not pretrained.is_file():
+        raise FileNotFoundError(
+            f"PI05 weights were not found at {pretrained}. Run the OpenPI-to-PyTorch conversion or pass --pretrained."
+        )
     if len(dataset) < args.batch_size:
         raise ValueError(f"Dataset has {len(dataset)} samples, smaller than --batch-size={args.batch_size}")
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed) if is_distributed else None
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler, num_workers=args.num_workers, drop_last=True)
     try:
         from openpi.models.pi0_config import Pi0Config
         from openpi.models_pytorch.pi0_pytorch import PI05SafetyPytorch
@@ -416,23 +472,28 @@ def main() -> None:
         ) from exc
     config = Pi0Config(action_dim=32, action_horizon=horizon, pi05=True, dtype=args.precision)
     model = PI05SafetyPytorch(config, joint_dim=joint_dim).to(device)
-    if args.pretrained is not None:
+    if pretrained is not None:
         from safetensors.torch import load_model
 
         # load_model understands the tied-weight aliases recorded by
         # safetensors.save_model. load_file()+load_state_dict() silently leaves
         # PaliGemma's shared token embedding random.
-        missing, unexpected = load_model(model, str(args.pretrained), strict=False, device=str(device))
+        missing, unexpected = load_model(model, str(pretrained), strict=False, device=str(device))
         disallowed_missing = [key for key in missing if not key.startswith("surface_")]
         if disallowed_missing or unexpected:
             raise RuntimeError(
                 "Pretrained PI05 backbone is incomplete or incompatible: "
                 f"missing={disallowed_missing}, unexpected={unexpected}"
             )
-        print(f"[weights] PI05 backbone complete; new_surface_keys={len(missing)}")
+        if is_primary:
+            print(f"[weights] PI05 backbone complete; new_surface_keys={len(missing)}")
     if args.freeze_base:
         for name, parameter in model.named_parameters():
             parameter.requires_grad_(name.startswith("surface_"))
+    if not args.no_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    if is_distributed:
+        model = DistributedDataParallel(model, device_ids=[device.index], output_device=device.index, broadcast_buffers=False)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     metadata = {
         "dataset": [str(path) for path in shards], "point_target": args.point_target, "point_count": dataset.point_count,
@@ -450,33 +511,62 @@ def main() -> None:
         "episode_task_texts": [episode.task_text for episode in dataset.episodes],
         "episode_task_text_sources": [episode.task_text_source for episode in dataset.episodes],
         "max_train_batches": args.max_train_batches,
+        "world_size": world_size,
+        "per_rank_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_global_batch_size": world_size * args.batch_size * args.gradient_accumulation_steps,
+        "max_steps": args.max_steps,
     }
+    completed_steps = 0
     for epoch in range(1, args.epochs + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
         total_loss = total_action = total_point = 0.0
+        optimizer.zero_grad(set_to_none=True)
+        requested_batches = min(len(loader), args.max_train_batches or len(loader))
+        reached_step_limit = False
         for batch_index, batch in enumerate(loader, start=1):
-            optimizer.zero_grad(set_to_none=True)
-            losses = model.compute_losses(
-                _to_observation(batch, device),
+            accumulation_start = ((batch_index - 1) // args.gradient_accumulation_steps) * args.gradient_accumulation_steps + 1
+            accumulation_size = min(args.gradient_accumulation_steps, requested_batches - accumulation_start + 1)
+            should_step = batch_index == accumulation_start + accumulation_size - 1
+            sync_context = model.no_sync() if is_distributed and not should_step else nullcontext()
+            with sync_context:
+                losses = model(
+                    _to_observation(batch, device),
                 batch["actions"].to(device=device, dtype=torch.float32),
                 batch["robot_points"].to(device=device, dtype=torch.float32),
                 batch["joint_positions"].to(device=device, dtype=torch.float32),
                 batch["target_point_offsets"].to(device=device, dtype=torch.float32),
                 batch["target_point_mask"].to(device=device, dtype=torch.bool),
                 point_loss_weight=args.point_loss_weight,
-            )
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-            optimizer.step()
+                )
+                (losses["loss"] / accumulation_size).backward()
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                completed_steps += 1
+                reached_step_limit = args.max_steps is not None and completed_steps >= args.max_steps
             total_loss += float(losses["loss"].detach())
             total_action += float(losses["action_loss"])
             total_point += float(losses["point_loss"])
-            if args.max_train_batches is not None and batch_index >= args.max_train_batches:
+            if (args.max_train_batches is not None and batch_index >= args.max_train_batches) or reached_step_limit:
                 break
         batches = batch_index
-        print(f"epoch={epoch:03d} loss={total_loss / batches:.6f} action={total_action / batches:.6f} point={total_point / batches:.6f}")
-        if epoch % args.save_every == 0 or epoch == args.epochs:
-            _save_checkpoint(args.output, model, optimizer, epoch, metadata)
+        aggregate = torch.tensor((total_loss, total_action, total_point, float(batches)), dtype=torch.float64, device=device)
+        if is_distributed:
+            distributed.all_reduce(aggregate, op=distributed.ReduceOp.SUM)
+        if is_primary:
+            global_batches = aggregate[3].item()
+            print(f"epoch={epoch:03d} step={completed_steps} loss={aggregate[0].item() / global_batches:.6f} action={aggregate[1].item() / global_batches:.6f} point={aggregate[2].item() / global_batches:.6f}")
+            if epoch % args.save_every == 0 or epoch == args.epochs or reached_step_limit:
+                _save_checkpoint(args.output, model.module if is_distributed else model, optimizer, epoch, metadata)
+        if reached_step_limit:
+            break
+    if is_distributed:
+        distributed.barrier()
+        distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

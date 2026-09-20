@@ -173,12 +173,10 @@ class PI0Pytorch(nn.Module):
         Kept separate so auxiliary PI05 heads can consume the same action-expert
         tokens rather than a detached post-hoc VLM feature.
         """
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        transformer_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        if transformer_dtype in (torch.bfloat16, torch.float16):
+            suffix_embs = suffix_embs.to(dtype=transformer_dtype)
+            prefix_embs = prefix_embs.to(dtype=transformer_dtype)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)

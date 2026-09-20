@@ -68,9 +68,11 @@ class PaliGemmaWithExpertModel(nn.Module):
 
         self.to_bfloat16_for_selected_params(precision)
 
-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
+        elif precision == "float16":
+            self.to(dtype=torch.float16)
         elif precision == "float32":
             self.to(dtype=torch.float32)
             return
@@ -233,9 +235,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                    # Keep activations in the linear layer's compute dtype.
+                    if layer.mlp.up_proj.weight.dtype in (torch.bfloat16, torch.float16):
+                        out_emb = out_emb.to(dtype=layer.mlp.up_proj.weight.dtype)
 
                     out_emb = layer.mlp(out_emb)
                     # second residual

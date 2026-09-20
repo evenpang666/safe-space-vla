@@ -100,10 +100,49 @@ conda run -n safety python scripts/train_pi05_ur7e_surface_pytorch.py \
 uv run --project openpi scripts/train_pi05_ur7e_surface_pytorch.py \
   --dataset outputs/quest3_pi05 \
   --output outputs/pi05_quest3/dual_joint_safety.pt \
-  --pretrained outputs/pretrained/pi05_base_pytorch/model.safetensors \
   --max-points 256 \
-  --epochs 20
+  --epochs 20 --max-steps 20000
 ```
+
+### 4 × V100（16 GB）分布式训练
+
+V100 不支持硬件 BF16；当前训练器的 DDP 模式会复制而非分片 PI0.5 主干，
+因此 16 GB 卡只能训练新增的安全点流层。以下命令的全局 batch 为
+`4 × 4 × 2 = 32`，并默认开启 activation checkpointing：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+  scripts/train_pi05_ur7e_surface_pytorch.py \
+  --distributed \
+  --dataset outputs/quest3_pi05/left_dual_formal \
+  --output outputs/pi05_quest3/left_dual_pi05_v100_ddp.pt \
+  --epochs 200 --max-steps 2000 --batch-size 4 --gradient-accumulation-steps 2 \
+  --max-points 256 --precision float16 --freeze-base
+```
+
+完整 PI0.5 AdamW 微调仍需要 FSDP/ZeRO-3 参数、梯度和优化器状态分片；4 张
+16 GB V100 即使使用 DDP 也不会获得模型显存分片。
+
+### A100 / H100 多卡训练
+
+脚本的 DDP/NCCL 路径同样适用于 A100（SM 8.x）和 H100（SM 9.x）。对于
+80 GB 型号，可以进行完整 PI0.5 微调；下例为 4 卡、全局 batch 16（每卡 4）的
+单机启动方式：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+  scripts/train_pi05_ur7e_surface_pytorch.py \
+  --distributed \
+  --dataset outputs/quest3_pi05/left_dual_formal \
+  --output outputs/pi05_quest3/left_dual_pi05_a100_h100_full.pt \
+  --epochs 200 --max-steps 2000 --batch-size 4 --gradient-accumulation-steps 1 \
+  --max-points 256 --precision bfloat16
+```
+
+40 GB A100 不应使用上面的全量 AdamW 模式；使用 V100 段落中的
+`--freeze-base` 配置即可，但可将 `--precision` 改为 `bfloat16`。多节点时，将
+`--standalone` 换为集群分配的 `--nnodes`、`--node_rank`、`--master_addr` 与
+`--master_port` 参数；每个节点都必须可见相同的 checkpoint、tokenizer 与数据路径。
 
 同一 checkpoint 中的 shard 必须具有相同的臂数、action 维度、horizon 和点
 布局；不要混合 7D 单臂与 14D 双臂数据。左臂数据使用占位模式后应全部采用
