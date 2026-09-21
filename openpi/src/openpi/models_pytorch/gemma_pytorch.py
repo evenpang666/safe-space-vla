@@ -114,6 +114,18 @@ class PaliGemmaWithExpertModel(nn.Module):
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+
+        def condition_for_norm(norm, condition):
+            """Match AdaRMS conditioning to its dense projection dtype.
+
+            The PI0.5 time MLP is deliberately fp32 for stable time features,
+            whereas a V100 FP16 backbone stores AdaRMS ``dense`` in fp16.
+            ``nn.Linear`` does not permit this mixed input/weight pair.
+            """
+            dense = getattr(norm, "dense", None)
+            if condition is not None and dense is not None and condition.dtype != dense.weight.dtype:
+                return condition.to(dtype=dense.weight.dtype)
+            return condition
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -179,7 +191,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 gates = []
                 for i, hidden_states in enumerate(inputs_embeds):
                     layer = models[i].layers[layer_idx]
-                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+                    input_condition = condition_for_norm(layer.input_layernorm, adarms_cond[i])
+                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=input_condition)  # noqa: PLW2901
                     gates.append(gate)
 
                     input_shape = hidden_states.shape[:-1]
@@ -239,7 +252,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
-                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                    post_condition = condition_for_norm(layer.post_attention_layernorm, adarms_cond[i])
+                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=post_condition)
                     # Keep activations in the linear layer's compute dtype.
                     if layer.mlp.up_proj.weight.dtype in (torch.bfloat16, torch.float16):
                         out_emb = out_emb.to(dtype=layer.mlp.up_proj.weight.dtype)
@@ -277,7 +291,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    final_condition = condition_for_norm(models[i].norm, adarms_cond[i])
+                    out_emb, _ = models[i].norm(hidden_states, cond=final_condition)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
