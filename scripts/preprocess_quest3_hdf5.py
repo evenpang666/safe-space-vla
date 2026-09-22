@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb-view", action="append", default=[], help="RGB view to retain; repeat for multiple. Default follows project camera_to_model (front only).")
     parser.add_argument("--measured-flow-npz", type=Path, default=None, help="Optional CoTracker observation NPZ to merge as masked auxiliary targets.")
     parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Permit provisional right EPick FK labels (never recommended for safety training).")
+    parser.add_argument(
+        "--left-gripper-position-convention",
+        choices=("closing_fraction", "opening_fraction"),
+        default="closing_fraction",
+        help=(
+            "Meaning of the recorded left observations/gripper_position. "
+            "closing_fraction means 0=open,1=closed (current collector contract); "
+            "opening_fraction means 1=open,0=closed (legacy recordings only)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -227,6 +237,15 @@ def main() -> None:
         gripper_action = np.concatenate((gripper_action, np.zeros_like(gripper_action)), axis=1)
         arm_count = 2
     actions = _pack_actions(joint_actions, gripper_action, arm_count)
+    # The collision model always consumes a physical closing fraction: finger
+    # angle 0 rad is open and +0.8 rad is closed in the vendor 2F-85 Xacro.
+    # Keep the recorder value untouched in ``gripper_position`` for audit and
+    # action replay, but explicitly convert only the mesh/FK input.  Some
+    # historical Quest3 recordings predate the 0=open/1=closed contract and
+    # stored the complementary opening fraction.
+    surface_gripper_position = gripper_position.copy()
+    if args.left_gripper_position_convention == "opening_fraction":
+        surface_gripper_position[:, 0] = 1.0 - surface_gripper_position[:, 0]
     sampler = DualUR7eSurfacePointSampler(points_per_link=points_per_link, project_config=config_path)
     if arm_count == 2 and not sampler.tcp_transform_verified["right_arm"] and not args.allow_unverified_right_tcp:
         raise RuntimeError(
@@ -237,7 +256,9 @@ def main() -> None:
     link_names = sampler.link_names(surface_arm_count)
     fixed = np.empty((frame_count, len(link_names), points_per_link, 3), dtype=np.float32)
     for frame in range(frame_count):
-        fixed[frame] = sampler.link_points(qpos[frame, : recorded_arm_count * 6], gripper_position[frame, :recorded_arm_count])
+        fixed[frame] = sampler.link_points(
+            qpos[frame, : recorded_arm_count * 6], surface_gripper_position[frame, :recorded_arm_count]
+        )
     sample_indices = _window_starts(action_valid, horizon)
     if not len(sample_indices):
         raise ValueError("Episode has no complete valid action/flow window")
@@ -261,6 +282,9 @@ def main() -> None:
         "inactive_right_arm_placeholder": np.asarray(inactive_right_arm),
         "qpos": qpos,
         "gripper_position": gripper_position,
+        "surface_gripper_position": surface_gripper_position,
+        "left_gripper_position_convention": np.asarray(args.left_gripper_position_convention),
+        "surface_gripper_position_semantics": np.asarray("closing_fraction_0_open_1_closed"),
         "actions": actions,
         "action_valid": action_valid,
         "action_source": np.asarray(action_source),
@@ -294,6 +318,7 @@ def main() -> None:
         "action_dim": arm_count * 7, "action_source": action_source, "links": len(link_names),
         "fixed_points": flat.shape[1], "rgb_views": sorted(rgb), "measured_flow": args.measured_flow_npz is not None,
         "task_text": task, "task_source": task_source, "inactive_right_arm_placeholder": inactive_right_arm,
+        "left_gripper_position_convention": args.left_gripper_position_convention,
     }, ensure_ascii=False, indent=2))
 
 

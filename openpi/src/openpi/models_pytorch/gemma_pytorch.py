@@ -139,13 +139,24 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            # In autoregressive sampling this shortcut calls Hugging Face's
+            # expert model directly rather than the joint-layer loop below.
+            # Cast the FP32 time/AdaRMS condition to the expert norm's FP16
+            # projection dtype before it reaches GemmaRMSNorm.dense.
+            expert_condition = adarms_cond[1] if adarms_cond is not None else None
+            if self.gemma_expert.model.layers:
+                expert_condition = condition_for_norm(self.gemma_expert.model.layers[0].input_layernorm, expert_condition)
+                expert_dtype = self.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+                expert_inputs = inputs_embeds[1].to(dtype=expert_dtype)
+            else:
+                expert_inputs = inputs_embeds[1]
             suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
+                inputs_embeds=expert_inputs,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                adarms_cond=expert_condition,
             )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None

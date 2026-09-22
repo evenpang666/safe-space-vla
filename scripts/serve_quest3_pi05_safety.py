@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
+import os
 from pathlib import Path
 import socket
 import sys
@@ -18,6 +20,14 @@ for path in (REPO_ROOT, REPO_ROOT / "openpi" / "src", REPO_ROOT / "openpi" / "pa
         sys.path.insert(0, str(path))
 
 MODEL_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+DEFAULT_TOKENIZER_REPOSITORY = "google/paligemma-3b-pt-224"
+DEFAULT_TOKENIZER_FILENAME = "tokenizer.model"
+
+
+def _cached_huggingface_tokenizer() -> Path | None:
+    hub_root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    candidates = sorted((hub_root / "models--google--paligemma-3b-pt-224" / "snapshots").glob("*/tokenizer.model"))
+    return candidates[-1] if candidates else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,21 +43,25 @@ def parse_args() -> argparse.Namespace:
 class _Tokenizer:
     def __init__(self, model_path: Path | None) -> None:
         self.max_len = 200
-        self._openpi = None
         if model_path is None:
-            from openpi.models import tokenizer
+            model_path = _cached_huggingface_tokenizer()
+        if model_path is None:
+            try:
+                from huggingface_hub import hf_hub_download
 
-            self._openpi = tokenizer.PaligemmaTokenizer(max_len=self.max_len)
-        else:
-            import sentencepiece
+                model_path = Path(hf_hub_download(repo_id=DEFAULT_TOKENIZER_REPOSITORY, filename=DEFAULT_TOKENIZER_FILENAME))
+            except Exception as exc:
+                raise RuntimeError(
+                    "PaliGemma tokenizer is absent from the Hugging Face cache and could not be downloaded. "
+                    "Copy tokenizer.model to the normal cache or pass --tokenizer-model."
+                ) from exc
+        import sentencepiece
 
-            self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
+        self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
 
     def tokenize(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if self._openpi is not None:
-            return self._openpi.tokenize(prompt, state=state)
         bins = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        text = f"Task: {prompt.strip()}, State: {' '.join(map(str, bins))};\nAction: "
+        text = f"Task: {prompt.strip().replace('_', ' ').replace(chr(10), ' ')}, State: {' '.join(map(str, bins))};\nAction: "
         tokens = self._processor.encode(text, add_bos=True)[: self.max_len]
         values = np.zeros((self.max_len,), dtype=np.int32)
         mask = np.zeros((self.max_len,), dtype=bool)
@@ -63,7 +77,12 @@ class Quest3JointSafetyPolicy:
 
         self.torch = torch
         self.device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
-        payload = torch.load(checkpoint, map_location=self.device, weights_only=True)
+        # Keep parameter tensors memory-mapped until ``assign=True`` hands
+        # their storage directly to the module.  A conventional torch.load +
+        # copy produces a state dict, an initialized model and then a CUDA
+        # model at once; that can exhaust both 32 GB host RAM and 16 GB GPUs.
+        # The checkpoint is a zip-format torch.save file, which supports mmap.
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
         if payload.get("model_type") != "PI05SafetyPytorch":
             raise ValueError(f"{checkpoint} is not a jointly trained PI05SafetyPytorch checkpoint")
         self.info = dict(payload["metadata"])
@@ -83,8 +102,20 @@ class Quest3JointSafetyPolicy:
             action_dim=32, action_horizon=int(self.info["action_horizon"]), pi05=True,
             dtype=str(self.info.get("precision", "bfloat16")),
         )
-        self.model = PI05SafetyPytorch(config, joint_dim=self.joint_dim).to(self.device)
+        # Constructing directly on ``meta`` prevents an otherwise-unused
+        # ~6 GB CPU parameter allocation.  ``to_empty`` allocates the final
+        # parameter storage only on the target device; load_state_dict then
+        # copies each memory-mapped tensor in turn, rather than retaining a
+        # complete extra CUDA state dict.  Some rotary buffers are not stored
+        # in the checkpoint, so assigning tensor storage directly is unsafe.
+        with torch.device("meta"):
+            self.model = PI05SafetyPytorch(config, joint_dim=self.joint_dim)
+        self.model.to_empty(device=self.device)
         self.model.load_state_dict(payload["model_state_dict"], strict=True)
+        del payload
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         self.model.eval()
         self.tokenizer = _Tokenizer(tokenizer_model)
         self.num_steps = int(num_steps)
